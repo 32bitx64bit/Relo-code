@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: core/go.mod
+      - run: cd core && go vet ./...
+      - run: test -z "$(cd core && gofmt -l .)"
+      - run: cd core && go test -race ./...
+
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: cd extension && npm ci
+      - run: cd extension && npm run compile
+      - run: cd extension && npm run lint
+      - run: cd extension && npm test
+
+  vsix:
+    runs-on: ubuntu-latest
+    needs: [go, node]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: core/go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build vsix (no install)
+        run: make vsix
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relo-code-vsix
+          path: extension/*.vsix
+          if-no-files-found: error

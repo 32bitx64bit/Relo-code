@@ -1,0 +1,8 @@
+{
+  "name": "relo-webview",
+  "private": true,
+  "scripts": {
+    "build": "cp src/main.js ../extension/media/webview.js",
+    "test": "node --test src/main.test.js"
+  }
+}

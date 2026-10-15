@@ -1,0 +1,39 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}/extension"],
+      "outFiles": ["${workspaceFolder}/extension/out/**/*.js"],
+      "preLaunchTask": "build-relo"
+    },
+    {
+      "name": "Run Extension (mock runtime)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}/extension"],
+      "outFiles": ["${workspaceFolder}/extension/out/**/*.js"],
+      "preLaunchTask": "build-relo",
+      "env": { "RELO_RUNTIME": "mock" }
+    },
+    {
+      "name": "Debug Relo Core",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/core/cmd/relo-core",
+      "args": ["-workspace", "${workspaceFolder}", "-runtime", "mock", "-log-level", "debug"]
+    },
+    {
+      "name": "Debug Extension + Core",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}/extension"],
+      "outFiles": ["${workspaceFolder}/extension/out/**/*.js"],
+      "preLaunchTask": "build-relo",
+      "env": { "RELO_RUNTIME": "mock" }
+    }
+  ]
+}

@@ -1,0 +1,631 @@
+{
+  "name": "relo-code",
+  "displayName": "Relo Code",
+  "description": "Context-managed multi-agent software engineering for Visual Studio Code. Relo orchestrates; OpenCode executes.",
+  "version": "0.1.0",
+  "publisher": "relocode",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "relo",
+          "title": "Relo Code",
+          "icon": "media/relo.svg"
+        }
+      ]
+    },
+    "views": {
+      "relo": [
+        {
+          "id": "relo.chat",
+          "name": "Relo",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "relo.open",
+        "title": "Relo: Open"
+      },
+      {
+        "command": "relo.newSession",
+        "title": "Relo: New Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "relo.sessionHistory",
+        "title": "Relo: Session History",
+        "icon": "$(history)"
+      },
+      {
+        "command": "relo.dashboard",
+        "title": "Relo: Open Dashboard"
+      },
+      {
+        "command": "relo.runTask",
+        "title": "Relo: Run Task"
+      },
+      {
+        "command": "relo.planTask",
+        "title": "Relo: Plan Task"
+      },
+      {
+        "command": "relo.reviewChanges",
+        "title": "Relo: Review Changes"
+      },
+      {
+        "command": "relo.openAgents",
+        "title": "Relo: Open Agents"
+      },
+      {
+        "command": "relo.openTasks",
+        "title": "Relo: Open Tasks"
+      },
+      {
+        "command": "relo.openContext",
+        "title": "Relo: Open Context"
+      },
+      {
+        "command": "relo.openChanges",
+        "title": "Relo: Open Changes"
+      },
+      {
+        "command": "relo.openVerification",
+        "title": "Relo: Open Checks"
+      },
+      {
+        "command": "relo.openLogs",
+        "title": "Relo: Open Logs"
+      },
+      {
+        "command": "relo.pause",
+        "title": "Relo: Pause"
+      },
+      {
+        "command": "relo.resume",
+        "title": "Relo: Resume"
+      },
+      {
+        "command": "relo.stopAll",
+        "title": "Relo: Stop All Agents"
+      },
+      {
+        "command": "relo.refreshPrimary",
+        "title": "Relo: Refresh Primary Context"
+      },
+      {
+        "command": "relo.selectPrimaryModel",
+        "title": "Relo: Select Primary Model"
+      },
+      {
+        "command": "relo.selectTier1Model",
+        "title": "Relo: Select Tier 1 Model"
+      },
+      {
+        "command": "relo.selectTier2Model",
+        "title": "Relo: Select Tier 2 Model"
+      },
+      {
+        "command": "relo.restartBackend",
+        "title": "Relo: Restart Backend"
+      },
+      {
+        "command": "relo.configureDifficultyRouting",
+        "title": "Relo: Configure Difficulty Routing"
+      },
+      {
+        "command": "relo.showCacheStats",
+        "title": "Relo: Show Cache Stats"
+      },
+      {
+        "command": "relo.settings",
+        "title": "Relo: Settings"
+      },
+      {
+        "command": "relo.askSelection",
+        "title": "Ask Relo About Selection"
+      },
+      {
+        "command": "relo.fixSelection",
+        "title": "Fix With Relo"
+      },
+      {
+        "command": "relo.refactorSelection",
+        "title": "Refactor With Relo"
+      },
+      {
+        "command": "relo.reviewSelection",
+        "title": "Review With Relo"
+      },
+      {
+        "command": "relo.askFile",
+        "title": "Ask Relo About File"
+      },
+      {
+        "command": "relo.reviewFile",
+        "title": "Review File"
+      },
+      {
+        "command": "relo.askFolder",
+        "title": "Ask Relo About Folder"
+      },
+      {
+        "command": "relo.agent.stop",
+        "title": "Stop Agent"
+      },
+      {
+        "command": "relo.agent.refresh",
+        "title": "Refresh Context"
+      },
+      {
+        "command": "relo.agent.inspect",
+        "title": "Inspect Context"
+      },
+      {
+        "command": "relo.agent.openWorktree",
+        "title": "Open Worktree"
+      },
+      {
+        "command": "relo.changes.accept",
+        "title": "Accept Change"
+      },
+      {
+        "command": "relo.changes.reject",
+        "title": "Reject Change"
+      },
+      {
+        "command": "relo.changes.diff",
+        "title": "Open Diff"
+      },
+      {
+        "command": "relo.changes.acceptAll",
+        "title": "Relo: Accept All Changes"
+      },
+      {
+        "command": "relo.changes.rejectAll",
+        "title": "Relo: Reject All Changes"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "relo.newSession",
+          "when": "view == relo.chat",
+          "group": "navigation@1"
+        },
+        {
+          "command": "relo.sessionHistory",
+          "when": "view == relo.chat",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "relo.askSelection",
+          "group": "relo@1",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "relo.fixSelection",
+          "group": "relo@2",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "relo.refactorSelection",
+          "group": "relo@3",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "relo.reviewSelection",
+          "group": "relo@4",
+          "when": "editorHasSelection"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "relo.askFile",
+          "group": "relo@1",
+          "when": "!explorerResourceIsFolder"
+        },
+        {
+          "command": "relo.reviewFile",
+          "group": "relo@2",
+          "when": "!explorerResourceIsFolder"
+        },
+        {
+          "command": "relo.askFolder",
+          "group": "relo@1",
+          "when": "explorerResourceIsFolder"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "relo.agent.stop",
+          "when": "false"
+        },
+        {
+          "command": "relo.agent.refresh",
+          "when": "false"
+        },
+        {
+          "command": "relo.agent.inspect",
+          "when": "false"
+        },
+        {
+          "command": "relo.agent.openWorktree",
+          "when": "false"
+        },
+        {
+          "command": "relo.changes.accept",
+          "when": "false"
+        },
+        {
+          "command": "relo.changes.reject",
+          "when": "false"
+        },
+        {
+          "command": "relo.changes.diff",
+          "when": "false"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "relo.open",
+        "key": "ctrl+shift+.",
+        "mac": "cmd+shift+."
+      }
+    ],
+    "configuration": {
+      "title": "Relo Code",
+      "properties": {
+        "relo.primaryModel": {
+          "type": "string",
+          "default": "",
+          "description": "Primary orchestrator model (provider/model)."
+        },
+        "relo.tier1Model": {
+          "type": "string",
+          "default": "",
+          "description": "Model for medium and hard tasks. Relo sends trivial and easy tasks and probes to Tier 2, so put your stronger worker model here and your cheapest in Tier 2."
+        },
+        "relo.tier2Model": {
+          "type": "string",
+          "default": "",
+          "description": "Cheap model for trivial and easy tasks and for probes. Put your cheapest model here; a stronger model here is paid for on every small task."
+        },
+        "relo.routing.mode": {
+          "type": "string",
+          "enum": [
+            "simple",
+            "advanced"
+          ],
+          "default": "simple",
+          "description": "Simple: Primary plus two worker tiers. Advanced: pick a model per task difficulty."
+        },
+        "relo.models.contextLimit": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Global context cap in tokens for every model (0 = no cap). A model with a smaller window uses its own maximum."
+        },
+        "relo.models.efforts": {
+          "type": "object",
+          "default": {},
+          "description": "Reasoning effort per model, keyed provider/model. Missing = model default."
+        },
+        "relo.providers": {
+          "type": "array",
+          "default": [],
+          "scope": "application",
+          "description": "Custom OpenAI- or Anthropic-compatible providers. API keys are stored in VS Code secret storage, never here.",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "kind",
+              "baseURL"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "openai",
+                  "anthropic"
+                ]
+              },
+              "baseURL": {
+                "type": "string"
+              },
+              "models": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        },
+        "relo.routing.byDifficulty": {
+          "type": "object",
+          "default": {},
+          "description": "Optional model overrides by task difficulty."
+        },
+        "relo.routing.escalate": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow escalation to a stronger model after repeated failures."
+        },
+        "relo.report.maxChars": {
+          "type": "number",
+          "default": 1200,
+          "minimum": 1,
+          "description": "Maximum characters in agent report fields."
+        },
+        "relo.efficiency.preset": {
+          "type": "string",
+          "enum": [
+            "off",
+            "auto",
+            "max"
+          ],
+          "default": "off"
+        },
+        "relo.efficiency.voice": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "off",
+            "lite",
+            "full",
+            "ultra"
+          ],
+          "default": "auto"
+        },
+        "relo.efficiency.craft": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "off",
+            "lite",
+            "full",
+            "ultra"
+          ],
+          "default": "auto"
+        },
+        "relo.efficiency.roles": {
+          "type": "object",
+          "default": {}
+        },
+        "relo.efficiency.planLean": {
+          "type": "boolean",
+          "default": false
+        },
+        "relo.maxConcurrentAgents": {
+          "type": "number",
+          "default": 6
+        },
+        "relo.maxTier1Agents": {
+          "type": "number",
+          "default": 3
+        },
+        "relo.maxTier2Agents": {
+          "type": "number",
+          "default": 4
+        },
+        "relo.maxHierarchyDepth": {
+          "type": "number",
+          "default": 3
+        },
+        "relo.maxRetries": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 5,
+          "description": "How many times a failed task may be retried (on a stronger model) before Relo stops and reports it. Every retry costs tokens."
+        },
+        "relo.context.maxUtilization": {
+          "type": "number",
+          "default": 0.85
+        },
+        "relo.context.autoRefresh": {
+          "type": "boolean",
+          "default": true
+        },
+        "relo.context.refreshThreshold": {
+          "type": "number",
+          "default": 0.8
+        },
+        "relo.context.keepRawHistory": {
+          "type": "boolean",
+          "default": true
+        },
+        "relo.context.projectMemory": {
+          "type": "boolean",
+          "default": true
+        },
+        "relo.context.compressionStrategy": {
+          "type": "string",
+          "enum": [
+            "variable",
+            "full_history",
+            "summary",
+            "aggressive_refresh",
+            "role_optimized"
+          ],
+          "default": "variable"
+        },
+        "relo.autoVerify": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run the project's own checks (tests, build) after an agent changes files, and send failures back to that agent to fix."
+        },
+        "relo.autoReview": {
+          "type": "boolean",
+          "default": true,
+          "description": "Have a second agent review large or hard changes (a hard or expert task, 6 or more files, or 200 or more changed lines). Small changes are not reviewed, and a reviewer the Primary already planned is not duplicated."
+        },
+        "relo.runtime": {
+          "type": "string",
+          "enum": [
+            "opencode",
+            "mock"
+          ],
+          "default": "opencode",
+          "description": "OpenCode backend, or mock for local testing without paid inference."
+        },
+        "relo.openCode.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the OpenCode binary."
+        },
+        "relo.logLevel": {
+          "type": "string",
+          "enum": [
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ],
+          "default": "info"
+        },
+        "relo.permissions.read": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "ask",
+            "deny"
+          ],
+          "default": "allow"
+        },
+        "relo.permissions.write": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "ask",
+            "deny"
+          ],
+          "default": "allow"
+        },
+        "relo.permissions.test": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "ask",
+            "deny"
+          ],
+          "default": "allow"
+        },
+        "relo.permissions.build": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "ask",
+            "deny"
+          ],
+          "default": "allow"
+        },
+        "relo.permissions.install": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "ask",
+            "deny"
+          ],
+          "default": "ask"
+        },
+        "relo.permissions.delete": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "ask",
+            "deny"
+          ],
+          "default": "ask"
+        },
+        "relo.permissions.gitCommit": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "ask",
+            "deny"
+          ],
+          "default": "ask"
+        },
+        "relo.permissions.gitPush": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "ask",
+            "deny"
+          ],
+          "default": "ask"
+        },
+        "relo.permissions.network": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "ask",
+            "deny"
+          ],
+          "default": "ask"
+        },
+        "relo.permissions.outside": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "ask",
+            "deny"
+          ],
+          "default": "ask"
+        },
+        "relo.permissions.destructive": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "ask",
+            "deny"
+          ],
+          "default": "ask"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -p . -w",
+    "lint": "eslint src --max-warnings=0 && tsc -p . --noEmit",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "tsx --test src/protocol.test.ts src/settingsBridge.test.ts src/providers.test.ts src/uiState.test.ts src/crashBreaker.test.ts && node --test ../webview/src/main.test.js ../tests/protocol-contract.test.mjs",
+    "package": "cd .. && make package"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "@vscode/vsce": "^4.0.0",
+    "eslint": "^9.17.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
