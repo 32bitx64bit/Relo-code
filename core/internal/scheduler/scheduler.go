@@ -35,6 +35,18 @@ func (l Limits) WithDefaults() Limits {
 	return l
 }
 
+// Why an agent is not admitted. A full limit passes when another agent finishes; the others do not.
+const (
+	WhyPaused = "paused"
+	WhyDepth  = "max hierarchy depth"
+	WhyTotal  = "max concurrent agents"
+	WhyTier1  = "max tier1 agents"
+	WhyTier2  = "max tier2 agents"
+)
+
+// Full reports whether why is a limit that opens up as soon as another agent finishes, so waiting for it is useful.
+func Full(why string) bool { return why == WhyTotal || why == WhyTier1 || why == WhyTier2 }
+
 type Scheduler struct {
 	Limits   Limits
 	mu       sync.Mutex
@@ -112,10 +124,10 @@ func (s *Scheduler) Unreserve(id string) {
 
 func (s *Scheduler) allowLocked(reg *agent.Registry, a agent.Agent) (bool, string) {
 	if s.paused {
-		return false, "paused"
+		return false, WhyPaused
 	}
 	if a.Depth >= s.Limits.MaxDepth {
-		return false, "max hierarchy depth"
+		return false, WhyDepth
 	}
 	total, t1, t2 := reg.CountActive()
 	active := map[string]bool{}
@@ -140,13 +152,13 @@ func (s *Scheduler) allowLocked(reg *agent.Registry, a agent.Agent) (bool, strin
 		}
 	}
 	if total >= s.Limits.MaxTotal {
-		return false, "max concurrent agents"
+		return false, WhyTotal
 	}
 	if a.Tier == agent.Tier1 && t1 >= s.Limits.MaxTier1 {
-		return false, "max tier1 agents"
+		return false, WhyTier1
 	}
 	if a.Tier == agent.Tier2 && t2 >= s.Limits.MaxTier2 {
-		return false, "max tier2 agents"
+		return false, WhyTier2
 	}
 	return true, ""
 }

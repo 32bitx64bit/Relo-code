@@ -50,7 +50,7 @@ Dynamic, not a fixed org chart. Default roles:
 - **Worker / architect / debug / integration (tier 1)** — implementation.
 - **Reviewer / test** — independent verification.
 
-Scheduler enforces `relo.maxConcurrentAgents`, tier caps, and hierarchy depth. Duplicate mutating work is isolated with Git worktrees under `.relo/worktrees/<agent-id>/`.
+Scheduler enforces `relo.maxConcurrentAgents`, tier caps, and hierarchy depth. A task that does not fit shows as a queued agent saying which limit it waits on (at most four wait at a time), and takes a slot the moment one frees, the agent that has waited longest first; a request does not wait for a whole batch of workers to finish before the queue moves. When a run ends with agents still waiting they are retired, not left queued. Duplicate mutating work is isolated with Git worktrees under `.relo/worktrees/<agent-id>/`.
 
 ## Primary loop
 

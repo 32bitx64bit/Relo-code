@@ -785,83 +785,18 @@ func (c *Coord) drive(ctx context.Context) error {
 		if err := sched.Wait(ctx); err != nil {
 			return err
 		}
-		tasks := sched.Next(c.Graph, 4)
-		if len(tasks) == 0 {
+		if len(sched.Next(c.Graph, 1)) == 0 {
 			c.cancelOrphans()
 			return nil
 		}
 		c.refreshSnapshot()
 		c.primaryWaits()
-		var wg sync.WaitGroup
-		errs := make(chan error, len(tasks))
-		started := 0
-		for _, task := range tasks {
-			if err := sched.Wait(ctx); err != nil {
-				break
-			}
-			if ok, _ := sched.CanReserve(c.Agents, agent.Agent{Role: parseRole(task.Role), Depth: 1}); !ok {
-				break
-			}
-			a := c.spawn(task, parseRole(task.Role))
-			release, ok, why := sched.Reserve(c.Agents, a)
-			if !ok {
-				c.Agents.Update(a.ID, func(x *agent.Agent) { x.Status = agent.Queued; x.Activity = why })
-				continue
-			}
-			updated, err := c.Graph.Update(task.ID, func(x *taskgraph.Task) {
-				x.Status = taskgraph.Running
-				x.AgentID = a.ID
-				x.Started = time.Now().UTC()
-				x.Attempt++
-				x.Attempts++
-			})
-			if err != nil {
-				release()
-				c.logWarn("mark task running", err)
-				continue
-			}
-			c.Agents.Update(a.ID, func(x *agent.Agent) { x.Status = agent.Starting; x.Phase = "context"; x.Activity = "Starting" })
-			c.Agents.Update(a.ID, func(x *agent.Agent) { x.Attempt = updated.Attempt })
-			c.mu.Lock()
-			delete(c.escalations, task.ID)
-			c.mu.Unlock()
-			c.emit("task.updated", updated)
-			wg.Add(1)
-			started++
-			go func(t taskgraph.Task, ag agent.Agent) {
-				defer wg.Done()
-				defer sched.Unreserve(ag.ID)
-				err := c.guard("worker "+t.ID, func() error { return c.execWorker(ctx, t, ag) })
-				if err != nil && strings.HasPrefix(err.Error(), "internal error") {
-					// A panic skipped the worker's own bookkeeping: close the task here so the run can end.
-					c.fail(ag.ID, err)
-					c.failTask(t, ag, err)
-				}
-				c.Agents.Update(ag.ID, func(x *agent.Agent) {
-					if err != nil && ctx.Err() != nil {
-						x.Status, x.Activity = agent.Cancelled, "Stopped"
-					} else if err != nil {
-						x.Status, x.Activity = agent.Failed, err.Error()
-					}
-				})
-				if err != nil {
-					errs <- err
-				}
-			}(updated, a)
-		}
-		if started == 0 {
+		if c.dispatch(ctx, sched) == 0 {
 			if sched.Paused() {
 				continue
 			}
 			c.cancelOrphans()
 			return nil
-		}
-		wg.Wait()
-		close(errs)
-		for err := range errs {
-			if err != nil && ctx.Err() == nil {
-				c.logWarn("worker", err)
-			}
 		}
 		c.cancelOrphans()
 		c.repromptPrimary(ctx)
