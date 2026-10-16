@@ -443,6 +443,13 @@
           "maximum": 5,
           "description": "How many times a failed task may be retried (on a stronger model) before Relo stops and reports it. Every retry costs tokens."
         },
+        "relo.context.compactAt": {
+          "type": "number",
+          "default": 0.9,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Summarize an agent's conversation when it reaches this share of its context window (the smaller of the context limit and the model's own maximum). The work carries on from the summary. 0 turns this off."
+        },
         "relo.context.maxUtilization": {
           "type": "number",
           "default": 0.85

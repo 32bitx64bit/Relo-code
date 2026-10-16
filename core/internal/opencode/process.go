@@ -202,6 +202,8 @@ type Adapter struct {
 	Client *Client
 }
 
+var _ runtime.Compactor = (*Adapter)(nil)
+
 func (a *Adapter) StartSession(ctx context.Context, cfg runtime.SessionConfig) (runtime.SessionID, error) {
 	return a.Client.StartSession(ctx, cfg)
 }
@@ -213,6 +215,9 @@ func (a *Adapter) Events(ctx context.Context, session runtime.SessionID) (<-chan
 }
 func (a *Adapter) Cancel(ctx context.Context, session runtime.SessionID) error {
 	return a.Client.Cancel(ctx, session)
+}
+func (a *Adapter) Compact(ctx context.Context, session runtime.SessionID) error {
+	return a.Client.Compact(ctx, session)
 }
 func (a *Adapter) CloseSession(ctx context.Context, session runtime.SessionID) error {
 	return a.Client.CloseSession(ctx, session)

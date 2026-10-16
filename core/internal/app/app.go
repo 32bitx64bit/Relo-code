@@ -438,6 +438,11 @@ func (a *App) applySettings(p map[string]any) {
 	if n := num(p, "maxUtilization", 0); n > 0 {
 		s.MaxUtil = n
 	}
+	if _, ok := p["compactAt"]; ok { // 0 is a real value here: it turns compaction off
+		if n := num(p, "compactAt", 0.9); n >= 0 && n <= 1 {
+			s.CompactAt = n
+		}
+	}
 	if n := num(p, "refreshThreshold", 0); n > 0 {
 		s.Threshold = n
 	}

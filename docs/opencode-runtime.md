@@ -22,6 +22,7 @@ Relo Core starts `opencode serve --hostname 127.0.0.1 --port <ephemeral>`. Readi
 | GET | `/api/event` | Authenticated SSE event stream |
 | GET | `/api/session/:id/message` | Read assistant final text and token usage after idle |
 | POST | `/api/session/:id/interrupt` | Cancel current work |
+| POST | `/api/session/:id/compact` | Summarize the history (`delivery: steer`); see Context limit and compaction |
 | DELETE | `/api/session/:id` | Close session |
 | POST | `/api/session/:id/permission/:requestID/reply` | Reply with `once`, `always`, or `reject` |
 
@@ -34,6 +35,17 @@ SSE v2 data is `{ id, type, data }`. Relo filters by session, reconnects with ba
 `AgentTask.TimeoutSec` optionally bounds one turn. At expiry, Relo calls `/interrupt` and emits `session.error` with timeout detail; zero keeps caller-managed timeout behavior. Each call to `SendTask` sends `Prompt` verbatim as the only prompt field and does not add a wrapper or extra parts. The model is set only when provider/model changes; the `relo-system` instruction entry is PUT only when its SHA-256 changes. Reuse sessions sequentially and consume one terminal event before the next `SendTask`; usage is read from assistant messages since the latest user message, not accumulated across the whole session.
 
 On context refresh Relo aborts/closes the OpenCode session and starts a new one. The Relo agent id stays the same.
+
+## Context limit and compaction
+
+`relo.models.contextLimit` is Relo's number, not OpenCode's: OpenCode compacts on its own only near the end of the model's own window (on 2.0.29 it fired after a call of 85k tokens against a 100k window, and not after one of 80k), so under a 300k limit on a model that holds a million a conversation can grow towards 900k before OpenCode acts. Relo therefore watches the size itself.
+
+- `session.step.ended` carries the tokens of the one provider call that just ended (`tokens.input + output + cache.read + cache.write`) and `finish` (`tool-calls` when the turn goes on, `stop` when it ends). The adapter reports them as `Event.ContextTokens` and `Event.MoreSteps`. `session.usage.updated` is the running total of the turn and is not a size. The agent's context chip follows `ContextTokens` after every model call, not only when the turn ends.
+- When `ContextTokens` reaches `relo.context.compactAt` (default 0.9, 0 = off) of the agent's window (`min(relo.models.contextLimit, model max)`), and the step is going on to another one, Relo calls `POST /api/session/:id/compact` with `{"delivery":"steer"}`. OpenCode admits it at once, writes the summary at the next step boundary, and the same turn carries on from the summary in the same session. Events: `session.compaction.started`, `.delta`, `.ended` or `.failed` (also emitted for OpenCode's own automatic compaction, `reason: "auto"`).
+- The request is asynchronous. The end of the step that crossed the line reaches Relo after the next model call has begun, so one or two calls usually land after it. With a 300k window and steps of a few thousand tokens that is a few percent over the line, not a runaway. Measured by `TestTheRealOpenCodeIsSummarizedAtNinetyPercentOfTheLimit` (`RELO_E2E_OPENCODE=1`), which also runs the same task with compaction off to show the unbounded growth.
+- Guards: no request while a summary is already being written (Relo's or OpenCode's own); none on a step that ends the turn; none when the window is unknown; after a summary the first measurement must be back under the line or Relo stops asking in that turn and says so; a refused request is tried twice and then dropped.
+- A failed summary (`session.compaction.failed`, then `session.execution.failed`: "Compaction produced no summary") fails the turn like any provider error.
+- Not accounted: the summary's own model call is a `compaction` message, not an `assistant` one, so it is not in Relo's token counters.
 
 ## Token overhead
 

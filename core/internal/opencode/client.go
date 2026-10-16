@@ -395,6 +395,12 @@ func (c *Client) Cancel(ctx context.Context, session runtime.SessionID) error {
 	return ignoreNotFound("interrupt", string(session), err)
 }
 
+// Compact asks OpenCode to summarize the session's history. It is admitted at once and, steered, runs at the next
+// step boundary of a turn in progress; the turn carries on from the summary. Progress arrives as compaction events.
+func (c *Client) Compact(ctx context.Context, session runtime.SessionID) error {
+	return c.post(ctx, "/api/session/"+url.PathEscape(string(session))+"/compact", map[string]any{"delivery": "steer"}, nil)
+}
+
 func (c *Client) CloseSession(ctx context.Context, session runtime.SessionID) error {
 	sid := string(session)
 	c.mu.Lock()
@@ -782,12 +788,20 @@ func (c *Client) dispatch(ctx context.Context, raw string) {
 		ev.ToolID, _ = props["id"].(string)
 	case "session.execution.interrupted":
 		ev.Interrupted = true
+	case "session.step.ended":
+		// This usage is the one provider call that just ended; the session.usage.updated events around it add up.
+		if u := ev.Usage; u != nil {
+			ev.ContextTokens = u.Input + u.Output + u.CacheRead + u.CacheWrite
+		}
+		ev.MoreSteps = props["finish"] == "tool-calls"
 	case "session.compaction.started":
-		ev.Phase = "compacting"
+		ev.Phase, ev.Compaction = "compacting", "started"
 	case "session.compaction.delta":
 		ev.Phase, ev.Delta = "compacting", ""
-	case "session.compaction.ended", "session.compaction.failed":
-		ev.Phase = "model"
+	case "session.compaction.ended":
+		ev.Phase, ev.Compaction = "model", "ended"
+	case "session.compaction.failed":
+		ev.Phase, ev.Compaction = "model", "failed"
 	case "session.retry.scheduled":
 		ev.Phase = "retry"
 		if n, ok := props["attempt"].(float64); ok {

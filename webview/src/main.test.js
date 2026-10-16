@@ -297,6 +297,15 @@ test("settings: simple mode shows tiers, hides difficulty table; advanced does t
   assert.ok(mainApi.settingsPageHtml(cacheFx({ "relo.routing.mode": "bogus" }), "").includes("Tier 1 model"), "unknown mode falls back to simple");
 });
 
+test("settings: the compaction share is a bounded number on the Context page", () => {
+  const cache = cacheFx({ "relo.context.compactAt": 0.9 });
+  cache.schema = { ...schemaFx, "relo.context.compactAt": { type: "number", minimum: 0, maximum: 1, description: "share" } };
+  const html = mainApi.settingsPageHtml(cache, "");
+  assert.ok(html.includes("Compact at"), "the row is listed in a group, so it is shown");
+  assert.match(html, /min="0"[^>]*max="1"|max="1"[^>]*min="0"/, "a share outside 0 to 1 cannot be typed in");
+  assert.ok(html.includes('value="0.9"'));
+});
+
 test("model hint: ctx and effort list, nothing when unknown", () => {
   assert.equal(mainApi.modelHint(modelsFx[0]), "ctx 200.0k · low/med/high");
   assert.equal(mainApi.modelHint(modelsFx[1]), "ctx 32.0k");

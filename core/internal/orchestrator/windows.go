@@ -40,6 +40,16 @@ func (s Settings) BudgetFor(model string, base int) int {
 	return base
 }
 
+// CompactAfter is how many tokens model's context may hold before the conversation is summarized: the configured
+// share of its window. 0 means never, either because compaction is off or because the window is not known.
+func (s Settings) CompactAfter(model string) int {
+	w := s.Window(model)
+	if w <= 0 || s.CompactAt <= 0 || s.CompactAt > 1 {
+		return 0
+	}
+	return max(1, int(float64(w)*s.CompactAt))
+}
+
 // EffortFor returns the reasoning effort to request for model, or "" for the model default. The pick must be
 // one of the model's advertised efforts; anything else is ignored rather than sent to the endpoint.
 func (s Settings) EffortFor(model string) string {

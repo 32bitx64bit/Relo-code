@@ -60,6 +60,35 @@ func TestSettingsApplyReadsRoutingContextAndEfforts(t *testing.T) {
 	}
 }
 
+func TestSettingsApplyReadsTheCompactionShare(t *testing.T) {
+	core, _ := newMockApp(t)
+	if got := core.Coord.SettingsSnapshot().CompactAt; got != 0.9 {
+		t.Fatalf("default share = %v, want 0.9", got)
+	}
+	apply := func(payload string) float64 {
+		t.Helper()
+		if _, err := core.Handle("settings.apply", json.RawMessage(payload)); err != nil {
+			t.Fatal(err)
+		}
+		return core.Coord.SettingsSnapshot().CompactAt
+	}
+	if got := apply(`{"compactAt":0.75}`); got != 0.75 {
+		t.Errorf("share = %v, want 0.75", got)
+	}
+	if got := apply(`{"compactAt":0}`); got != 0 {
+		t.Errorf("share = %v: 0 must switch compaction off, not fall back to the default", got)
+	}
+	if got := apply(`{"contextLimit":300000}`); got != 0 {
+		t.Errorf("share = %v: a payload without compactAt must leave it alone", got)
+	}
+	if got := apply(`{"compactAt":1.5}`); got != 0 {
+		t.Errorf("share = %v: a share above 1 is not a share and must be ignored", got)
+	}
+	if got := apply(`{"compactAt":-0.2}`); got != 0 {
+		t.Errorf("share = %v: a negative share must be ignored", got)
+	}
+}
+
 func TestProvidersValidateAndKeysNeverLeak(t *testing.T) {
 	core, logs := newMockApp(t)
 	payload := `{"providers":[{"id":"acme","kind":"openai","baseURL":"https://api.acme.test/v1","models":[{"id":"m","context":64000}]}],"providerKeys":{"acme":"sk-very-secret"}}`

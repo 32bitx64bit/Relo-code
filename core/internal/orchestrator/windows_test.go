@@ -85,3 +85,34 @@ func TestRouteConfigCarriesMode(t *testing.T) {
 		t.Errorf("advanced must honour byDifficulty, got %q", got)
 	}
 }
+
+func TestCompactAfterIsTheShareOfTheWindow(t *testing.T) {
+	s := windowSettings(300_000)
+	cases := []struct {
+		model string
+		share float64
+		want  int
+	}{
+		{"p/big", 0.9, 270_000},   // the cap, not the model's million
+		{"p/small", 0.9, 28_800},  // a smaller model keeps its own window
+		{"p/blind", 0.5, 150_000}, // unknown model max: the cap is the window
+		{"p/big", 1, 300_000},
+		{"p/big", 0, 0},    // off
+		{"p/big", 1.2, 0},  // not a share
+		{"p/big", -0.1, 0}, // not a share
+	}
+	for _, tc := range cases {
+		s.CompactAt = tc.share
+		if got := s.CompactAfter(tc.model); got != tc.want {
+			t.Errorf("%s at %v = %d, want %d", tc.model, tc.share, got, tc.want)
+		}
+	}
+	s = windowSettings(0)
+	s.CompactAt = 0.9
+	if got := s.CompactAfter("p/blind"); got != 0 {
+		t.Errorf("unknown window = %d, want 0 (nothing to take a share of)", got)
+	}
+	if got := DefaultSettings().CompactAt; got != 0.9 {
+		t.Errorf("default share = %v, want 0.9", got)
+	}
+}

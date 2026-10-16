@@ -95,6 +95,15 @@ type Event struct {
 	// Interrupted is the runtime confirming that a Cancel stopped the turn. It is not a terminal event: the session
 	// stays usable, and a new task can be sent to it.
 	Interrupted bool `json:"interrupted,omitempty"`
+	// ContextTokens is set on the event that ends one model step: what that provider call held (input, cached input
+	// and output), which is how full the context is right now. Usage on the same event is that one call too, but the
+	// usage events around it add up over the turn. 0 when the event says nothing about it.
+	ContextTokens int `json:"contextTokens,omitempty"`
+	// MoreSteps is true on that same event when the step ended in tool calls, so the turn goes on with another
+	// model call. A step that ends in plain text is the end of the turn.
+	MoreSteps bool `json:"moreSteps,omitempty"`
+	// Compaction follows a history summary the runtime is running: "started", "ended" or "failed".
+	Compaction string `json:"compaction,omitempty"`
 }
 
 type Health struct {
@@ -114,6 +123,13 @@ type AgentRuntime interface {
 	Providers(ctx context.Context) ([]Provider, error)
 	Health(ctx context.Context) Health
 	Close() error
+}
+
+// Compactor is implemented by runtimes that can summarize a session's history while a turn is running. The summary
+// replaces the older messages and the turn carries on from it, with the same session and the same edits. The request
+// is admitted at once and runs at the next step boundary; progress arrives as events with Compaction set.
+type Compactor interface {
+	Compact(ctx context.Context, session SessionID) error
 }
 
 // RolePrimary must match agent.Primary. Duplicated as a string because this package

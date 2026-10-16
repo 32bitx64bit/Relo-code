@@ -898,6 +898,7 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 			armed = st.quietLimit()
 			rearm(quiet, armed)
 			c.handleEvent(ctx, a, ev, &body, st)
+			c.watchContext(ctx, a, rt, sid, ev, st)
 			// A terminal event can carry the provider's failure (session.execution.failed is Done and Error
 			// together). The error check must come first, or the failure is returned as an empty body and
 			// surfaces as "invalid JSON" instead of the real cause.
@@ -1049,6 +1050,8 @@ type runState struct {
 	interrupting bool          // a stuck call was interrupted and the runtime has not yet confirmed
 	nudge        string        // what to tell the agent once it has
 	stalledFor   time.Duration // how long the agent had been quiet when it was interrupted
+
+	watch contextWatch // how full the context is and whether it is being summarized; see compact.go
 }
 
 // An agent is stopped when it goes quiet, never for being busy. It used to be stopped 8 minutes after it began,
