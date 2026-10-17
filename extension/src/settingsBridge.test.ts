@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 import { checkCommand, checkSessionId, checkSetting, isAllowedCommand, modelsSignature, settingsReply, type SettingsSchema } from "./settingsBridge";
 
 const schema: SettingsSchema = {
@@ -14,6 +15,19 @@ const schema: SettingsSchema = {
 
 test("settings: unknown key rejected", () => {
   assert.equal(checkSetting("relo.nope", "x", schema).ok, false);
+});
+
+test("changes settings and repository command match the extension manifest", () => {
+  const manifest = JSON.parse(readFileSync("package.json", "utf8"));
+  const actual: SettingsSchema = manifest.contributes.configuration.properties;
+  assert.equal(actual["relo.changes.autoApply"].default, false);
+  assert.equal(actual["relo.repository"].default, "");
+  assert.equal(checkSetting("relo.changes.autoApply", true, actual).ok, true);
+  assert.equal(checkSetting("relo.changes.autoApply", "true", actual).ok, false);
+  assert.equal(checkSetting("relo.repository", "/work/repository", actual).ok, true);
+  assert.equal(checkSetting("relo.repository", {}, actual).ok, false);
+  assert.deepEqual(checkCommand({ command: "relo.selectRepository" }), { ok: true, command: "relo.selectRepository", args: [] });
+  assert.ok(manifest.contributes.commands.some((c: { command: string }) => c.command === "relo.selectRepository"));
 });
 
 test("settings: non-relo key rejected", () => {

@@ -791,7 +791,7 @@ func (c *Client) dispatch(ctx context.Context, raw string) {
 	case "session.step.ended":
 		// This usage is the one provider call that just ended; the session.usage.updated events around it add up.
 		if u := ev.Usage; u != nil {
-			ev.ContextTokens = u.Input + u.Output + u.CacheRead + u.CacheWrite
+			ev.ContextTokens = u.PromptTokens()
 		}
 		ev.MoreSteps = props["finish"] == "tool-calls"
 	case "session.compaction.started":
@@ -947,7 +947,7 @@ func (c *Client) completeEvent(ctx context.Context, ev *runtime.Event, props map
 			if usage := parseUsageJSON(msg.Tokens); usage != nil {
 				if total.Context == 0 {
 					// Newest first: the first message with usage is the last provider call.
-					total.Context = usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
+					total.Context = usage.PromptTokens()
 				}
 				total.Input += usage.Input
 				total.Output += usage.Output

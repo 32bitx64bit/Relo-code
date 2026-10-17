@@ -169,6 +169,134 @@ func TestAcceptAllReportsConflictsAndAppliesTheRest(t *testing.T) {
 	}
 }
 
+func TestAcceptAllClearsConflictState(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n", "b.txt": "two\n"})
+	first := proposeChange(t, core, dir, "a.txt", func(p string) {
+		if err := os.WriteFile(p, []byte("agent a\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := os.WriteFile(filepath.Join(first.Worktree, "b.txt"), []byte("agent b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := core.Coord.Current()
+	s.Changes = append(s.Changes, orchestrator.Change{ID: "c2", AgentID: first.AgentID, Path: "b.txt", Status: "proposed", Worktree: first.Worktree})
+	for i := range s.Changes {
+		s.Changes[i].Conflict = overlapReason
+		s.Changes[i].Resolving = true
+	}
+	core.Coord.Restore(s)
+
+	res, err := core.decideAll(true)
+	if err != nil {
+		t.Fatalf("accept all: %v", err)
+	}
+	m := res.(map[string]any)
+	if m["done"] != 2 || len(m["failed"].([]bulkFailure)) != 0 {
+		t.Fatalf("bulk result = %+v", m)
+	}
+	changes := m["changes"].([]orchestrator.Change)
+	if len(changes) != 2 {
+		t.Fatalf("returned changes = %+v", changes)
+	}
+	for _, ch := range changes {
+		if ch.Status != "accepted" || ch.Conflict != "" || ch.Resolving {
+			t.Fatalf("accepted change keeps conflict state: %+v", ch)
+		}
+	}
+	if _, err := os.Stat(first.Worktree); !os.IsNotExist(err) {
+		t.Fatalf("worktree was not released: %v", err)
+	}
+}
+
+func TestAcceptAllBatchKeepsSameFileOrderAndPartialFailures(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n", "b.txt": "uno\n", "c.txt": "tres\n"})
+	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
+	tree, err := core.Coord.WS.EnsureTree("agent_batch", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(tree.Path, "a.txt"), []byte("agent a\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(tree.Path, "b.txt"), []byte("agent b\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(tree.Path, "c.txt"), []byte("agent c\n"), 0o644)
+	s := core.Coord.Current()
+	s.Changes = []orchestrator.Change{
+		{ID: "c1", AgentID: "agent_batch", Path: "a.txt", Status: "proposed", Worktree: tree.Path},
+		{ID: "c2", AgentID: "agent_batch", Path: "b.txt", Status: "proposed", Worktree: tree.Path},
+		{ID: "c3", AgentID: "agent_batch", Path: "a.txt", Status: "proposed", Worktree: tree.Path},
+		{ID: "c4", AgentID: "agent_batch", Path: "c.txt", Status: "proposed", Worktree: tree.Path},
+	}
+	core.Coord.Restore(s)
+	_ = os.WriteFile(filepath.Join(dir, "c.txt"), []byte("mine c\n"), 0o644)
+	res, err := core.decideAll(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := res.(map[string]any)
+	failed := m["failed"].([]bulkFailure)
+	if m["done"] != 3 || len(failed) != 1 || failed[0].ID != "c4" {
+		t.Fatalf("bulk result = %+v", m)
+	}
+	for _, id := range []string{"c1", "c2", "c3"} {
+		if now, _ := core.Coord.FindChange(id); now.Status != "accepted" {
+			t.Fatalf("%s status = %q", id, now.Status)
+		}
+	}
+	if now, _ := core.Coord.FindChange("c4"); now.Status != "proposed" {
+		t.Fatalf("failed change status = %q", now.Status)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "agent a\n" {
+		t.Fatalf("a.txt = %q (same-file changes must apply in order)", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "b.txt")); string(got) != "agent b\n" {
+		t.Fatalf("b.txt = %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "c.txt")); string(got) != "mine c\n" {
+		t.Fatalf("c.txt was touched: %q", got)
+	}
+}
+
+func TestAcceptAllMergesSamePathChangesFromDifferentAgents(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "one\ntwo\nthree\nfour\n"})
+	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
+	firstTree, err := core.Coord.WS.EnsureTree("agent_first", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondTree, err := core.Coord.WS.EnsureTree("agent_second", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(firstTree.Path, "a.txt"), []byte("ONE\ntwo\nthree\nfour\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(secondTree.Path, "a.txt"), []byte("one\ntwo\nthree\nFOUR\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := core.Coord.Current()
+	s.Changes = []orchestrator.Change{
+		{ID: "first", AgentID: "agent_first", Path: "a.txt", Status: "proposed", Worktree: firstTree.Path},
+		{ID: "second", AgentID: "agent_second", Path: "a.txt", Status: "proposed", Worktree: secondTree.Path},
+	}
+	core.Coord.Restore(s)
+
+	res, err := core.decideAll(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := res.(map[string]any)
+	if m["done"] != 2 || len(m["failed"].([]bulkFailure)) != 0 {
+		t.Fatalf("bulk result = %+v", m)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "ONE\ntwo\nthree\nFOUR\n" {
+		t.Fatalf("merged file = %q", got)
+	}
+}
+
 func TestSessionHistoryNewOpenDelete(t *testing.T) {
 	core, dir := newGitCore(t, map[string]string{"a.txt": "x\n"})
 	core.Coord.CreateSession(dir, "first goal", orchestrator.ModeBuild)

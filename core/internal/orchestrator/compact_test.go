@@ -115,6 +115,37 @@ func TestExactlyTheShareCounts(t *testing.T) {
 	}
 }
 
+func TestCompactionUsesEachRequestsPromptIncludingCache(t *testing.T) {
+	for _, tc := range []struct {
+		name, model          string
+		window, prompt, want int
+	}{
+		{"global cap below threshold", "p/big", 300_000, 269_999, 0},
+		{"global cap at threshold", "p/big", 300_000, 270_000, 1},
+		{"model window below threshold", "p/small", 200_000, 179_999, 0},
+		{"model window at threshold", "p/small", 200_000, 180_000, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Multiple tool calls can exceed the window in cumulative usage without any one prompt reaching it.
+			step := func() rt.Event {
+				return rt.Event{Type: "session.step.ended", MoreSteps: true,
+					Usage: &rt.Usage{Input: 1_000, CacheRead: tc.prompt - 1_100, CacheWrite: 100, Output: 8_034, Reasoning: 500}}
+			}
+			c, r, _ := newCompacting(t, nil, func(s *Settings) {
+				s.PrimaryModel = tc.model
+				s.Models["p/small"] = rt.Model{ID: "small", Provider: "p", Context: 200_000}
+			}, step(), rt.Event{Type: "session.usage.updated", Usage: &rt.Usage{Input: 900_000, CacheRead: 900_000}}, step(), step())
+			run(t, c)
+			if got := r.asked(); got != tc.want {
+				t.Fatalf("summaries = %d, want %d at %d prompt tokens", got, tc.want, tc.prompt)
+			}
+			if p := primaryOf(c); p.ContextTokens != tc.prompt || p.Window != tc.window {
+				t.Fatalf("context = %d / %d, want %d / %d", p.ContextTokens, p.Window, tc.prompt, tc.window)
+			}
+		})
+	}
+}
+
 func TestBelowTheShareNothingIsSummarizedButTheSizeIsShown(t *testing.T) {
 	c, r, _ := newCompacting(t, nil, nil, stepEnd(269_000, true))
 	run(t, c)

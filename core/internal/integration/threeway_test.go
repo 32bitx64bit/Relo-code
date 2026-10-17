@@ -83,3 +83,30 @@ func TestMergeRefusesUnsafePaths(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckMatchesMergeWithoutWriting(t *testing.T) {
+	root, wt := t.TempDir(), t.TempDir()
+	write(t, root, "f.txt", "ONE\ntwo\n")
+	write(t, wt, "f.txt", "one\ntwo\n")
+	write(t, wt, "new.txt", "fresh\n")
+	if reason, err := Check(root, wt, "new.txt", nil, false); err != nil || reason != "" {
+		t.Fatalf("clean add: reason=%q err=%v", reason, err)
+	}
+	if reason, err := Check(root, wt, "f.txt", []byte("one\ntwo\n"), true); err != nil || reason != "" {
+		t.Fatalf("clean update: reason=%q err=%v", reason, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "new.txt")); !os.IsNotExist(err) {
+		t.Fatalf("Check wrote new.txt: %v", err)
+	}
+	if got := read(t, root, "f.txt"); got != "ONE\ntwo\n" {
+		t.Fatalf("Check changed f.txt: %q", got)
+	}
+	write(t, root, "f.txt", "ONE\ntwo\n")
+	write(t, wt, "f.txt", "agent\ntwo\n")
+	if reason, err := Check(root, wt, "f.txt", []byte("one\ntwo\n"), true); err != nil || reason != "your edits and the agent's edits overlap" {
+		t.Fatalf("overlap: reason=%q err=%v", reason, err)
+	}
+	if reason, err := Check(root, wt, ".git/config", nil, false); err != nil || reason != "protected metadata path" {
+		t.Fatalf("protected: reason=%q err=%v", reason, err)
+	}
+}

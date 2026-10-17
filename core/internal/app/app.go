@@ -70,6 +70,16 @@ type App struct {
 	// sessMu serialises writes of the session to the database with switching sessions, so one session's agents are
 	// never saved under another's id.
 	sessMu       sync.Mutex
+	decisionMu   sync.Mutex                     // serialises change decisions for the current session
+	conflictSet  map[string]map[string][]string // session id -> path -> ids of conflicted changes; guarded by decisionMu
+	autoApply    atomic.Bool
+	autoMu       sync.Mutex
+	autoDirty    bool
+	autoStopped  bool
+	autoDone     chan struct{} // non-nil while the coalesced auto-apply worker is running
+	headMu       sync.Mutex
+	headQueue    []headMessage // head messages waiting for the running turn to end; guarded by headMu
+	headBusy     bool          // a goroutine is draining headQueue; guarded by headMu
 	persistMu    sync.Mutex
 	persistTimer *time.Timer
 	closed       bool
@@ -139,6 +149,10 @@ func (a *App) AttachIPC(srv *ipc.Server) {
 			if persistEvents[name] {
 				a.persistSoon()
 			}
+		}
+		if name == "changes.updated" {
+			go a.safely("supersede conflicts", a.supersedeStale)
+			a.scheduleAutoApply()
 		}
 		if name == "agent.completed" || name == "agent.failed" {
 			go a.safely("deferred restart", a.applyPendingRestart)
@@ -300,6 +314,8 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 		return a.decideAll(false)
 	case "changes.diff":
 		return a.changeDiff(str(p, "id", ""))
+	case "changes.resolveConflicts":
+		return a.resolveConflicts()
 	case "verification.list":
 		if s := a.Coord.Current(); s != nil {
 			return s.Verify, nil
@@ -363,6 +379,8 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 }
 
 func (a *App) initialize(ctx context.Context, p map[string]any) (any, error) {
+	a.decisionMu.Lock()
+	defer a.decisionMu.Unlock()
 	if v := str(p, "workspace", ""); v != "" {
 		a.Cfg.Workspace = v
 	}
@@ -376,6 +394,7 @@ func (a *App) initialize(ctx context.Context, p map[string]any) (any, error) {
 		if json.Unmarshal(raw, &s) == nil {
 			a.Coord.Restore(&s)
 			a.restoreSession(s.ID)
+			a.clearResolvingLoaded()
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		a.Log.Error("restore session failed", map[string]any{"workspace": a.Cfg.Workspace, "error": err.Error()})
@@ -410,6 +429,12 @@ func (a *App) initialize(ctx context.Context, p map[string]any) (any, error) {
 }
 
 func (a *App) applySettings(p map[string]any) {
+	if enabled, ok := p["autoApply"].(bool); ok {
+		a.autoApply.Store(enabled)
+		if enabled {
+			a.scheduleAutoApply()
+		}
+	}
 	s := a.Coord.SettingsSnapshot()
 	if v := str(p, "primaryModel", ""); v != "" {
 		s.PrimaryModel = v
@@ -880,6 +905,7 @@ func cachePayload(snapshot metrics.CacheSnapshot) map[string]any {
 
 func (a *App) Close() {
 	a.once.Do(func() {
+		a.stopAutoApply()
 		a.stopPersistTimer()
 		a.persist()
 		a.Coord.StopAll(context.Background())

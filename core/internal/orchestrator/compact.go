@@ -48,10 +48,13 @@ func (c *Coord) watchContext(ctx context.Context, a agent.Agent, rt runtime.Agen
 		w.compacting, w.before = false, 0
 		c.logWarn("context compaction", fmt.Errorf("agent %s: the runtime could not summarize the conversation", a.ID))
 	}
-	if ev.ContextTokens <= 0 {
+	held := ev.ContextTokens
+	if ev.Type == "session.step.ended" && ev.Usage != nil {
+		held = ev.Usage.PromptTokens()
+	}
+	if held <= 0 {
 		return
 	}
-	held := ev.ContextTokens
 	w.last = held
 	settings := c.settings()
 	window := settings.Window(a.Model)

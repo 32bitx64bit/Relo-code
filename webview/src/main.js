@@ -488,8 +488,15 @@
   }
 
   function drawerRowsChanges(s) {
-    const changes = s.changes || [];
-    if (!changes.length) return `<div class="drawer-row mini">No changes</div>`;
+    const autoApply = !!valueOf("relo.changes.autoApply");
+    const repo = settingsCache && settingsCache.repository;
+    const controls = `<div class="drawer-row"><label><input type="checkbox" data-auto-apply${autoApply ? " checked" : ""}/> Auto-apply proposed changes</label></div>
+      <div class="drawer-row mini">Unstaged edits only. No commit or push.</div>
+      <div class="drawer-row mini"><button type="button" class="link-btn grow" data-cmd="relo.selectRepository" title="${attr(repo ? `Select repository: ${repo.root}` : "Select repository")}">${esc(repo ? repo.root : "Select repository")}</button>${repo ? ` <span>${esc(repo.branch)}</span>` : ""}</div>`;
+    const changes = (s.changes || []).filter((c) => !(c && c.superseded));
+    if (!changes.length) return controls + `<div class="drawer-row mini">No changes</div>`;
+    const resolving = changes.filter((c) => c.resolving && !isDecided(c)).length;
+    const banner = resolving ? `<div class="drawer-row mini" role="status">Resolving ${resolving} conflict${resolving === 1 ? "" : "s"} via head agent</div>` : "";
     const rows = changes.map((c) => {
       const status = String(c.status || "").toLowerCase();
       const applied = status === "applied";
@@ -504,7 +511,7 @@
       return `<div class="drawer-row${decided ? " dim" : ""}" role="treeitem" aria-level="1" data-key="ch-${attr(c.id)}">
         ${deco}
         <button type="button" class="link-btn grow" data-command="relo.changes.diff" data-id="${attr(c.id)}" title="Open diff">${esc(c.path)}</button>
-        ${lines}${state}
+        ${lines}${state}${c.conflict && !decided ? `<span class="badge" title="${attr(c.conflict)}">conflict</span><div class="mini" role="note">Conflict: ${esc(c.conflict)}</div>` : ""}${c.resolving && !decided ? `<span class="mini" role="status">resolving</span>` : ""}
         <span class="actions shown">
           ${rowBtn("command", "relo.changes.accept", c.id, "check", "Accept change", off)}
           ${rowBtn("command", "relo.changes.reject", c.id, "close", "Reject change", off)}
@@ -513,11 +520,11 @@
     }).join("");
     const pending = changes.filter((c) => !isDecided(c) && String(c.status || "").toLowerCase() !== "applied").length;
     const note = pending ? `<div class="drawer-row mini">Compared with your files when the agent started. Nothing here is in your files until you accept it.</div>` : "";
-    const foot = pending > 1 ? `<div class="drawer-foot">
-      <button type="button" class="secondary" data-cmd="relo.changes.acceptAll">Accept all (${pending})</button>
-      <button type="button" class="secondary" data-cmd="relo.changes.rejectAll">Reject all</button>
-    </div>` : "";
-    return note + rows + foot;
+    const bulk = pending > 1 ? `<button type="button" class="secondary" data-cmd="relo.changes.acceptAll">Accept all (${pending})</button>
+      <button type="button" class="secondary" data-cmd="relo.changes.rejectAll">Reject all</button>` : "";
+    const resolve = pending ? `<button type="button" class="secondary" data-cmd="relo.changes.resolveConflicts">Resolve conflicts</button>` : "";
+    const foot = bulk || resolve ? `<div class="drawer-foot">${bulk}${resolve}</div>` : "";
+    return controls + banner + note + rows + foot;
   }
 
   function drawerRowsChecks(s) {
@@ -1398,7 +1405,7 @@
       agentRowsHtml: (agents) => agentRows(agents),
       efficiencyHtml: (eff) => efficiencyHtml(eff),
       stripHtml: (s) => withState(s, () => strip(s)),
-      drawerHtml: (name, s) => withState(s, () => drawerBody(name, s)),
+      drawerHtml: (name, s, cache) => withSettings(cache, "", () => withState(s, () => drawerBody(name, s))),
       toolbarHtml: (s) => withState(s, () => toolbar(s)),
       chipCounts: (s) => chipCounts(s || {}),
       contextPct: (s) => contextPct(s || {}),
@@ -1771,6 +1778,7 @@
   });
   root.addEventListener("change", (e) => {
     if (e.target && e.target.id === "mode") post({ type: "mode", mode: e.target.value });
+    if (e.target && e.target.matches("[data-auto-apply]")) post({ type: "settings.set", key: "relo.changes.autoApply", value: e.target.checked });
   });
 
   function bindSettings() {

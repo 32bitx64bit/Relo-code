@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/relocode/relo/internal/integration"
@@ -170,6 +171,8 @@ func (a *App) sweepWorktrees() {
 // newSession stops whatever is running, saves the session being left and starts a blank one.
 func (a *App) newSession(ctx context.Context, mode orchestrator.Mode, objective string) *orchestrator.Session {
 	a.Coord.StopAll(ctx)
+	a.decisionMu.Lock()
+	defer a.decisionMu.Unlock()
 	a.sessMu.Lock()
 	a.persistLocked()
 	old := a.Coord.Current()
@@ -194,6 +197,8 @@ func (a *App) deleteStored(id string) {
 
 // openSession switches to a stored session.
 func (a *App) openSession(ctx context.Context, id string) (any, error) {
+	a.decisionMu.Lock()
+	defer a.decisionMu.Unlock()
 	cur := a.Coord.Current()
 	if cur != nil && cur.ID == id {
 		return a.Coord.Snapshot(), nil
@@ -211,6 +216,7 @@ func (a *App) openSession(ctx context.Context, id string) (any, error) {
 	old := a.Coord.Current()
 	a.Coord.OpenSession(ctx, &s)
 	a.restoreSession(s.ID)
+	a.clearResolvingLoaded()
 	if old != nil && emptySession(old) {
 		a.deleteStored(old.ID)
 	}
@@ -221,6 +227,8 @@ func (a *App) openSession(ctx context.Context, id string) (any, error) {
 
 // deleteSession removes a stored session. Deleting the open one leaves a fresh blank session in its place.
 func (a *App) deleteSession(ctx context.Context, id string) (any, error) {
+	a.decisionMu.Lock()
+	defer a.decisionMu.Unlock()
 	if id == "" {
 		return nil, ipc.Fail{C: "invalid_params", M: "id is required"}
 	}
@@ -350,6 +358,9 @@ func (a *App) settle(agentID string) {
 }
 
 func (a *App) acceptChange(id string) (any, error) {
+	a.decisionMu.Lock()
+	defer a.decisionMu.Unlock()
+
 	ch, ok := a.Coord.FindChange(id)
 	if !ok {
 		return nil, ipc.Fail{C: "not_found", M: "change not found"}
@@ -363,31 +374,50 @@ func (a *App) acceptChange(id string) (any, error) {
 	default:
 		return nil, ipc.Fail{C: "invalid_state", M: "this change is not waiting for a decision"}
 	}
-	if !a.ownWorktree(ch.Worktree) || ch.Path == "" {
-		return nil, ipc.Fail{C: "invalid_change", M: "change lacks a worktree or path"}
-	}
-	if _, err := os.Stat(ch.Worktree); err != nil {
-		return nil, ipc.Fail{C: "not_found", M: "the agent's worktree no longer exists, so this change cannot be applied"}
-	}
-	tree, err := a.Coord.WS.EnsureTree(ch.AgentID, false)
-	if err != nil || tree.Path != ch.Worktree {
-		return nil, ipc.Fail{C: "not_found", M: "the agent's worktree could not be opened"}
-	}
-	base, hadBase, err := a.Coord.WS.BaseContent(ch.AgentID, ch.Path)
+	outcome, err := a.mergeChange(ch)
 	if err != nil {
-		return nil, ipc.Fail{C: "integration_failed", M: err.Error()}
+		return nil, err
 	}
-	outcome, err := integration.Merge(a.Cfg.Workspace, tree.Path, ch.Path, base, hadBase)
-	if err != nil {
-		return nil, conflictFail(err, ch.Path)
-	}
-	updated, _ := a.Coord.UpdateChange(id, func(c *orchestrator.Change) { c.Status = "accepted" })
+	updated, _ := a.Coord.UpdateChange(id, func(c *orchestrator.Change) { c.Status, c.Conflict, c.Resolving = "accepted", "", false })
 	a.settle(ch.AgentID)
 	a.persist()
 	return map[string]any{"change": updated, "integration": outcome}, nil
 }
 
+// mergeChange three-way merges one proposed change into the workspace. It does not change the status or persist.
+func (a *App) mergeChange(ch orchestrator.Change) (integration.Outcome, error) {
+	if !a.ownWorktree(ch.Worktree) || ch.Path == "" {
+		return integration.Outcome{}, ipc.Fail{C: "invalid_change", M: "change lacks a worktree or path"}
+	}
+	if _, err := os.Stat(ch.Worktree); err != nil {
+		return integration.Outcome{}, ipc.Fail{C: "not_found", M: "the agent's worktree no longer exists, so this change cannot be applied"}
+	}
+	tree, err := a.Coord.WS.EnsureTree(ch.AgentID, false)
+	if err != nil || tree.Path != ch.Worktree {
+		return integration.Outcome{}, ipc.Fail{C: "not_found", M: "the agent's worktree could not be opened"}
+	}
+	base, hadBase, err := a.baseOf(ch)
+	if err != nil {
+		return integration.Outcome{}, ipc.Fail{C: "integration_failed", M: err.Error()}
+	}
+	outcome, err := integration.Merge(a.Cfg.Workspace, tree.Path, ch.Path, base, hadBase)
+	if err != nil {
+		var ce integration.ConflictError
+		if errors.As(err, &ce) {
+			a.Coord.UpdateChange(ch.ID, func(c *orchestrator.Change) { c.Conflict = ce.Report.Reason })
+		}
+		return integration.Outcome{}, conflictFail(err, ch.Path)
+	}
+	return outcome, nil
+}
+
 func (a *App) rejectChange(id string) (any, error) {
+	a.decisionMu.Lock()
+	defer a.decisionMu.Unlock()
+	return a.rejectChangeLocked(id)
+}
+
+func (a *App) rejectChangeLocked(id string) (any, error) {
 	ch, ok := a.Coord.FindChange(id)
 	if !ok {
 		return nil, ipc.Fail{C: "not_found", M: "change not found"}
@@ -415,7 +445,7 @@ func (a *App) rejectChange(id string) (any, error) {
 			}
 		}
 	}
-	updated, _ := a.Coord.UpdateChange(id, func(c *orchestrator.Change) { c.Status = "rejected" })
+	updated, _ := a.Coord.UpdateChange(id, func(c *orchestrator.Change) { c.Status, c.Conflict, c.Resolving = "rejected", "", false })
 	a.settle(ch.AgentID)
 	a.persist()
 	return map[string]any{"change": updated}, nil
@@ -427,21 +457,105 @@ type bulkFailure struct {
 	Reason string `json:"reason"`
 }
 
-// decideAll accepts or rejects every change that is waiting, one by one, so a conflict in one file does not block the rest.
+// decideAll accepts or rejects every change that is waiting, so a conflict in one file does not block the rest.
+// Accepts merge changes to the same destination path in their original order and different paths concurrently, then update
+// the session, release worktrees and persist once for the whole batch.
 func (a *App) decideAll(accept bool) (any, error) {
+	if !accept {
+		return a.rejectAll()
+	}
+	return a.acceptAll(false)
+}
+
+func (a *App) acceptAll(auto bool) (any, error) {
+	a.decisionMu.Lock()
+	defer a.decisionMu.Unlock()
+
+	var waiting []orchestrator.Change
+	for _, ch := range a.Coord.Changes() {
+		if ch.Status == "proposed" && (!auto || (a.autoApply.Load() && autoEligible(ch))) {
+			waiting = append(waiting, ch)
+		}
+	}
+	errs := make([]error, len(waiting))
+	skipped := make([]bool, len(waiting))
+	groups := map[string][]int{}
+	var order []string
+	for i, ch := range waiting {
+		key := ch.Path
+		if _, ok := groups[key]; !ok {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], i)
+	}
+	sem := make(chan struct{}, bulkMergeWorkers)
+	var wg sync.WaitGroup
+	for _, key := range order {
+		wg.Add(1)
+		go func(idx []int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			for _, i := range idx {
+				current, ok := a.Coord.FindChange(waiting[i].ID)
+				if !ok {
+					errs[i] = ipc.Fail{C: "not_found", M: "change not found"}
+					continue
+				}
+				if auto && (!a.autoApply.Load() || !autoEligible(current)) {
+					skipped[i] = true
+					continue
+				}
+				if current.Status != "proposed" {
+					errs[i] = ipc.Fail{C: "invalid_state", M: "this change is not waiting for a decision"}
+					continue
+				}
+				_, errs[i] = a.mergeChange(current)
+			}
+		}(groups[key])
+	}
+	wg.Wait()
+
+	done := 0
+	failed := []bulkFailure{}
+	var accepted []string
+	agents := map[string]bool{}
+	for i, ch := range waiting {
+		if skipped[i] {
+			continue
+		}
+		if errs[i] != nil {
+			failed = append(failed, bulkFailure{ID: ch.ID, Path: ch.Path, Reason: errs[i].Error()})
+			if auto {
+				a.Coord.UpdateChange(ch.ID, func(c *orchestrator.Change) { c.Conflict = errs[i].Error() })
+			}
+			continue
+		}
+		accepted = append(accepted, ch.ID)
+		agents[ch.AgentID] = true
+		done++
+	}
+	a.Coord.UpdateChanges(accepted, func(c *orchestrator.Change) { c.Status, c.Conflict, c.Resolving = "accepted", "", false })
+	for agentID := range agents {
+		a.settle(agentID)
+	}
+	if done > 0 || (auto && len(failed) > 0) {
+		a.persist()
+	}
+	return map[string]any{"done": done, "failed": failed, "changes": a.Coord.Changes()}, nil
+}
+
+func (a *App) rejectAll() (any, error) {
+	a.decisionMu.Lock()
+	defer a.decisionMu.Unlock()
+
 	done := 0
 	failed := []bulkFailure{}
 	for _, ch := range a.Coord.Changes() {
 		if ch.Status != "proposed" {
 			continue
 		}
-		var err error
-		if accept {
-			_, err = a.acceptChange(ch.ID)
-		} else {
-			_, err = a.rejectChange(ch.ID)
-		}
-		if err != nil {
+		if _, err := a.rejectChangeLocked(ch.ID); err != nil {
 			failed = append(failed, bulkFailure{ID: ch.ID, Path: ch.Path, Reason: err.Error()})
 			continue
 		}
@@ -449,3 +563,6 @@ func (a *App) decideAll(accept bool) (any, error) {
 	}
 	return map[string]any{"done": done, "failed": failed, "changes": a.Coord.Changes()}, nil
 }
+
+// bulkMergeWorkers bounds how many files are merged at the same time during accept-all.
+const bulkMergeWorkers = 4

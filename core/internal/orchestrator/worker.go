@@ -904,7 +904,12 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 			// surfaces as "invalid JSON" instead of the real cause.
 			if ev.Error == "" && (ev.Done || ev.Idle) {
 				if ev.Done && ev.Usage != nil && !usageRecorded {
-					c.recordUsage(a, gen, *ev.Usage, st.live)
+					usage := *ev.Usage
+					// Turn totals are billing, not window occupancy. Prefer this turn's latest measured request.
+					if usage.Context <= 0 && st.watch.last > 0 {
+						usage.Context = st.watch.last
+					}
+					c.recordUsage(a, gen, usage, st.live)
 					usageRecorded = true
 				}
 				if ev.JSON != "" {
@@ -1009,7 +1014,7 @@ func (c *Coord) recordUsage(a agent.Agent, generation int, usage runtime.Usage, 
 	c.mu.Unlock()
 	held := usage.Context
 	if held <= 0 {
-		held = usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
+		held = usage.PromptTokens()
 	}
 	window := c.settings().Window(a.Model)
 	c.Agents.Update(a.ID, func(x *agent.Agent) {

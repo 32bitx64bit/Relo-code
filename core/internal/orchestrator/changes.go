@@ -49,6 +49,30 @@ func (c *Coord) UpdateChange(id string, fn func(*Change)) (Change, bool) {
 	return out, found
 }
 
+// UpdateChanges edits every change whose id is in ids under one lock and tells the UI once.
+func (c *Coord) UpdateChanges(ids []string, fn func(*Change)) {
+	if len(ids) == 0 {
+		return
+	}
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	c.mu.Lock()
+	if c.sess == nil {
+		c.mu.Unlock()
+		return
+	}
+	for i := range c.sess.Changes {
+		if want[c.sess.Changes[i].ID] {
+			fn(&c.sess.Changes[i])
+		}
+	}
+	snapshot := append([]Change{}, c.sess.Changes...)
+	c.mu.Unlock()
+	c.emit("changes.updated", snapshot)
+}
+
 // OpenChanges counts the changes of one agent that still wait for a decision.
 func (c *Coord) OpenChanges(agentID string) int {
 	c.mu.Lock()

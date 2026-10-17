@@ -36,6 +36,7 @@ export const COMMAND_ALLOWLIST = new Set<string>([
   "relo.openLogs",
   "relo.showCacheStats",
   "relo.selectPrimaryModel",
+  "relo.selectRepository",
   "relo.agent.stop",
   "relo.agent.refresh",
   "relo.agent.inspect",
@@ -45,6 +46,7 @@ export const COMMAND_ALLOWLIST = new Set<string>([
   "relo.changes.diff",
   "relo.changes.acceptAll",
   "relo.changes.rejectAll",
+  "relo.changes.resolveConflicts",
 ]);
 
 // Commands that take a single {id} payload.

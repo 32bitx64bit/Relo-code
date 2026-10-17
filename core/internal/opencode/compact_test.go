@@ -20,8 +20,8 @@ func TestAStepEndReportsWhatTheCallHeld(t *testing.T) {
 	if len(evs) != 3 {
 		t.Fatalf("got %d events: %+v", len(evs), evs)
 	}
-	if got := evs[0].ContextTokens; got != 8000+500+30000+2000 {
-		t.Errorf("first step held %d tokens, want 40500 (input, cached input and output)", got)
+	if got := evs[0].ContextTokens; got != 8000+30000+2000 {
+		t.Errorf("first step held %d tokens, want 40000 prompt tokens (output excluded)", got)
 	}
 	if !evs[0].MoreSteps {
 		t.Error("a step that ended in tool calls was not reported as going on")
@@ -29,8 +29,8 @@ func TestAStepEndReportsWhatTheCallHeld(t *testing.T) {
 	if evs[1].ContextTokens != 0 {
 		t.Errorf("the running total was taken for the size of one call: %d", evs[1].ContextTokens)
 	}
-	if evs[2].ContextTokens != 1050 || evs[2].MoreSteps {
-		t.Errorf("a step that ended in plain text = %+v, want 1050 tokens and the end of the turn", evs[2])
+	if evs[2].ContextTokens != 1000 || evs[2].MoreSteps {
+		t.Errorf("a step that ended in plain text = %+v, want 1000 prompt tokens and the end of the turn", evs[2])
 	}
 }
 

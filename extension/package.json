@@ -37,6 +37,10 @@
     },
     "commands": [
       {
+        "command": "relo.selectRepository",
+        "title": "Relo: Select Repository"
+      },
+      {
         "command": "relo.open",
         "title": "Relo: Open"
       },
@@ -481,6 +485,18 @@
           ],
           "default": "variable"
         },
+        "relo.repository": {
+          "type": "string",
+          "default": "",
+          "scope": "window",
+          "description": "Absolute repository or workspace folder path. Empty uses the first workspace folder. Changing this restarts Relo Core. Changes use this repository's checked-out branch."
+        },
+        "relo.changes.autoApply": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Automatically accept clean proposed changes into the selected repository as unstaged edits. Never stages, commits or pushes. Conflicted changes remain proposed for review."
+        },
         "relo.autoVerify": {
           "type": "boolean",
           "default": true,
@@ -622,7 +638,7 @@
     "watch": "tsc -p . -w",
     "lint": "eslint src --max-warnings=0 && tsc -p . --noEmit",
     "typecheck": "tsc -p . --noEmit",
-    "test": "tsx --test src/protocol.test.ts src/settingsBridge.test.ts src/providers.test.ts src/uiState.test.ts src/crashBreaker.test.ts && node --test ../webview/src/main.test.js ../tests/protocol-contract.test.mjs",
+    "test": "tsx --test src/protocol.test.ts src/settingsBridge.test.ts src/providers.test.ts src/uiState.test.ts src/crashBreaker.test.ts src/repository.test.ts && node --test ../webview/src/main.test.js ../tests/protocol-contract.test.mjs",
     "package": "cd .. && make package"
   },
   "devDependencies": {

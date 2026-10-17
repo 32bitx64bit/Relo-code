@@ -2,6 +2,7 @@ package integration
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,13 +21,30 @@ type Outcome struct {
 // while the agent worked are kept: a clean merge is written, anything that overlaps is reported as a ConflictError
 // and nothing is touched. baseText is the file at base; hadBase is false when it did not exist there.
 func Merge(root, worktree, rel string, baseText []byte, hadBase bool) (Outcome, error) {
+	return merge(root, worktree, rel, baseText, hadBase, true)
+}
+
+// Check runs the decisions of Merge without writing anything. It returns the reason Merge would refuse the file, or ""
+// when Merge would apply it.
+func Check(root, worktree, rel string, baseText []byte, hadBase bool) (string, error) {
+	if _, err := normalizePath(rel); err != nil {
+		return err.Error(), nil
+	}
+	_, err := merge(root, worktree, rel, baseText, hadBase, false)
+	var ce ConflictError
+	if errors.As(err, &ce) {
+		return ce.Report.Reason, nil
+	}
+	return "", err
+}
+
+func merge(root, worktree, rel string, baseText []byte, hadBase, write bool) (Outcome, error) {
 	path, err := normalizePath(rel)
 	if err != nil {
 		return Outcome{}, err
 	}
 	out := Outcome{Path: path}
-	lower := strings.ToLower(path)
-	if lower == ".git" || strings.HasPrefix(lower, ".git/") || lower == ".relo" || strings.HasPrefix(lower, ".relo/") {
+	if protectedPath(path) {
 		return out, conflictErr(path, "protected metadata path")
 	}
 	if err := checkSymlinkPath(root, path); err != nil {
@@ -59,10 +77,13 @@ func Merge(root, worktree, rel string, baseText []byte, hadBase bool) (Outcome, 
 		if !bytes.Equal(ours, baseText) {
 			return out, conflictErr(path, "you changed this file after the agent started, and the agent deleted it")
 		}
+		out.Action = "deleted"
+		if !write {
+			return out, nil
+		}
 		if err := os.Remove(oursPath); err != nil {
 			return out, err
 		}
-		out.Action = "deleted"
 		return out, nil
 	case hasOurs && bytes.Equal(ours, theirs):
 		out.Action = "unchanged"
@@ -72,12 +93,12 @@ func Merge(root, worktree, rel string, baseText []byte, hadBase bool) (Outcome, 
 			return out, conflictErr(path, "the file exists in your workspace and the agent created a different one")
 		}
 		out.Action = "created"
-		return out, writeLike(oursPath, theirsPath, theirs)
+		return out, store(write, oursPath, theirsPath, theirs)
 	case !hasOurs:
 		return out, conflictErr(path, "you deleted this file after the agent started, and the agent changed it")
 	case bytes.Equal(ours, baseText):
 		out.Action = "updated"
-		return out, writeLike(oursPath, theirsPath, theirs)
+		return out, store(write, oursPath, theirsPath, theirs)
 	}
 	merged, clean, err := mergeFile(ours, baseText, theirs)
 	if err != nil {
@@ -87,11 +108,23 @@ func Merge(root, worktree, rel string, baseText []byte, hadBase bool) (Outcome, 
 		return out, conflictErr(path, "your edits and the agent's edits overlap")
 	}
 	out.Action = "merged"
-	return out, writeLike(oursPath, theirsPath, merged)
+	return out, store(write, oursPath, theirsPath, merged)
+}
+
+func store(write bool, dst, src string, data []byte) error {
+	if !write {
+		return nil
+	}
+	return writeLike(dst, src, data)
 }
 
 func conflictErr(path, reason string) error {
 	return ConflictError{Report: ConflictReport{Files: []string{path}, Reason: reason}}
+}
+
+func protectedPath(path string) bool {
+	lower := strings.ToLower(path)
+	return lower == ".git" || strings.HasPrefix(lower, ".git/") || lower == ".relo" || strings.HasPrefix(lower, ".relo/")
 }
 
 // writeLike writes data to dst, creating folders, and gives it the permission bits of src (the agent's file).

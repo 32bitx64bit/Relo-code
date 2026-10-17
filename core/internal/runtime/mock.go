@@ -72,7 +72,7 @@ func (m *Mock) SendTask(ctx context.Context, session SessionID, task AgentTask) 
 	}
 	s.system = task.System
 	usage := &Usage{Input: max(1, (len(task.System)+len(task.Prompt))/4), Output: 32, CacheRead: cacheRead, CacheWrite: cacheWrite}
-	usage.Context = usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
+	usage.Context = usage.PromptTokens()
 	s.wg.Add(1)
 	m.mu.Unlock()
 	go m.play(s, task, n, usage)

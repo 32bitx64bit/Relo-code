@@ -44,11 +44,37 @@ func TestContextFallsBackToUsageSumWhenRuntimeOmitsIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, _ := c.Agents.Primary()
-	if p.ContextTokens != 8_640 {
-		t.Fatalf("context = %d, want input + cached + output = 8640", p.ContextTokens)
+	if p.ContextTokens != 8_600 {
+		t.Fatalf("context = %d, want input + cached = 8600 (output excluded)", p.ContextTokens)
 	}
 	if p.Window != 0 {
 		t.Fatalf("window = %d, want 0 (unknown) with no cap and no model limit", p.Window)
+	}
+}
+
+func TestTerminalTotalsDoNotOverwriteLatestToolStepContext(t *testing.T) {
+	for _, terminalContext := range []int{0, 115_000} {
+		c, _ := newScripted(
+			rt.Event{Type: "session.step.ended", ContextTokens: 90_000, MoreSteps: true},
+			rt.Event{Type: "session.step.ended", ContextTokens: 110_000},
+			rt.Event{Type: "session.idle", Done: true, Idle: true, JSON: turnJSON,
+				Usage: &rt.Usage{Input: 20_000, CacheRead: 180_000, Output: 5_000, Context: terminalContext}},
+		)
+		c.CreateSession(t.TempDir(), "", ModeBuild)
+		if err := c.Submit(context.Background(), "hi", nil); err != nil {
+			t.Fatal(err)
+		}
+		want := terminalContext
+		if want == 0 {
+			want = 110_000
+		}
+		p, _ := c.Agents.Primary()
+		if p.ContextTokens != want {
+			t.Fatalf("context = %d, want latest request %d, not cumulative usage", p.ContextTokens, want)
+		}
+		if got := c.CacheSnapshot().Session.Usage; got.Input != 20_000 || got.CacheRead != 180_000 || got.Output != 5_000 {
+			t.Fatalf("turn usage = %+v, want cumulative billing unchanged", got)
+		}
 	}
 }
 

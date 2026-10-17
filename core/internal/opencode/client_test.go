@@ -447,8 +447,8 @@ func TestV2OpenCode2027TextDeltaAndExecutionSucceeded(t *testing.T) {
 	if terminal.Session != "ses_1" || terminal.Text != `{"answer":"OK"}` || terminal.JSON != `{"answer":"OK"}` {
 		t.Fatalf("terminal: %+v", terminal)
 	}
-	// Calls add up, but Context is only the last call: its input, cached input and output.
-	if terminal.Usage == nil || terminal.Usage.Input != 80 || terminal.Usage.Output != 8 || terminal.Usage.Context != 50+3+40+2 {
+	// Calls add up, but Context is only the last call's prompt, including cached input, excluding output.
+	if terminal.Usage == nil || terminal.Usage.Input != 80 || terminal.Usage.Output != 8 || terminal.Usage.Context != 50+40+2 {
 		t.Fatalf("usage: %+v", terminal.Usage)
 	}
 }

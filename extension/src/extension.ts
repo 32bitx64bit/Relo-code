@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { repositoryInfo } from "./repository";
 import { CoreClient } from "./client";
 import { emptyState, reduce, routingFrom, type ReloState, type AgentInfo, type CacheInfo, type ChangeDiff, type SessionSummary, normalizeCache } from "./protocol";
 import { ChatView, openDashboard, openInspector } from "./webview";
@@ -31,9 +32,11 @@ let applyTimer: ReturnType<typeof setTimeout> | undefined;
 let extCtx: vscode.ExtensionContext | undefined;
 let postedModels = ""; // signature of the model catalog the webview was last sent
 const crashes = new CrashBreaker();
+let coreLifecycle: Promise<void> = Promise.resolve();
+let postedRepository = "";
 
 // Settings that core consumes; a change to any of them re-applies to the running core.
-const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context"];
+const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context", "relo.changes.autoApply"];
 
 export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   output = vscode.window.createOutputChannel("Relo");
@@ -55,6 +58,10 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (!e.affectsConfiguration("relo")) return;
       void resendSettings(ctx);
+      if (e.affectsConfiguration("relo.repository")) {
+        void restartRepositoryCore(ctx).catch((err) => vscode.window.showErrorMessage(`Relo: ${errorText(err)}`));
+        return;
+      }
       if (CORE_SETTING_SECTIONS.some((section) => e.affectsConfiguration(section))) scheduleCoreApply();
     }),
   );
@@ -91,6 +98,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   });
 
   registerCommands(ctx);
+  const repoTimer = setInterval(() => { void refreshRepository(ctx); }, 5000);
+  ctx.subscriptions.push({ dispose: () => clearInterval(repoTimer) });
   await startCore(ctx);
 }
 
@@ -168,6 +177,7 @@ function registerCommands(ctx: vscode.ExtensionContext): void {
     syncModels();
   });
   cmd("relo.settings", () => openSettingsPage());
+  cmd("relo.selectRepository", () => selectRepository());
   cmd("relo.askSelection", () => fromEditor("Explain this selection and related constraints."));
   cmd("relo.fixSelection", () => fromEditor("Fix the selected code. Stay in scope."));
   cmd("relo.refactorSelection", () => fromEditor("Refactor the selection without changing behavior."));
@@ -204,6 +214,7 @@ function registerCommands(ctx: vscode.ExtensionContext): void {
   cmd("relo.changes.acceptAll", () => decideAll("accept"));
   cmd("relo.changes.rejectAll", () => decideAll("reject"));
   cmd("relo.changes.diff", (item?: unknown) => openChangeDiff(idOf(item)));
+  cmd("relo.changes.resolveConflicts", () => resolveConflicts());
 }
 
 function idOf(item: unknown): string | undefined {
@@ -224,13 +235,13 @@ function onWebviewMessage(ctx: vscode.ExtensionContext, m: unknown): void {
       if (!check.ok) return;
       // Providers are re-validated: a webview payload must not smuggle extra fields (e.g. apiKey) into settings.
       const value = check.subkey === "providers" ? sanitizeProviderList(check.value).providers : check.value;
-      void vscode.workspace.getConfiguration("relo").update(check.subkey, value, vscode.ConfigurationTarget.Global).then(() => postSettings(schema), (err) => log(`settings.set failed: ${String(err)}`));
+      void vscode.workspace.getConfiguration("relo").update(check.subkey, value, settingTarget(check.subkey)).then(() => postSettings(schema), (err) => log(`settings.set failed: ${String(err)}`));
       return;
     }
     case "settings.reset": {
       const check = checkSetting(msg.key, schema[String(msg.key)]?.default, schema);
       if (!check.ok) return;
-      void vscode.workspace.getConfiguration("relo").update(check.subkey, undefined, vscode.ConfigurationTarget.Global).then(() => postSettings(schema), (err) => log(`settings.reset failed: ${String(err)}`));
+      void vscode.workspace.getConfiguration("relo").update(check.subkey, undefined, settingTarget(check.subkey)).then(() => postSettings(schema), (err) => log(`settings.reset failed: ${String(err)}`));
       return;
     }
     case "ui.collapse": {
@@ -388,7 +399,39 @@ function currentProviders(): ProviderConfig[] {
 }
 
 function workspacePath(): string {
-  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+  const selected = cfg().get<string>("repository", "");
+  return selected ? path.resolve(selected) : vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+}
+
+function settingTarget(subkey: string): vscode.ConfigurationTarget {
+  return (subkey === "repository" || subkey === "changes.autoApply") && vscode.workspace.workspaceFolders?.length
+    ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+}
+
+async function selectRepository(): Promise<void> {
+  const folders = vscode.workspace.workspaceFolders || [];
+  const roots = new Set(folders.filter((f) => f.uri.scheme === "file").map((f) => f.uri.fsPath));
+  roots.add(workspacePath());
+  const gitExtension = vscode.extensions.getExtension<{ getAPI(version: number): { repositories: { rootUri: vscode.Uri }[] } }>("vscode.git");
+  try {
+    const api = (await gitExtension?.activate())?.getAPI(1);
+    for (const repo of api?.repositories || []) if (repo.rootUri.scheme === "file") roots.add(repo.rootUri.fsPath);
+  } catch (err) {
+    log(`repository discovery: ${errorText(err)}`);
+  }
+  const found = await Promise.all([...roots].map(repositoryInfo));
+  for (const repo of found) if (repo.gitRoot) roots.add(repo.gitRoot);
+  const items = [...roots].map((root) => ({ label: path.basename(root), description: root, root }));
+  const picked = await vscode.window.showQuickPick([
+    { label: "Default workspace folder", description: folders[0]?.uri.fsPath || process.cwd(), root: "" },
+    ...items,
+  ], { title: "Relo: Select Repository", placeHolder: "Apply changes to this folder's checked-out branch", matchOnDescription: true });
+  if (picked) await cfg().update("repository", picked.root, settingTarget("repository"));
+}
+
+async function refreshRepository(ctx: vscode.ExtensionContext): Promise<void> {
+  const repository = await repositoryInfo(workspacePath());
+  if (JSON.stringify(repository) !== postedRepository) await postSettings(settingsSchema(ctx));
 }
 
 // Reads stored API keys for the configured providers. Returns id -> key (only ids with a non-empty key).
@@ -419,7 +462,9 @@ async function postSettings(schema: SettingsSchema): Promise<void> {
   const providerKeys: Record<string, boolean> = {};
   for (const p of providers) providerKeys[p.id] = Boolean(keys[p.id]);
   postedModels = modelsSignature(state.backend.models);
-  chat.send({ ...settingsReply(values, schema, state.backend.models || []), providerKeys, collapsed: readCollapsed() });
+  const repository = await repositoryInfo(workspacePath());
+  postedRepository = JSON.stringify(repository);
+  chat.send({ ...settingsReply(values, schema, state.backend.models || []), providerKeys, collapsed: readCollapsed(), repository });
 }
 
 // The pickers in the webview read their models from the settings message. That message is built the moment a
@@ -507,6 +552,24 @@ async function askPermission(p: { id: string; title: string; command: string }):
 }
 
 async function startCore(ctx: vscode.ExtensionContext, maxAttempts = 5, showFailure = true): Promise<void> {
+  coreLifecycle = coreLifecycle.catch(() => {}).then(() => startCoreNow(ctx, maxAttempts, showFailure));
+  return coreLifecycle;
+}
+
+function restartRepositoryCore(ctx: vscode.ExtensionContext): Promise<void> {
+  coreLifecycle = coreLifecycle.catch(() => {}).then(async () => {
+    if (applyTimer) clearTimeout(applyTimer);
+    await client.dispose();
+    state = emptyState();
+    chat.post();
+    crashes.reset();
+    await startCoreNow(ctx);
+    await resendSettings(ctx);
+  });
+  return coreLifecycle;
+}
+
+async function startCoreNow(ctx: vscode.ExtensionContext, maxAttempts = 5, showFailure = true): Promise<void> {
   const ws = workspacePath();
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
    if (client.running) {
@@ -616,6 +679,7 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
   const providers = currentProviders();
   return {
     workspace,
+    autoApply: c.get<boolean>("changes.autoApply", false),
     routingMode: c.get<string>("routing.mode", "simple"),
     contextLimit: c.get<number>("models.contextLimit", 0),
     providers,
@@ -755,6 +819,19 @@ async function decideAll(kind: "accept" | "reject"): Promise<void> {
   const failed = res?.failed ?? [];
   if (failed.length) {
     void vscode.window.showWarningMessage(`Relo: ${res?.done ?? 0} done, ${failed.length} need attention. ${failed.slice(0, 3).map((f) => f.reason).join(" | ")}`);
+  }
+}
+
+async function resolveConflicts(): Promise<void> {
+  try {
+    const res = await client.request<{ conflicted?: number; prompted?: boolean }>("changes.resolveConflicts", {});
+    if (!res?.conflicted) {
+      void vscode.window.showInformationMessage("Relo: no conflicts. Every proposed change merges cleanly.");
+      return;
+    }
+    void vscode.window.showInformationMessage(`Relo: ${res.conflicted} conflicted change${res.conflicted === 1 ? "" : "s"} sent to the head agent.`);
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Relo: could not resolve conflicts. ${errorText(err)}`);
   }
 }
 

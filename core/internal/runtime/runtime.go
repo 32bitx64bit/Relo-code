@@ -62,10 +62,16 @@ type Usage struct {
 	Reasoning  int `json:"reasoning"`
 	CacheRead  int `json:"cacheRead"`
 	CacheWrite int `json:"cacheWrite"`
-	// Context is how much the latest provider call held: its input, cached input and output. Input and
-	// the other fields add up over every call of a turn, so only this one says how full the window is.
+	// Context is the latest provider call's prompt tokens: input + cacheRead + cacheWrite, excluding output.
+	// The other fields add up over every call of a turn, so only this one says how full the window is.
 	// 0 means the runtime did not report it.
 	Context int `json:"context,omitempty"`
+}
+
+// PromptTokens counts one provider request's input, including cache hits and writes, never generated output.
+// Do not use turn/session totals to measure the context window.
+func (u Usage) PromptTokens() int {
+	return u.Input + u.CacheRead + u.CacheWrite
 }
 
 type Event struct {
@@ -95,9 +101,9 @@ type Event struct {
 	// Interrupted is the runtime confirming that a Cancel stopped the turn. It is not a terminal event: the session
 	// stays usable, and a new task can be sent to it.
 	Interrupted bool `json:"interrupted,omitempty"`
-	// ContextTokens is set on the event that ends one model step: what that provider call held (input, cached input
-	// and output), which is how full the context is right now. Usage on the same event is that one call too, but the
-	// usage events around it add up over the turn. 0 when the event says nothing about it.
+	// ContextTokens is set on the event that ends one model step: that provider call's prompt tokens (input and cached
+	// input, excluding output). Usage on the same event is that one call too, but surrounding usage events add up
+	// over the turn. 0 when the event says nothing about it.
 	ContextTokens int `json:"contextTokens,omitempty"`
 	// MoreSteps is true on that same event when the step ended in tool calls, so the turn goes on with another
 	// model call. A step that ends in plain text is the end of the turn.

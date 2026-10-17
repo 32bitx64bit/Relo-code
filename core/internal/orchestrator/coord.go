@@ -48,6 +48,12 @@ type Change struct {
 	Added    int    `json:"added,omitempty"`
 	Deleted  int    `json:"deleted,omitempty"`
 	Worktree string `json:"worktree,omitempty"`
+	BaseBlob string `json:"baseBlob,omitempty"`
+	Conflict string `json:"conflict,omitempty"`
+	// Resolving is set while the head agent is re-applying this change after a conflict check.
+	Resolving bool `json:"resolving,omitempty"`
+	// Superseded is set when a newer proposal for the same path replaced this conflicted change.
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 type Settings struct {

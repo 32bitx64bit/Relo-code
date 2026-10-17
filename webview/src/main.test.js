@@ -594,6 +594,40 @@ test("changes drawer says what the changes are measured against, only while some
   assert.ok(!done.includes("Compared with your files"), "nothing is waiting, so there is nothing to explain");
 });
 
+test("changes drawer: auto-apply defaults off and repository selection stays visible without proposals", () => {
+  const off = mainApi.drawerHtml("changes", { changes: [] });
+  assert.match(off, /type="checkbox" data-auto-apply\/>/);
+  assert.ok(off.includes('data-cmd="relo.selectRepository"'));
+  assert.ok(off.includes("No changes"));
+  assert.ok(off.includes("Unstaged edits only. No commit or push."));
+  const on = mainApi.drawerHtml("changes", { changes: [] }, {
+    values: { "relo.changes.autoApply": true },
+    repository: { root: "/work/<repo>", branch: "feature/<current>" },
+  });
+  assert.match(on, /data-auto-apply checked/);
+  assert.ok(on.includes("/work/&lt;repo&gt;"));
+  assert.ok(on.includes("feature/&lt;current&gt;"));
+  assert.ok(!on.includes("feature/<current>"));
+});
+
+test("changes drawer: conflict badge, resolving state, superseded changes hidden", () => {
+  const html = mainApi.drawerHtml("changes", {
+    changes: [
+      { id: "c1", path: "a.ts", status: "proposed", kind: "modified", conflict: "overlap", resolving: true },
+      { id: "c2", path: "b.ts", status: "proposed", kind: "modified", superseded: true },
+    ],
+  });
+  assert.ok(html.includes("Resolving 1 conflict via head agent"));
+  assert.ok(html.includes('class="badge" title="overlap"'));
+  assert.ok(!html.includes("b.ts"), "superseded change leaves the proposed list");
+  const decided = mainApi.drawerHtml("changes", { changes: [{ id: "c1", path: "a.ts", status: "accepted", kind: "modified", conflict: "overlap", resolving: true }] });
+  assert.ok(!decided.includes('class="badge" title="overlap"'), "decided change shows no conflict badge");
+  assert.ok(!decided.includes("Resolving"));
+  const none = mainApi.drawerHtml("changes", { changes: [{ id: "c1", path: "a.ts", status: "proposed", kind: "modified" }] });
+  assert.ok(!none.includes("Resolving"));
+  assert.ok(!none.includes('class="badge"'));
+});
+
 test("chips count only changes still waiting for a decision", () => {
   const c = mainApi.chipCounts({ changes: [{ status: "proposed" }, { status: "accepted" }, { status: "rejected" }, { status: "applied" }] });
   assert.equal(c.changes.label, "2");
