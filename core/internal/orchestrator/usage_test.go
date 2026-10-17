@@ -36,6 +36,27 @@ func TestContextFillIsLastCallNotRunningTotal(t *testing.T) {
 	}
 }
 
+func TestStepsAndCacheAccumulatePerModelRequest(t *testing.T) {
+	c, _ := newScripted(
+		rt.Event{Type: "session.step.started", Phase: "model"},
+		rt.Event{Type: "session.step.ended", ContextTokens: 90_000, MoreSteps: true, Usage: &rt.Usage{Input: 1_000, CacheRead: 80_000, CacheWrite: 10_000, Output: 500}},
+		rt.Event{Type: "session.step.started", Phase: "model"},
+		rt.Event{Type: "session.step.ended", ContextTokens: 91_000, Usage: &rt.Usage{Input: 1_000, CacheRead: 90_000, CacheWrite: 0, Output: 300}},
+		rt.Event{Type: "session.idle", Done: true, Idle: true, JSON: turnJSON, Usage: &rt.Usage{Input: 2_000, CacheRead: 170_000, CacheWrite: 10_000, Output: 800}},
+	)
+	c.CreateSession(t.TempDir(), "", ModeBuild)
+	if err := c.Submit(context.Background(), "hi", nil); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := c.Agents.Primary()
+	if p.Steps != 2 {
+		t.Fatalf("steps = %d, want one per model request (2)", p.Steps)
+	}
+	if p.CacheRead != 170_000 || p.CacheWrite != 10_000 {
+		t.Fatalf("cache = read %d write %d, want 170000 / 10000 from turn usage", p.CacheRead, p.CacheWrite)
+	}
+}
+
 func TestContextFallsBackToUsageSumWhenRuntimeOmitsIt(t *testing.T) {
 	c, _ := newScripted(rt.Event{Type: "session.idle", Done: true, Idle: true, JSON: turnJSON, Usage: &rt.Usage{Input: 500, Output: 40, CacheRead: 8_000, CacheWrite: 100}})
 	c.UpdateSettings(func(s *Settings) { s.PrimaryModel = "p/blind" })

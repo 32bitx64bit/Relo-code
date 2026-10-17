@@ -67,6 +67,9 @@ type Agent struct {
 	Window        int       `json:"window"`        // context window planned for Model; 0 when unknown
 	InputTokens   int       `json:"inputTokens"`
 	OutputTokens  int       `json:"outputTokens"`
+	Steps         int       `json:"steps"`      // model requests made, one per provider call
+	CacheRead     int       `json:"cacheRead"`  // cached input tokens read, summed over every model call
+	CacheWrite    int       `json:"cacheWrite"` // input tokens written to the cache, summed over every model call
 	Cost          float64   `json:"cost,omitempty"`
 	Activity      string    `json:"activity"`
 	Phase         string    `json:"phase"`               // what it is doing now: context, model, reasoning, writing, tool, verifying, waiting; "" when idle or finished

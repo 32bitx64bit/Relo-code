@@ -69,8 +69,8 @@ func (s *Store) migrate() error {
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version > 1 {
-		return fmt.Errorf("database schema version %d is newer than supported version 1", version)
+	if version > 2 {
+		return fmt.Errorf("database schema version %d is newer than supported version 2", version)
 	}
 	_, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS kv (
@@ -151,9 +151,32 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_agents_session ON agents(session_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
 CREATE INDEX IF NOT EXISTS idx_gen_agent ON generations(agent_id);
-PRAGMA user_version=1;
 `)
-	return err
+	if err != nil {
+		return err
+	}
+	if version < 2 {
+		return s.migrateV2()
+	}
+	return nil
+}
+
+// migrateV2 adds the per-agent metric columns. Existing rows keep their payload and read 0 for each.
+func (s *Store) migrateV2() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, col := range []string{"steps", "cache_read", "cache_write"} {
+		if _, err := tx.Exec(`ALTER TABLE agents ADD COLUMN ` + col + ` INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`PRAGMA user_version=2`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) PutJSON(table, id, session string, extra string, v any) error {
@@ -167,8 +190,17 @@ func (s *Store) PutJSON(table, id, session string, extra string, v any) error {
 		_, err = s.db.Exec(`INSERT INTO sessions(id, workspace, payload, updated_at) VALUES(?,?,?,?)
 			ON CONFLICT(id) DO UPDATE SET workspace=excluded.workspace, payload=excluded.payload, updated_at=excluded.updated_at`, id, extra, string(b), now)
 	case "agents":
-		_, err = s.db.Exec(`INSERT INTO agents(id, session_id, payload, updated_at) VALUES(?,?,?,?)
-			ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, payload=excluded.payload, updated_at=excluded.updated_at`, id, session, string(b), now)
+		var m struct {
+			Steps      int `json:"steps"`
+			CacheRead  int `json:"cacheRead"`
+			CacheWrite int `json:"cacheWrite"`
+		}
+		if err := json.Unmarshal(b, &m); err != nil {
+			return err
+		}
+		_, err = s.db.Exec(`INSERT INTO agents(id, session_id, payload, updated_at, steps, cache_read, cache_write) VALUES(?,?,?,?,?,?,?)
+			ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, payload=excluded.payload, updated_at=excluded.updated_at,
+			steps=excluded.steps, cache_read=excluded.cache_read, cache_write=excluded.cache_write`, id, session, string(b), now, m.Steps, m.CacheRead, m.CacheWrite)
 	case "tasks":
 		_, err = s.db.Exec(`INSERT INTO tasks(id, session_id, payload, updated_at) VALUES(?,?,?,?)
 			ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, payload=excluded.payload, updated_at=excluded.updated_at`, id, session, string(b), now)

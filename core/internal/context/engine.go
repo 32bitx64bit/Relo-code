@@ -624,7 +624,7 @@ func applyScopeToItems(items []Item, scope *Scope, dependencyTaskIDs []string) (
 			continue
 		}
 		EnsureTokens(&it)
-		if scope.MaxItemTokens > 0 && it.Tokens > scope.MaxItemTokens && !it.Pinned && Priority(it) != 1 {
+		if scope.MaxItemTokens > 0 && it.Tokens > scope.MaxItemTokens && it.Class != ClassFinding && it.Class != ClassReport && !it.Pinned && Priority(it) != 1 {
 			it.Content, it.Tokens = clippedExcerpt(it.Content, it.Files, it.Symbols, it.Tokens, scope.MaxItemTokens)
 		}
 		kept = append(kept, it)

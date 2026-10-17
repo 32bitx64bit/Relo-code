@@ -114,6 +114,8 @@ func (c *Coord) CreateSession(workspace, objective string, mode Mode) *Session {
 		c.runCancel = nil
 		c.sessionCtx = nil
 	}
+	// The replaced session's waiting messages can never be delivered now.
+	c.inbox = map[string][]queuedNote{}
 	s := &Session{ID: id.New("sess"), Workspace: workspace, Objective: objective, Mode: mode, Status: "active", Created: time.Now().UTC(), Updated: time.Now().UTC(), Usage: map[string]any{}}
 	c.sess, c.reviewed = s, map[string]bool{}
 	c.Graph, c.Agents, c.Engine = taskgraph.New(), c.newRegistry(), ctxeng.New()
@@ -140,6 +142,7 @@ func (c *Coord) OpenSession(ctx context.Context, s *Session) {
 	c.mu.Lock()
 	c.runCancel, c.sessionCtx = nil, nil
 	c.sess, c.reviewed = cloneSession(s), map[string]bool{}
+	clearQueuedMarks(c.sess)
 	if c.sess != nil {
 		c.sess.Running = false
 		if c.sess.Usage == nil {
@@ -157,6 +160,7 @@ func (c *Coord) OpenSession(ctx context.Context, s *Session) {
 func (c *Coord) Restore(s *Session) {
 	c.mu.Lock()
 	c.sess = cloneSession(s)
+	clearQueuedMarks(c.sess)
 	if c.sess != nil {
 		c.sess.Running = false
 	}
@@ -196,6 +200,10 @@ func (c *Coord) Resume() {
 }
 
 func (c *Coord) StopAll(ctx context.Context) {
+	// Queued user messages that never reached the head are dropped, not silently lost.
+	if n := c.dropQueued(); n > 0 {
+		c.chat("system", fmt.Sprintf("Dropped %s that had not reached the head agent yet: the run was stopped.", plural(n, "queued message")), "")
+	}
 	c.mu.Lock()
 	cancel := c.runCancel
 	c.mu.Unlock()
@@ -325,10 +333,14 @@ func (c *Coord) Submit(ctx context.Context, text string, refs []string) error {
 		return fmt.Errorf("no session")
 	}
 	if c.runCancel != nil {
+		// A request is already running: the message waits for the head's next step instead of being refused.
+		queued := c.enqueueLocked(text, refs)
 		c.mu.Unlock()
 		cancel()
-		c.chat("system", "Still working on the previous request. Stop it first, or wait for it to finish.", "")
-		return fmt.Errorf("session already running")
+		// The user's own message must reach the UI at once, in its queued state.
+		c.emit("chat.message", queued)
+		c.wakeHead()
+		return nil
 	}
 	if c.sess.Objective == "" {
 		c.sess.Objective = text
@@ -353,7 +365,19 @@ func (c *Coord) Submit(ctx context.Context, text string, refs []string) error {
 		x.Status, x.Phase, x.Activity = agent.Running, "context", "Building context"
 	})
 	c.seedPrimary(text, refs)
-	err := c.guard("primary", func() error { return c.loopPrimary(runCtx, primary, text) })
+	sid := c.SessionID()
+	err := c.guard("primary", func() error {
+		if err := c.loopPrimary(runCtx, primary, text); err != nil {
+			return err
+		}
+		// Guidance that arrived too late for a turn starts a follow-up turn, so nothing the user typed is lost.
+		for runCtx.Err() == nil && c.queuedPending(sid) {
+			if err := c.loopPrimary(runCtx, primary, ""); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	c.reportFailure(primary, "Primary failed", err)
 	c.settlePrimary(primary.ID, runCtx, err)
 	cancel()
@@ -555,6 +579,14 @@ func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text strin
 	s := c.Current()
 	if s == nil {
 		return fmt.Errorf("no session")
+	}
+	// Guidance queued during an earlier turn is part of this step's user message.
+	if queued, refs, ok := c.takeQueued(c.SessionID()); ok {
+		c.ingestGuidance(primary.ID, queued, refs)
+		if text != "" {
+			queued += "\n\n" + text
+		}
+		text = queued
 	}
 	resolvedPrimary := style.Resolve(settings.Efficiency, primary.Role, primary.Difficulty, primary.Attempt, settings.Budget)
 	primaryBudget := settings.Budget
@@ -845,6 +877,11 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 	c.replans++
 	final := c.replans >= maxReplans
 	c.mu.Unlock()
+	// Guidance queued while the workers ran is part of this step.
+	queued, refs, hasQueued := c.takeQueued(c.SessionID())
+	if hasQueued {
+		c.ingestGuidance(p.ID, queued, refs)
+	}
 	gen, err := c.Engine.Refresh(p.ID, "collapse completed worker reports")
 	if err != nil {
 		c.logWarn("refresh primary after workers", err)
@@ -855,6 +892,9 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 	extra := c.workspaceFacts() + "\nAll scheduled workers finished. If every task is done and no check failed, put what was done in userMessage and return tasks as []. Plan follow-up work only for a task that failed or an acceptance criterion that is still unmet."
 	if final {
 		extra += " This is the last planning turn of this request: return tasks as [] and tell the user what is done and what remains."
+	}
+	if hasQueued {
+		extra += "\nThe user sent this while you were working:\n" + queued
 	}
 	parts := prompt.ComposePartsWith(p.Role, *gen, extra, resolvedPrimary.Profile.Fragment(p.Role))
 	turn, err := c.primaryTurn(ctx, p, parts, "Integrate worker reports and return the structured turn.")

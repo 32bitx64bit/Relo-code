@@ -361,6 +361,44 @@ func TestScopeFiltersClipsAndKeepsMandatoryItems(t *testing.T) {
 	}
 }
 
+func TestWorkerScopeExemptsFindingsAndReportsFromItemClip(t *testing.T) {
+	e := New()
+	e.Bind("worker-clip", "task", "worker", 100000)
+
+	findingContent := strings.Repeat("finding detail ", 6000)
+	reportContent := strings.Repeat("dependency report detail ", 6000)
+	codeContent := strings.Repeat("code implementation ", 6000)
+	e.Ingest("worker-clip", []Item{
+		{ID: "finding", Class: ClassFinding, Source: SourceWorker, Content: findingContent},
+		{ID: "report", Class: ClassReport, Source: SourceParent, TaskID: "dep", Content: reportContent},
+		{ID: "code", Class: ClassCode, Source: SourceRepo, Content: codeContent},
+	})
+
+	scope := &Scope{
+		MaxItemTokens:         2000,
+		Classes:               []Class{ClassFinding, ClassReport, ClassCode},
+		DependencyReportsOnly: true,
+	}
+	g, err := e.Build(BuildRequest{AgentID: "worker-clip", Scope: scope, DependencyTaskIDs: []string{"dep"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	included := map[string]Item{}
+	for _, it := range g.Items {
+		included[it.ID] = it
+	}
+	for id, content := range map[string]string{"finding": findingContent, "report": reportContent} {
+		it, ok := included[id]
+		if !ok || it.Content != content || it.Tokens <= scope.MaxItemTokens {
+			t.Fatalf("%s was clipped or omitted: included=%v tokens=%d", id, ok, it.Tokens)
+		}
+	}
+	code, ok := included["code"]
+	if !ok || code.Content == codeContent || !strings.Contains(code.Content, "[clipped ") || code.Tokens > scope.MaxItemTokens {
+		t.Fatalf("code was not clipped: included=%v tokens=%d", ok, code.Tokens)
+	}
+}
+
 func TestScopeAppliesAtGenerationBoundaries(t *testing.T) {
 	e := New()
 	e.Bind("boundary", "task", "worker", 8000)

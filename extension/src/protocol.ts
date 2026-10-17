@@ -93,6 +93,8 @@ export interface ChatMessage {
   agentId?: string;
   createdAt: string;
   streaming?: boolean;
+  // Queued marks a user message waiting for the running head agent's next step; delivery re-emits without it.
+  queued?: boolean;
 }
 
 export interface CacheAgentInfo {
@@ -284,8 +286,10 @@ export function reduce(state: ReloState, event: string, payload: unknown): ReloS
       const byId = message.id ? next.messages.findIndex((item) => item.id === message.id) : -1;
       const index = byId >= 0 ? byId : streamingIndex(next.messages, message.agentId);
       next.messages = next.messages.slice();
-      if (index >= 0) next.messages[index] = { ...next.messages[index], ...message, streaming: false };
-      else next.messages.push({ ...message, streaming: false });
+      // The payload is the message's full state: a missing queued flag means it was delivered.
+      const queued = message.queued === true;
+      if (index >= 0) next.messages[index] = { ...next.messages[index], ...message, streaming: false, queued };
+      else next.messages.push({ ...message, streaming: false, queued });
       break;
     }
     case "chat.delta": {

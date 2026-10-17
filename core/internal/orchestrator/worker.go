@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -213,11 +214,11 @@ func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent)
 	}
 	c.Agents.Update(a.ID, func(x *agent.Agent) { x.Status = agent.Starting; x.Phase = "context"; x.Activity = "Building context" })
 	c.emit("agent.started", c.freshAgent(a))
-	c.Engine.Ingest(a.ID, c.workerSeed(t))
+	c.Engine.Ingest(a.ID, c.workerSeed(t, a.Role))
 	gen, err := c.Engine.Build(ctxeng.BuildRequest{
 		AgentID: a.ID, TaskID: t.ID, Role: string(a.Role), Phase: phaseFor(a.Role),
 		Budget: a.Budget, Reason: "worker start", Query: ctxeng.Query{Task: t.Title, Keywords: strings.Fields(t.Title + " " + t.Description), Failures: a.Role == agent.Debug},
-		Scope: scope, DependencyTaskIDs: t.Depends,
+		Scope: scope, DependencyTaskIDs: c.depTaskIDs(t),
 	})
 	if err != nil {
 		c.fail(a.ID, err)
@@ -457,7 +458,10 @@ func (c *Coord) clampReport(rep RawReport) RawReport {
 	return rep
 }
 
-func (c *Coord) workerSeed(t taskgraph.Task) []ctxeng.Item {
+// workerSeed assembles the starting pack for a dispatched agent. Worker-class roles (worker, debug, integration)
+// carry only the findings and reports their task needs: those from dep tasks, transitively, and findings naming
+// files in the task's scope. Every finding keeps its source task as provenance. Other roles keep all findings.
+func (c *Coord) workerSeed(t taskgraph.Task, role agent.Role) []ctxeng.Item {
 	settings := c.settings()
 	s := c.Current()
 	objective := ""
@@ -469,16 +473,157 @@ func (c *Coord) workerSeed(t taskgraph.Task) []ctxeng.Item {
 		{Class: ctxeng.ClassTask, Source: ctxeng.SourceUser, Title: "Task", Content: t.Title + "\n" + t.Description, Durability: 1},
 		{Class: ctxeng.ClassTask, Source: ctxeng.SourceUser, Title: "Acceptance", Content: strings.Join(t.Acceptance, "\n"), Durability: 1},
 	}
+	scoped := scopedPackRole(role)
+	var deps, scopeFiles map[string]bool
+	if scoped {
+		deps = depIDSet(c.depTaskIDs(t))
+		scopeFiles = taskScopeFiles(t)
+	}
 	for _, f := range c.Engine.Findings() {
+		if scoped && !findingInPack(f, deps, scopeFiles) {
+			continue
+		}
 		items = append(items, ctxeng.Item{
 			Class: ctxeng.ClassFinding, Source: ctxeng.SourceVerified, Title: f.Summary, Content: f.Summary + "\n" + f.RootCause,
-			Files: f.Files, Verified: f.Verified, Confidence: f.Confidence, Durability: 0.9, Kind: f.Kind,
+			Files: f.Files, Verified: f.Verified, Confidence: f.Confidence, Durability: 0.9, Kind: f.Kind, TaskID: f.TaskID,
 		})
+	}
+	if scoped {
+		items = append(items, c.depReports(deps)...)
 	}
 	if settings.Memory {
 		for _, e := range c.Memory.Recall(t.Title + " " + t.Description) {
 			items = append(items, ctxeng.Item{Class: ctxeng.ClassMemory, Title: staleMemory + e.Title, Content: e.Body, Files: e.Files, Verified: e.Verified, Durability: 0.75})
 		}
+	}
+	return items
+}
+
+// scopedPackRole reports whether role's pack is limited to the findings and reports its task needs.
+func scopedPackRole(role agent.Role) bool {
+	switch role {
+	case agent.Worker, agent.Debug, agent.Integration:
+		return true
+	}
+	return false
+}
+
+// depTaskIDs returns t's dependency task IDs, transitively: direct deps first, then their deps. A cycle ends
+// the walk at the task already seen.
+func (c *Coord) depTaskIDs(t taskgraph.Task) []string {
+	seen := map[string]bool{}
+	var out []string
+	var walk func(ids []string)
+	walk = func(ids []string) {
+		for _, id := range ids {
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			out = append(out, id)
+			if dep, ok := c.Graph.Get(id); ok {
+				walk(dep.Depends)
+			}
+		}
+	}
+	walk(t.Depends)
+	return out
+}
+
+func depIDSet(ids []string) map[string]bool {
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return set
+}
+
+// taskScopeFiles returns the files named in the task's own text: title, description and acceptance lines.
+func taskScopeFiles(t taskgraph.Task) map[string]bool {
+	files := map[string]bool{}
+	for _, path := range scopePaths(t.Title + "\n" + t.Description + "\n" + strings.Join(t.Acceptance, "\n")) {
+		files[path] = true
+	}
+	return files
+}
+
+var scopePathPattern = regexp.MustCompile(`[\w][\w./-]*\.[\w-]+`)
+
+// scopePaths extracts file-path tokens from free text ("core/internal/style/style.go", "worker.go").
+// ponytail: path detection is a text heuristic; upgrade when tasks carry structured scope files.
+func scopePaths(text string) []string {
+	var out []string
+	for _, tok := range scopePathPattern.FindAllString(text, -1) {
+		tok = strings.Trim(tok, ".,;:()[]{}'\"`")
+		if tok == "" || strings.Contains(tok, "..") {
+			continue
+		}
+		out = append(out, tok)
+	}
+	return out
+}
+
+// samePath reports whether two spellings name the same file: equal, or one is a path-suffix of the other
+// ("style.go" names "core/internal/style/style.go").
+func samePath(a, b string) bool {
+	return a == b || strings.HasSuffix(a, "/"+b) || strings.HasSuffix(b, "/"+a)
+}
+
+// findingInPack reports whether a finding belongs in a scoped pack: it came from a dep task, or it names a file
+// in the task's scope. Everything else stays out.
+func findingInPack(f ctxeng.Finding, deps, scopeFiles map[string]bool) bool {
+	if f.TaskID != "" && deps[f.TaskID] {
+		return true
+	}
+	for _, file := range f.Files {
+		for scoped := range scopeFiles {
+			if samePath(file, scoped) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// depReports returns one report item per dep task that has a finished report, so a worker builds on what its
+// dependencies concluded instead of rediscovering it. A completed report wins over a failed one for the same task.
+func (c *Coord) depReports(deps map[string]bool) []ctxeng.Item {
+	var items []ctxeng.Item
+	placed := map[string]int{}
+	for _, a := range c.Agents.List() {
+		if a.TaskID == "" || !deps[a.TaskID] {
+			continue
+		}
+		rep, ok := c.Agents.Report(a.ID)
+		if !ok || strings.TrimSpace(rep.Summary) == "" {
+			continue
+		}
+		files := rep.Files
+		if len(files) == 0 {
+			files = a.Files
+		}
+		var verify []string
+		for _, v := range rep.Verify {
+			verify = append(verify, v.Command+" "+v.Status)
+		}
+		it := ctxeng.Item{
+			Class: ctxeng.ClassReport, Source: ctxeng.SourceParent, Title: a.Title,
+			Content:    ctxeng.CompressReport(rep.Summary, files, verify, rep.Risks, rep.Cause),
+			Files:      files,
+			AgentID:    a.ID,
+			TaskID:     a.TaskID,
+			Verified:   rep.Status == agent.Completed,
+			Durability: 0.95,
+		}
+		if pos, seen := placed[a.TaskID]; seen {
+			if items[pos].Verified || !it.Verified {
+				continue
+			}
+			items[pos] = it
+			continue
+		}
+		placed[a.TaskID] = len(items)
+		items = append(items, it)
 	}
 	return items
 }
@@ -1020,6 +1165,8 @@ func (c *Coord) recordUsage(a agent.Agent, generation int, usage runtime.Usage, 
 	c.Agents.Update(a.ID, func(x *agent.Agent) {
 		x.InputTokens += u.Input
 		x.OutputTokens += u.Output
+		x.CacheRead += u.CacheRead
+		x.CacheWrite += u.CacheWrite
 		x.UsedTokens = max(0, x.UsedTokens-streamed) + u.Input + u.Output + u.Reasoning
 		x.ContextTokens = held
 		x.Window = window
@@ -1233,6 +1380,13 @@ func (c *Coord) handleEvent(ctx context.Context, a agent.Agent, ev runtime.Event
 	// "repeated action" each time, which made the loop detector fire on almost every agent.
 	if ev.Done && ev.Text != "" && settings.KeepHistory {
 		c.Engine.Ingest(a.ID, []ctxeng.Item{{Class: ctxeng.ClassHistory, Source: ctxeng.SourceSummary, Content: ev.Text, Durability: 0.1}})
+	}
+	if ev.Type == "session.step.started" {
+		c.Agents.Update(a.ID, func(x *agent.Agent) {
+			if !agent.Terminal(x.Status) {
+				x.Steps++
+			}
+		})
 	}
 	c.trackPhase(a, ev, st)
 	if ev.Permission != nil {

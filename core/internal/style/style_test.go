@@ -58,8 +58,17 @@ func TestRoleMatrix(t *testing.T) {
 		}
 	}
 	worker := Resolve(Prefs{Preset: "auto"}, agent.Worker, routing.Medium, 1, 0).Scope
-	if worker.MaxItemTokens != 2000 || !worker.DependencyReportsOnly || len(worker.Classes) != 3 {
+	if worker.MaxItemTokens != 2000 || !worker.DependencyReportsOnly || len(worker.Classes) != 4 {
 		t.Errorf("worker scope = %+v", worker)
+	}
+	hasFinding := false
+	for _, cls := range worker.Classes {
+		if cls == "finding" {
+			hasFinding = true
+		}
+	}
+	if !hasFinding {
+		t.Errorf("worker scope drops findings: %+v", worker)
 	}
 	probe := Resolve(Prefs{Preset: "auto"}, agent.Probe, routing.Medium, 1, 0).Scope
 	if !probe.ReadOnly || probe.Memory || !probe.DependencyReportsOnly {

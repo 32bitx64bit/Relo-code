@@ -34,6 +34,8 @@ type Chat struct {
 	Text    string `json:"text"`
 	AgentID string `json:"agentId,omitempty"`
 	At      string `json:"createdAt"`
+	// Queued marks a user message that waits for the running head agent's next step. It clears when delivered.
+	Queued bool `json:"queued,omitempty"`
 }
 
 // Change is one file an agent changed. Status is proposed (waiting in the agent's worktree), accepted (merged into
@@ -146,6 +148,8 @@ type Coord struct {
 	emitFn          func(string, any)
 	cacheMu         sync.RWMutex
 	sess            *Session
+	inbox           map[string][]queuedNote // session ID -> user messages waiting for the head's next step; guarded by mu
+	wake            chan struct{}           // buffered nudge: the inbox has something for a head waiting on its sub agents
 	sessionCtx      context.Context
 	runCancel       context.CancelFunc
 	runID           uint64
@@ -174,6 +178,8 @@ func New(log *logging.Logger) *Coord {
 		Cache:           &metrics.CacheStats{},
 		pending:         map[string]*PendingPerm{},
 		reviewed:        map[string]bool{},
+		inbox:           map[string][]queuedNote{},
+		wake:            make(chan struct{}, 1),
 		runtimeSessions: map[string]*runtimeSession{},
 		escalations:     map[string]string{},
 		Emit:            func(string, any) {},

@@ -183,7 +183,7 @@ func matrix(role agent.Role) (Profile, Scope) {
 		s.Memory, s.DependencyReportsOnly, s.ReadOnly = false, true, true
 	case agent.Worker, agent.Debug, agent.Integration:
 		p.Voice, p.Craft, s.Budget = LevelFull, LevelFull, 16000
-		s.Classes, s.Memory, s.DependencyReportsOnly, s.MaxItemTokens = []string{"task_state", "code", "report"}, false, true, 2000
+		s.Classes, s.Memory, s.DependencyReportsOnly, s.MaxItemTokens = []string{"task_state", "code", "report", "finding"}, false, true, 2000
 	case agent.Architect:
 		p.Voice, p.Craft, s.Budget = LevelFull, LevelLite, 16000
 	case agent.Test:

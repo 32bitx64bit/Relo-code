@@ -546,12 +546,33 @@ test("assistant label no longer shows agent id; streaming bubble has a caret", (
   assert.ok(h.includes('class="stream"'));
 });
 
-test("Enter while running is a no-op; Shift+Enter ignored; idle Enter sends", () => {
-  assert.equal(ui.enterAction({ key: "Enter", shiftKey: false }, true), "noop");
-  assert.equal(ui.enterAction({ key: "Enter", shiftKey: false }, false), "send");
-  assert.equal(ui.enterAction({ key: "Enter", shiftKey: true }, false), "ignore");
-  assert.equal(ui.enterAction({ key: "a" }, true), "ignore");
-  assert.equal(ui.enterAction({ key: "Enter", shiftKey: false, isComposing: true }, false), "ignore");
+test("agent messages are distinct cards with a role header; queued user messages say so", () => {
+  const h = ui.msgHtml({ id: "a", role: "assistant", agentId: "agent_123", text: "hi" });
+  assert.ok(h.includes('class="msg agent"'));
+  assert.ok(h.includes("codicon-hubot"));
+  assert.ok(h.includes('class="msg-who"'));
+  const user = ui.msgHtml({ id: "u", role: "user", text: "do it", queued: true });
+  assert.ok(user.includes('class="msg user"'));
+  assert.ok(user.includes("msg-queued"));
+  const delivered = ui.msgHtml({ id: "u", role: "user", text: "do it" });
+  assert.ok(!delivered.includes("msg-queued"));
+});
+
+test("Enter sends while running and idle; Shift+Enter and IME composition ignored", () => {
+  assert.equal(ui.enterAction({ key: "Enter", shiftKey: false }), "send");
+  assert.equal(ui.enterAction({ key: "Enter", shiftKey: true }), "ignore");
+  assert.equal(ui.enterAction({ key: "a" }), "ignore");
+  assert.equal(ui.enterAction({ key: "Enter", shiftKey: false, isComposing: true }), "ignore");
+});
+
+test("running composer: Send and a separate Stop both render; idle has no Stop", () => {
+  const running = ui.chatHtml({ agents: [{ id: "p", role: "primary", status: "running" }], messages: [] });
+  assert.ok(running.includes('id="send"'));
+  assert.ok(running.includes('id="stop"'));
+  assert.ok(running.includes('aria-label="Stop run"'));
+  const idle = ui.chatHtml({ agents: [], messages: [] });
+  assert.ok(idle.includes('id="send"'));
+  assert.ok(!idle.includes('id="stop"'));
 });
 
 test("scroll after render: sticks to bottom when near bottom or a new message arrived, else keeps position", () => {
@@ -608,6 +629,21 @@ test("changes drawer: auto-apply defaults off and repository selection stays vis
   assert.ok(on.includes("/work/&lt;repo&gt;"));
   assert.ok(on.includes("feature/&lt;current&gt;"));
   assert.ok(!on.includes("feature/<current>"));
+});
+
+test("settings: Changes group has the auto-apply toggle and the repository row", () => {
+  const cache = cacheFx();
+  cache.schema = { ...schemaFx, "relo.changes.autoApply": { type: "boolean", description: "Apply proposed changes automatically" } };
+  cache.values["relo.changes.autoApply"] = true;
+  cache.values["relo.repository"] = "/work/<repo>";
+  const html = mainApi.settingsPageHtml(cache, "");
+  assert.ok(html.includes('data-group="changes"'));
+  assert.match(html, /data-key="relo.changes.autoApply"[^>]*checked/);
+  assert.ok(html.includes('data-cmd="relo.selectRepository"'));
+  assert.ok(html.includes("/work/&lt;repo&gt;"));
+  assert.ok(html.includes("Folder Relo edits"));
+  const empty = mainApi.settingsPageHtml({ ...cache, values: { "relo.routing.mode": "simple", "relo.providers": [] } }, "");
+  assert.ok(empty.includes("First workspace folder"));
 });
 
 test("changes drawer: conflict badge, resolving state, superseded changes hidden", () => {

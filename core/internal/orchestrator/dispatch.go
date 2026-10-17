@@ -64,6 +64,10 @@ func (c *Coord) dispatch(ctx context.Context, sched *scheduler.Scheduler) int {
 		}
 		select {
 		case <-d.wake:
+		case <-d.c.wake:
+			// The user queued guidance while the head waited here: step the head now, without touching the
+			// sub agents, which keep running.
+			d.c.stepQueued(ctx)
 		case <-tick.C:
 		case <-ctx.Done():
 		}

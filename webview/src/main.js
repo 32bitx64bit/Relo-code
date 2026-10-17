@@ -214,10 +214,9 @@
     return (s.agents || []).some((a) => LIVE_STATUSES.includes(a.status));
   }
 
-  // Enter in the composer while a run is live must not send or cancel; Stop is the button only.
-  function enterAction(e, running) {
+  function enterAction(e) {
     if (!e || e.key !== "Enter" || e.shiftKey || e.isComposing) return "ignore";
-    return running ? "noop" : "send";
+    return "send";
   }
 
   function toMs(v) {
@@ -650,8 +649,6 @@
     const msgs = state.messages || [];
     const emptyEl = msgs.length === 0 ? empty("Describe a task to start.") : "";
     const running = isRunning(state);
-    const sendIcon = running ? "codicon-debug-stop" : "codicon-send";
-    const sendLabel = running ? "Stop" : "Send message";
     const eff = (state.efficiency && state.efficiency.preset) || "off";
     return `${toolbar(state)}
     ${strip(state)}
@@ -666,7 +663,8 @@
         </div>
         <div class="toolbar-right">
           <button type="button" class="eff-link" id="eff" title="Token saving settings" aria-label="Token saving: ${attr(titleCase(eff))}. Open settings">Token saving: ${esc(titleCase(eff))}</button>
-          <button type="button" id="send" class="send" aria-label="${sendLabel}" title="${sendLabel}"><span class="codicon ${sendIcon}"></span><span class="sr-only">${sendLabel}</span></button>
+          ${running ? `<button type="button" id="stop" class="send stop" aria-label="Stop run" title="Stop run"><span class="codicon codicon-debug-stop"></span><span class="sr-only">Stop run</span></button>` : ""}
+          <button type="button" id="send" class="send" aria-label="Send message" title="Send message"><span class="codicon codicon-send"></span><span class="sr-only">Send message</span></button>
         </div>
       </div>
     </div>
@@ -724,6 +722,7 @@
     { id: "efficiency", title: "Token saving", keys: ["relo.efficiency.preset", "relo.efficiency.voice", "relo.efficiency.craft", "relo.efficiency.planLean", "relo.efficiency.roles"] },
     { id: "agents", title: "Agents", keys: ["relo.maxConcurrentAgents", "relo.maxTier1Agents", "relo.maxTier2Agents", "relo.maxHierarchyDepth", "relo.maxRetries"] },
     { id: "context", title: "Context", keys: ["relo.context.compactAt", "relo.context.autoRefresh", "relo.context.refreshThreshold", "relo.context.maxUtilization", "relo.context.compressionStrategy", "relo.context.keepRawHistory", "relo.context.projectMemory"] },
+    { id: "changes", title: "Changes", keys: ["relo.changes.autoApply"] },
     { id: "verification", title: "Verification", keys: ["relo.autoVerify", "relo.autoReview", "relo.report.maxChars"] },
     { id: "permissions", title: "Permissions", keys: ["relo.permissions.read", "relo.permissions.write", "relo.permissions.test", "relo.permissions.build", "relo.permissions.install", "relo.permissions.delete", "relo.permissions.gitCommit", "relo.permissions.gitPush", "relo.permissions.network", "relo.permissions.outside", "relo.permissions.destructive"] },
     { id: "advanced", title: "Advanced", keys: ["relo.runtime", "relo.openCode.path", "relo.logLevel"] },
@@ -1159,13 +1158,22 @@
     </div>`;
   }
 
+  function repositoryRow() {
+    const repo = String(valueOf("relo.repository") || "");
+    return `<div class="setting" data-search="${attr(`repository relo.repository ${repo}`.toLowerCase())}">
+      <div class="setting-label">Repository</div>
+      <div class="setting-desc">Folder Relo edits. Empty uses the first workspace folder.</div>
+      <div class="setting-ctl"><button type="button" class="secondary" data-cmd="relo.selectRepository">${esc(repo || "First workspace folder")}</button></div>
+    </div>`;
+  }
+
   function settingsPage() {
     if (!settingsCache) return `<div class="settings-empty">Loading settings…</div>`;
     const groups = SETTINGS_GROUPS.map((g) => {
       const collapsed = isCollapsed("g:" + g.id);
       const adv = routingMode() === "advanced";
       const keys = g.keys.filter((k) => !(adv ? SIMPLE_ONLY : ADVANCED_ONLY).includes(k));
-      const rows = (g.id === "providers" ? providersBodyHtml() : keys.filter((k) => settingsCache.schema && settingsCache.schema[k] || k === "relo.routing.byDifficulty" || k === "relo.efficiency.roles").map(settingRow).join(""));
+      const rows = (g.id === "providers" ? providersBodyHtml() : keys.filter((k) => settingsCache.schema && settingsCache.schema[k] || k === "relo.routing.byDifficulty" || k === "relo.efficiency.roles").map(settingRow).join("")) + (g.id === "changes" ? repositoryRow() : "");
       return `<section class="settings-group" data-group="${g.id}" aria-label="${esc(g.title)}">
         <h3 role="button" tabindex="0" aria-expanded="${collapsed ? "false" : "true"}" data-collapse="${g.id}"><span class="codicon ${collapsed ? "codicon-chevron-right" : "codicon-chevron-down"}" aria-hidden="true"></span>${esc(g.title)}</h3>
         <div class="settings-body"${collapsed ? " hidden" : ""}>${rows}</div>
@@ -1247,8 +1255,9 @@
     }
     const who = m.role === "assistant" ? "Assistant" : (m.role === "user" ? "You" : esc(m.role));
     const stream = m.streaming ? `<span class="stream" aria-hidden="true"></span>` : "";
-    return `<div class="msg ${m.role === "user" ? "user" : ""}"${m.id ? ` data-key="m-${attr(m.id)}"` : ""}>
-      <div class="msg-role">${esc(who)}</div>
+    const queued = m.queued ? `<span class="msg-queued">Queued</span>` : "";
+    return `<div class="msg ${m.role === "user" ? "user" : "agent"}"${m.id ? ` data-key="m-${attr(m.id)}"` : ""}>
+      <div class="msg-role">${m.role === "user" ? "" : `<span class="codicon codicon-hubot" aria-hidden="true"></span>`}<span class="msg-who">${esc(who)}</span>${queued}</div>
       <div class="msg-text">${md(m.text || "")}${stream}</div>
     </div>`;
   }
@@ -1338,7 +1347,7 @@
           <div class="toolbar">
             <div class="toolbar-left">${modeSelect(mode)}</div>
             <div class="toolbar-right">
-              <button type="button" id="send" class="send" aria-label="${isRunning(state) ? "Stop" : "Send message"}"><span class="codicon ${isRunning(state) ? "codicon-debug-stop" : "codicon-send"}"></span></button>
+              <button type="button" id="send" class="send" aria-label="Send message"><span class="codicon codicon-send"></span></button>
             </div>
           </div>
         </div>
@@ -1722,14 +1731,12 @@
     if ((el = at("[data-session-delete]"))) { post({ type: "session.delete", id: el.getAttribute("data-session-delete") }); return; }
     if (at("#model")) { post({ type: "command", command: "relo.selectPrimaryModel" }); return; }
     if (at("#eff")) { goPage("settings"); return; }
-    const send = at("#send");
-    if (send) {
+    if (at("#send")) {
       const box = document.getElementById("box");
-      if (isRunning(state)) post({ type: "cancel" });
-      else if (box) { submit(box, post); composerDraft = ""; autosize(); }
+      if (box) { submit(box, post); composerDraft = ""; autosize(); }
       return;
     }
-    if (at("[data-run-stop]")) { post({ type: "cancel" }); return; }
+    if (at("#stop") || at("[data-run-stop]")) { post({ type: "cancel" }); return; }
     if (at("[data-run-list]")) { runUi.listOpen = !runUi.listOpen; render(); return; }
     if (at("[data-run-more]")) { runUi.showAll = !runUi.showAll; render(); return; }
     if ((el = at("[data-run-card]"))) {
@@ -1746,7 +1753,7 @@
     const t = e.target;
     if (!t || !t.closest) return;
     if (t.id === "box") {
-      const act = enterAction(e, isRunning(state));
+      const act = enterAction(e);
       if (act === "ignore") return;
       e.preventDefault();
       if (act === "send") { submit(t, post); composerDraft = ""; autosize(); }

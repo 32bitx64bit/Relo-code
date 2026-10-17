@@ -38,6 +38,16 @@ test("chat deltas create per-agent streaming messages and finalize", () => {
   assert.equal(state.messages[0].text, "hello!");
 });
 
+test("queued user message keeps its mark until delivery re-emits it", () => {
+  let s = emptyState();
+  s = reduce(s, "chat.message", { id: "m1", role: "user", text: "later", createdAt: "now", queued: true });
+  assert.equal(s.messages.length, 1);
+  assert.equal(s.messages[0].queued, true);
+  s = reduce(s, "chat.message", { id: "m1", role: "user", text: "later", createdAt: "now" });
+  assert.equal(s.messages.length, 1);
+  assert.equal(s.messages[0].queued, false);
+});
+
 test("cache updates remain optional and retain per-agent values", () => {
   const cache: CacheInfo = { session: { hitRate: 0.7, input: 20, output: 4, cacheRead: 14, cacheWrite: 3 }, agents: [{ agentId: "a", generation: 2, model: "m", input: 20, output: 4, cacheRead: 14, cacheWrite: 3, hitRate: 0.7 }] };
   const state = reduce(emptyState(), "cache.updated", cache);

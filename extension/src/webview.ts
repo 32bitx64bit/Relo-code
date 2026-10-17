@@ -116,10 +116,15 @@ input,textarea,select{background:var(--vscode-input-background);border:1px solid
 @media (max-width: 320px){.header-meta{display:none;}}
 .header-counts{flex:0 1 auto;}
 .mode-select{font-size:12px;}
-.messages{flex:1;min-height:0;overflow:auto;padding:6px 4px;display:flex;flex-direction:column;gap:8px;}
+.messages{flex:1;min-height:0;overflow:auto;padding:6px 4px;display:flex;flex-direction:column;gap:10px;}
 .empty{color:var(--vscode-descriptionForeground);padding:8px 2px;}
 .msg{padding:0;}
+.msg.agent{display:flex;flex-direction:column;gap:2px;padding:6px 8px;border-left:2px solid var(--vscode-charts-blue,var(--vscode-focusBorder));background:var(--vscode-editor-inactiveSelectionBackground,var(--vscode-textBlockQuote-background,transparent));border-radius:2px;}
 .msg-role{font-size:11px;color:var(--vscode-descriptionForeground);margin-bottom:2px;display:flex;align-items:baseline;gap:4px;}
+.msg.agent .msg-role{font-size:12px;font-weight:600;color:var(--vscode-foreground);margin-bottom:0;}
+.msg.agent .msg-role .codicon{color:var(--vscode-charts-blue,var(--vscode-focusBorder));}
+.msg-who{flex:none;}
+.msg-queued{margin-left:auto;font-size:10px;font-weight:400;color:var(--vscode-descriptionForeground);border:1px solid var(--vscode-panel-border);border-radius:8px;padding:0 6px;}
 .msg-text{word-wrap:break-word;}
 .msg-text>:first-child{margin-top:0;}
 .msg-text>:last-child{margin-bottom:0;}

@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { repositoryInfo } from "./repository";
+import { repositoryInfo, snapRepository } from "./repository";
 import { CoreClient } from "./client";
 import { emptyState, reduce, routingFrom, type ReloState, type AgentInfo, type CacheInfo, type ChangeDiff, type SessionSummary, normalizeCache } from "./protocol";
 import { ChatView, openDashboard, openInspector } from "./webview";
@@ -426,7 +426,21 @@ async function selectRepository(): Promise<void> {
     { label: "Default workspace folder", description: folders[0]?.uri.fsPath || process.cwd(), root: "" },
     ...items,
   ], { title: "Relo: Select Repository", placeHolder: "Apply changes to this folder's checked-out branch", matchOnDescription: true });
-  if (picked) await cfg().update("repository", picked.root, settingTarget("repository"));
+  if (!picked) return;
+  const root = await snapRepository(picked.root, "");
+  if (root === undefined) {
+    void vscode.window.showErrorMessage(`Relo: ${picked.root} is not inside a Git repository. Repository setting unchanged.`);
+    return;
+  }
+  await cfg().update("repository", root, settingTarget("repository"));
+}
+
+// Resolves relo.repository for core launch; undefined when the setting points outside a Git repository.
+async function launchRepository(): Promise<string | undefined> {
+  const selected = cfg().get<string>("repository", "");
+  const root = await snapRepository(selected, workspacePath());
+  if (root === undefined) void vscode.window.showErrorMessage(`Relo: ${selected} is not inside a Git repository. Fix relo.repository to start the backend.`);
+  return root;
 }
 
 async function refreshRepository(ctx: vscode.ExtensionContext): Promise<void> {
@@ -570,7 +584,11 @@ function restartRepositoryCore(ctx: vscode.ExtensionContext): Promise<void> {
 }
 
 async function startCoreNow(ctx: vscode.ExtensionContext, maxAttempts = 5, showFailure = true): Promise<void> {
-  const ws = workspacePath();
+  const ws = await launchRepository();
+  if (ws === undefined) {
+    status.text = "$(error) Relo: Invalid repository";
+    return;
+  }
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
    if (client.running) {
     if (client.ready) return;
