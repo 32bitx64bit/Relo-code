@@ -466,6 +466,69 @@ func (m *Manager) Discard(agentID, rel string) error {
 	return os.Remove(path)
 }
 
+// DiscardMany restores or removes several paths in one worktree with one command per group, so rejecting a
+// multi-file change does not spawn git once per path.
+func (m *Manager) DiscardMany(agentID string, rels []string) error {
+	t, ok := m.Tree(agentID)
+	if !ok || t.Path == m.root {
+		return fmt.Errorf("no isolated worktree for agent %q", agentID)
+	}
+	if len(rels) == 0 {
+		return nil
+	}
+	for _, rel := range rels {
+		if err := validateRelative(rel); err != nil {
+			return err
+		}
+	}
+	var in strings.Builder
+	for _, rel := range rels {
+		fmt.Fprintf(&in, "%s:%s\n", t.Base, filepath.ToSlash(rel))
+	}
+	out, err := gitStdin(t.Path, in.String(), "cat-file", "--batch-check")
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != len(rels) {
+		return fmt.Errorf("git cat-file returned %d lines for %d paths", len(lines), len(rels))
+	}
+	var existing, absent []string
+	for i, line := range lines {
+		if strings.HasSuffix(line, " missing") {
+			absent = append(absent, rels[i])
+			continue
+		}
+		existing = append(existing, rels[i])
+	}
+	if len(existing) > 0 {
+		args := []string{"restore", "--source=" + t.Base, "--staged", "--worktree", "--"}
+		for _, rel := range existing {
+			args = append(args, ":(literal)"+filepath.ToSlash(rel))
+		}
+		if _, err := git(t.Path, args...); err != nil {
+			return err
+		}
+	}
+	if len(absent) > 0 {
+		args := []string{"rm", "--cached", "--ignore-unmatch", "--"}
+		for _, rel := range absent {
+			args = append(args, ":(literal)"+filepath.ToSlash(rel))
+		}
+		_, _ = git(t.Path, args...)
+		for _, rel := range absent {
+			path := filepath.Join(t.Path, filepath.FromSlash(rel))
+			if err := ensureWithin(t.Path, path); err != nil {
+				return err
+			}
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (m *Manager) Remove(agentID string) error {
 	m.mu.Lock()
 	t, ok := m.trees[agentID]
@@ -818,7 +881,18 @@ func isGit(root string) bool {
 	return err == nil
 }
 
+// GitProbe, when non-nil, is called before every git command. Tests use it to assert which work runs while a
+// decision lock is held. It is nil in production.
+var GitProbe func(args []string)
+
+func probeGit(args []string) {
+	if GitProbe != nil {
+		GitProbe(args)
+	}
+}
+
 func git(dir string, args ...string) (string, error) {
+	probeGit(args)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
@@ -832,6 +906,7 @@ func git(dir string, args ...string) (string, error) {
 
 // gitEnv runs git with extra environment variables (a private index, a committer identity).
 func gitEnv(dir string, env []string, args ...string) (string, error) {
+	probeGit(args)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	cmd.Env = env
@@ -846,6 +921,7 @@ func gitEnv(dir string, env []string, args ...string) (string, error) {
 
 // gitStdin runs git with input on its standard input (a patch to apply).
 func gitStdin(dir, input string, args ...string) (string, error) {
+	probeGit(args)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(input)
@@ -859,6 +935,7 @@ func gitStdin(dir, input string, args ...string) (string, error) {
 }
 
 func gitRaw(dir string, args ...string) (string, error) {
+	probeGit(args)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer

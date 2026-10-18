@@ -91,6 +91,9 @@ func TestSchemaCapsAndRolePromptSizes(t *testing.T) {
 	if acceptance["maxItems"] != PrimaryAcceptanceMaxItems || acceptance["items"].(map[string]any)["maxLength"] != PrimaryAcceptanceMaxLength {
 		t.Fatal("primary acceptance caps missing")
 	}
+	if _, ok := taskProps["paths"].(map[string]any); !ok {
+		t.Fatal("primary task schema has no paths field")
+	}
 	reportProps := ReportSchema["properties"].(map[string]any)
 	if reportProps["summary"].(map[string]any)["maxLength"] != ReportSummaryMaxLength {
 		t.Fatal("report summary cap missing")
@@ -105,7 +108,7 @@ func TestSchemaCapsAndRolePromptSizes(t *testing.T) {
 	for _, role := range roles {
 		prompt := For(role)
 		t.Logf("role=%s chars=%d", role, len(prompt))
-		if total := len(Shared) + len(prompt); total > 5000 {
+		if total := len(Shared) + len(prompt); total > 5600 {
 			t.Errorf("shared + %s prompt too large: %d chars", role, total)
 		}
 	}

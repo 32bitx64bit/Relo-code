@@ -80,6 +80,15 @@ func (c *Coord) dispatch(ctx context.Context, sched *scheduler.Scheduler) int {
 		}
 	}
 	d.wg.Wait()
+	if median := sched.LeaseWaitMedian(); median > 0 && c.Log != nil {
+		fields := map[string]any{"medianStartDelayMs": median.Milliseconds()}
+		// The design keeps path leases off when the delay they add exceeds the median agent run time measured in
+		// the design data (568 s). The setting already defaults to off; this tells the user why to leave it there.
+		if median > 568*time.Second {
+			fields["advice"] = "keep relo.scheduler.pathLeases off"
+		}
+		c.Log.Info("path leases", fields)
+	}
 	d.dropQueued()
 	for _, err := range d.errs {
 		if ctx.Err() == nil {
@@ -137,7 +146,7 @@ func (d *dispatcher) admit() (held bool) {
 			if ok, why := d.sched.CanReserve(c.Agents, agent.Agent{Role: role, Tier: agent.TierFor(role), Depth: 1}); !ok && (!scheduler.Full(why) || len(d.queued) >= maxQueued) {
 				continue
 			}
-			a = c.spawn(task, role)
+			a = c.spawnSoft(task, role, d.sched.PriorHolders(task.Paths))
 			if agent.Terminal(a.Status) {
 				// spawn failed closed (for example an unverifiable snapshot); do not run this agent.
 				c.failTask(task, a, fmt.Errorf("%s", a.Activity))
@@ -153,6 +162,15 @@ func (d *dispatcher) admit() (held bool) {
 			d.queued[task.ID] = waiting{agent: a, why: why}
 			continue
 		}
+		lease, leaseOK, leaseWhy := d.sched.AcquirePaths(task.ID, task.Paths)
+		if !leaseOK {
+			release()
+			if !queued || wait.why != leaseWhy {
+				c.Agents.Update(a.ID, func(x *agent.Agent) { x.Status = agent.Queued; x.Activity = leaseWhy })
+			}
+			d.queued[task.ID] = waiting{agent: a, why: leaseWhy}
+			continue
+		}
 		delete(d.queued, task.ID)
 		updated, err := c.Graph.Update(task.ID, func(x *taskgraph.Task) {
 			x.Status = taskgraph.Running
@@ -163,6 +181,7 @@ func (d *dispatcher) admit() (held bool) {
 		})
 		if err != nil {
 			release()
+			lease()
 			c.logWarn("mark task running", err)
 			d.discard(a, "The task is gone")
 			continue
@@ -170,6 +189,8 @@ func (d *dispatcher) admit() (held bool) {
 		c.Agents.Update(a.ID, func(x *agent.Agent) { x.Status = agent.Starting; x.Phase = "context"; x.Activity = "Starting" })
 		c.Agents.Update(a.ID, func(x *agent.Agent) { x.Attempt = updated.Attempt })
 		if queued {
+			// The holder may have finished while this task waited, so record its work before the re-cut restacks.
+			c.leaseLineage(a, d.sched.PriorHolders(task.Paths))
 			c.recutQueued(updated, a)
 		}
 		c.mu.Lock()
@@ -224,6 +245,7 @@ func (c *Coord) recutQueued(t taskgraph.Task, a agent.Agent) {
 	}
 	patches, patchDeps, accepted, ok := c.lineagePatches(c.lineageOf(a.ID))
 	if !ok {
+		c.setLineageProblem(a.ID, "parent_superseded", "a recorded dependency is no longer available; the worktree keeps its old base")
 		c.logWarn("re-cut queued worktree", fmt.Errorf("agent %s: a recorded dependency is no longer available; keeping the old base", a.ID))
 		return
 	}
@@ -231,21 +253,44 @@ func (c *Coord) recutQueued(t taskgraph.Task, a agent.Agent) {
 		c.logWarn("re-cut queued worktree", err)
 		return
 	}
-	if len(patches) > 0 {
-		results, err := ws.Stack(a.ID, patches)
-		if err != nil {
-			c.logWarn("re-stack after re-cut", err)
-		}
-		applied := append([]Dep(nil), accepted...)
-		for i, r := range results {
-			if r.Applied && i < len(patchDeps) {
-				applied = append(applied, patchDeps[i])
-			}
-		}
-		c.setLineage(a.ID, applied)
+	if len(patches) == 0 {
+		c.setLineage(a.ID, accepted)
 		return
 	}
-	c.setLineage(a.ID, accepted)
+	results, err := ws.Stack(a.ID, patches)
+	if err != nil {
+		c.setLineageProblem(a.ID, "parent_superseded", "a recorded dependency could not be re-stacked after the re-cut")
+		c.logWarn("re-stack after re-cut", err)
+		return
+	}
+	applied := map[string]bool{}
+	for i, r := range results {
+		if !r.Applied {
+			c.setLineageProblem(a.ID, "parent_superseded", "a recorded dependency did not apply after the re-cut")
+			c.logWarn("re-stack after re-cut", fmt.Errorf("patch %d did not apply", i))
+			return
+		}
+		if i < len(patchDeps) {
+			applied[patchDeps[i].ID] = true
+		}
+	}
+	lineage := c.lineageOf(a.ID)
+	next := make([]Dep, 0, len(lineage))
+	for _, dep := range lineage {
+		if applied[dep.ID] || containsDep(accepted, dep.ID) {
+			next = append(next, dep)
+		}
+	}
+	c.setLineage(a.ID, next)
+}
+
+func containsDep(deps []Dep, id string) bool {
+	for _, d := range deps {
+		if d.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // lineagePatches resolves the patches for recorded dependencies in order. Parents that are already accepted are
@@ -301,6 +346,7 @@ func (d *dispatcher) launch(t taskgraph.Task, a agent.Agent) {
 	go func() {
 		defer func() {
 			// The slot is free before anything is told, so a dispatcher that wakes finds it.
+			d.sched.ReleasePaths(t.ID)
 			d.sched.Unreserve(a.ID)
 			d.mu.Lock()
 			delete(d.running, t.ID)

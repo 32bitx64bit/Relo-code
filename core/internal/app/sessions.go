@@ -145,6 +145,8 @@ func (a *App) sweepWorktrees() {
 	if ws == nil || ws.Direct() {
 		return
 	}
+	a.cleanupMu.Lock()
+	defer a.cleanupMu.Unlock()
 	keep := map[string]bool{}
 	note := func(s *orchestrator.Session) {
 		for _, ch := range s.Changes {
@@ -163,6 +165,9 @@ func (a *App) sweepWorktrees() {
 	}
 	if cur := a.Coord.Current(); cur != nil {
 		note(cur)
+	}
+	for _, agentID := range a.heldCleanupAgents() {
+		keep[agentID] = true
 	}
 	if n := ws.Sweep(keep); n > 0 {
 		a.Log.Info("removed stale agent worktrees", map[string]any{"count": n})
@@ -355,7 +360,14 @@ func (a *App) ownWorktree(path string) bool {
 
 // settle releases an agent's worktree once none of its changes is waiting for a decision.
 func (a *App) settle(agentID string) {
-	if agentID == "" || a.Coord.OpenChanges(agentID) > 0 || a.Coord.WS == nil {
+	a.cleanupMu.Lock()
+	defer a.cleanupMu.Unlock()
+	a.settleLocked(agentID)
+}
+
+// settleLocked is settle for callers already holding cleanupMu.
+func (a *App) settleLocked(agentID string) {
+	if agentID == "" || a.Coord.OpenChanges(agentID) > 0 || a.Coord.WS == nil || a.cleanupHeld(agentID) {
 		return
 	}
 	if err := a.Coord.WS.Release(agentID); err != nil {
@@ -371,8 +383,11 @@ func (a *App) acceptChange(id string) (any, error) {
 // projection; otherwise a stale preview is refused and nothing is written.
 func (a *App) acceptChangeExpect(id, expect string) (any, error) {
 	a.decisionMu.Lock()
-	out, err, path := a.acceptChangeLocked(id, expect)
+	out, err, path, agentID := a.acceptChangeLocked(id, expect)
 	a.decisionMu.Unlock()
+	if err == nil && agentID != "" {
+		a.settle(agentID)
+	}
 	// E1: every other proposal on the written path gets a fresh projection outside decisionMu.
 	if err == nil && path != "" {
 		a.projectPaths([]string{path})
@@ -380,39 +395,56 @@ func (a *App) acceptChangeExpect(id, expect string) (any, error) {
 	return out, err
 }
 
-func (a *App) acceptChangeLocked(id, expect string) (any, error, string) {
+// parentGate refuses a write while any parent of ch is not accepted. A4/A2: the dependent stays proposed,
+// blocked with needs_parent, and nothing is written.
+func (a *App) parentGate(ch orchestrator.Change) error {
+	if !a.dependent.Load() {
+		return nil
+	}
+	pending := a.unmetNeeds(ch)
+	if len(pending) == 0 {
+		return nil
+	}
+	reason := fmt.Sprintf("parent %s is not accepted yet; accept it first or use Accept with parents", strings.Join(pending, ", "))
+	a.blockChange(ch.ID, "needs_parent", reason)
+	return ipc.Fail{C: "needs_parent", M: reason}
+}
+
+func (a *App) acceptChangeLocked(id, expect string) (any, error, string, string) {
 	ch, ok := a.Coord.FindChange(id)
 	if !ok {
-		return nil, ipc.Fail{C: "not_found", M: "change not found"}, ""
+		return nil, ipc.Fail{C: "not_found", M: "change not found"}, "", ""
 	}
 	switch ch.Status {
 	case "applied", "accepted":
-		return map[string]any{"change": ch}, nil, "" // direct mode edits are already in place
+		return map[string]any{"change": ch}, nil, "", "" // direct mode edits are already in place
 	case "rejected":
-		return nil, ipc.Fail{C: "invalid_state", M: "this change was rejected"}, ""
+		return nil, ipc.Fail{C: "invalid_state", M: "this change was rejected"}, "", ""
 	case "proposed":
 	default:
-		return nil, ipc.Fail{C: "invalid_state", M: "this change is not waiting for a decision"}, ""
+		return nil, ipc.Fail{C: "invalid_state", M: "this change is not waiting for a decision"}, "", ""
+	}
+	if err := a.parentGate(ch); err != nil {
+		return nil, err, "", ""
 	}
 	if expect != "" {
 		analysis, err := a.analyzeChange(ch)
 		if err != nil {
-			return nil, err, ""
+			return nil, err, "", ""
 		}
 		if analysis.Fingerprint != expect {
-			return nil, ipc.Fail{C: "stale_preview", M: "the file changed after the preview was made, so nothing was written; open the diff again and retry"}, ""
+			return nil, ipc.Fail{C: "stale_preview", M: "the file changed after the preview was made, so nothing was written; open the diff again and retry"}, "", ""
 		}
 	}
 	outcome, err := a.mergeChange(ch)
 	if err != nil {
-		return nil, err, ""
+		return nil, err, "", ""
 	}
 	updated, _ := a.Coord.UpdateChange(id, func(c *orchestrator.Change) {
 		c.Status, c.Conflict, c.Resolving, c.Landed = "accepted", "", false, outcome.Action
 	})
-	a.settle(ch.AgentID)
 	a.persist()
-	return map[string]any{"change": updated, "integration": outcome}, nil, ch.Path
+	return map[string]any{"change": updated, "integration": outcome}, nil, ch.Path, ch.AgentID
 }
 
 // resolveChange is the explicit resolution action for one change. head sends it to the head agent, mine rejects it
@@ -444,28 +476,34 @@ func (a *App) resolveChange(id, choice string) (any, error) {
 // only reachable through an explicit per-file choice.
 func (a *App) takeAgentChange(id string) (any, error) {
 	a.decisionMu.Lock()
-	out, err, path := a.takeAgentChangeLocked(id)
+	out, err, path, agentID := a.takeAgentChangeLocked(id)
 	a.decisionMu.Unlock()
+	if err == nil && agentID != "" {
+		a.settle(agentID)
+	}
 	if err == nil && path != "" {
 		a.projectPaths([]string{path})
 	}
 	return out, err
 }
 
-func (a *App) takeAgentChangeLocked(id string) (any, error, string) {
+func (a *App) takeAgentChangeLocked(id string) (any, error, string, string) {
 	ch, ok := a.Coord.FindChange(id)
 	if !ok {
-		return nil, ipc.Fail{C: "not_found", M: "change not found"}, ""
+		return nil, ipc.Fail{C: "not_found", M: "change not found"}, "", ""
 	}
 	if ch.Status != "proposed" {
-		return nil, ipc.Fail{C: "invalid_state", M: "this change is not waiting for a decision"}, ""
+		return nil, ipc.Fail{C: "invalid_state", M: "this change is not waiting for a decision"}, "", ""
+	}
+	if err := a.parentGate(ch); err != nil {
+		return nil, err, "", ""
 	}
 	if !a.ownWorktree(ch.Worktree) || ch.Path == "" {
-		return nil, ipc.Fail{C: "invalid_change", M: "change lacks a worktree or path"}, ""
+		return nil, ipc.Fail{C: "invalid_change", M: "change lacks a worktree or path"}, "", ""
 	}
 	if a.pathDirty(ch.Path) {
 		a.blockChange(ch.ID, "unsaved_buffer", "the file has unsaved changes in the editor; save it and try again")
-		return nil, ipc.Fail{C: "unsaved_buffer", M: ch.Path + ": the file has unsaved changes in the editor, so nothing was written"}, ""
+		return nil, ipc.Fail{C: "unsaved_buffer", M: ch.Path + ": the file has unsaved changes in the editor, so nothing was written"}, "", ""
 	}
 	journal := func(path string, pre []byte, preExists bool, post []byte, postExists bool) error {
 		_, jerr := a.Coord.WS.JournalChange(ch.ID, []workspace.JournalWrite{{Path: path, Post: post, PostExists: postExists}})
@@ -483,18 +521,17 @@ func (a *App) takeAgentChangeLocked(id string) (any, error, string) {
 	if err != nil {
 		var fail ipc.Fail
 		if errors.As(err, &fail) {
-			return nil, fail, ""
+			return nil, fail, "", ""
 		}
-		return nil, ipc.Fail{C: "integration_failed", M: fmt.Sprintf("%s: %v", ch.Path, err)}, ""
+		return nil, ipc.Fail{C: "integration_failed", M: fmt.Sprintf("%s: %v", ch.Path, err)}, "", ""
 	}
 	now := time.Now().UnixMilli()
 	updated, _ := a.Coord.UpdateChange(id, func(c *orchestrator.Change) {
 		c.Status, c.Conflict, c.Resolving, c.Landed = "accepted", "", false, outcome.Action
 		c.Integration = &orchestrator.Integration{State: "clean", CheckedAt: now}
 	})
-	a.settle(ch.AgentID)
 	a.persist()
-	return map[string]any{"change": updated, "integration": outcome}, nil, ch.Path
+	return map[string]any{"change": updated, "integration": outcome}, nil, ch.Path, ch.AgentID
 }
 
 // undoChange restores the journal pre-image of an accepted change when every touched path still holds the bytes
@@ -615,47 +652,295 @@ func (a *App) blockChange(id, kind, reason string) {
 	})
 }
 
-func (a *App) rejectChange(id string) (any, error) {
-	a.decisionMu.Lock()
-	defer a.decisionMu.Unlock()
-	return a.rejectChangeLocked(id)
+// rejectJob is the cleanup a rejection defers until decisionMu is released: clean the agent's worktree file
+// and release the tree once no change for that agent is waiting.
+type rejectJob struct {
+	changeID string
+	agentID  string
+	worktree string
+	path     string
 }
 
-func (a *App) rejectChangeLocked(id string) (any, error) {
+func (a *App) rejectChange(id string) (any, error) {
+	a.decisionMu.Lock()
+	out, job, err := a.rejectChangeLocked(id)
+	if job == nil {
+		a.decisionMu.Unlock()
+		return out, err
+	}
+	a.holdCleanup(job.agentID)
+	// Release decisionMu before waiting on cleanupMu. The decision is already recorded, and the hold stops a
+	// concurrent accept from releasing the worktree while the blob is retained.
+	a.decisionMu.Unlock()
+	a.cleanupMu.Lock()
+	a.runRejects([]rejectJob{*job})
+	return out, err
+}
+
+// holdCleanup marks an agent whose rejected bytes are not retained yet. settle and sweep skip it until the
+// cleanup finishes, so an accept cannot release the worktree in the gap.
+func (a *App) holdCleanup(agentID string) {
+	if agentID == "" {
+		return
+	}
+	a.cleanupHoldMu.Lock()
+	defer a.cleanupHoldMu.Unlock()
+	if a.cleanupHolds == nil {
+		a.cleanupHolds = map[string]int{}
+	}
+	a.cleanupHolds[agentID]++
+}
+
+// dropCleanup releases one hold taken by holdCleanup.
+func (a *App) dropCleanup(agentID string) {
+	a.cleanupHoldMu.Lock()
+	defer a.cleanupHoldMu.Unlock()
+	if a.cleanupHolds[agentID] <= 1 {
+		delete(a.cleanupHolds, agentID)
+		return
+	}
+	a.cleanupHolds[agentID]--
+}
+
+func (a *App) cleanupHeld(agentID string) bool {
+	a.cleanupHoldMu.Lock()
+	defer a.cleanupHoldMu.Unlock()
+	return a.cleanupHolds[agentID] > 0
+}
+
+func (a *App) heldCleanupAgents() []string {
+	a.cleanupHoldMu.Lock()
+	defer a.cleanupHoldMu.Unlock()
+	out := make([]string, 0, len(a.cleanupHolds))
+	for id := range a.cleanupHolds {
+		out = append(out, id)
+	}
+	return out
+}
+
+// rejectDecision describes one member of a rejected batch.
+type rejectDecision struct {
+	changeID     string
+	agentID      string
+	worktree     string
+	path         string
+	reason       string
+	supersededBy string
+	superseded   bool
+}
+
+// rejectDecisionsLocked marks a whole batch rejected with one UpdateChanges event and returns the cleanup jobs.
+// Callers hold decisionMu and must release it before waiting on cleanupMu.
+func (a *App) rejectDecisionsLocked(decisions []rejectDecision) []rejectJob {
+	if len(decisions) == 0 {
+		return nil
+	}
+	byID := make(map[string]rejectDecision, len(decisions))
+	ids := make([]string, 0, len(decisions))
+	for _, d := range decisions {
+		byID[d.changeID] = d
+		ids = append(ids, d.changeID)
+	}
+	a.Coord.UpdateChanges(ids, func(c *orchestrator.Change) {
+		d := byID[c.ID]
+		c.Status, c.Conflict, c.Resolving = "rejected", "", false
+		if d.reason != "" {
+			c.Reason = d.reason
+		}
+		if d.superseded {
+			c.Superseded = true
+		}
+		if d.supersededBy != "" {
+			c.SupersededBy = d.supersededBy
+		}
+	})
+	jobs := make([]rejectJob, 0, len(decisions))
+	held := map[string]bool{}
+	for _, d := range decisions {
+		jobs = append(jobs, rejectJob{changeID: d.changeID, agentID: d.agentID, worktree: d.worktree, path: d.path})
+		if !held[d.agentID] {
+			held[d.agentID] = true
+			a.holdCleanup(d.agentID)
+		}
+	}
+	return jobs
+}
+
+// runRejects performs the deferred reject work. The caller holds cleanupMu and has already released decisionMu.
+func (a *App) runRejects(jobs []rejectJob) {
+	defer a.cleanupMu.Unlock()
+	failed := a.keepRejectedBlobs(jobs)
+	a.finishRejectsLocked(jobs, failed)
+}
+
+// keepRejectedBlobs retains the agent bytes under refs/relo/changes before the worktree can be released. A
+// change whose bytes could not be retained is returned in failed: its worktree and branch are left in place so
+// the bytes stay recoverable.
+func (a *App) keepRejectedBlobs(jobs []rejectJob) map[string]error {
+	failed := map[string]error{}
+	if a.Coord.WS == nil {
+		return failed
+	}
+	var refs []workspace.BlobRef
+	for _, j := range jobs {
+		if _, err := os.Stat(j.worktree); err == nil && a.ownWorktree(j.worktree) {
+			refs = append(refs, workspace.BlobRef{ChangeID: j.changeID, Worktree: j.worktree, Path: j.path})
+		}
+	}
+	if len(refs) == 0 {
+		return failed
+	}
+	err := a.retainBlobs(refs)
+	if err == nil {
+		return failed
+	}
+	// The batch reports one error and may already have retained some blobs through its per-file fallback.
+	// Retry each change on its own so the ones that were kept can still have their worktrees released.
+	for _, r := range refs {
+		if one := a.retainBlob(r); one != nil {
+			failed[r.ChangeID] = one
+			a.Log.Warn("keep rejected agent blob", map[string]any{"changeId": r.ChangeID, "path": r.Path, "error": one.Error()})
+		}
+	}
+	return failed
+}
+
+func (a *App) retainBlobs(refs []workspace.BlobRef) error {
+	if a.keepBlobs != nil {
+		return a.keepBlobs(refs)
+	}
+	return a.Coord.WS.KeepChangeBlobs(refs)
+}
+
+func (a *App) retainBlob(r workspace.BlobRef) error {
+	if a.keepBlob != nil {
+		return a.keepBlob(r.ChangeID, r.Worktree, r.Path)
+	}
+	return a.Coord.WS.KeepChangeBlob(r.ChangeID, r.Worktree, r.Path)
+}
+
+// finishRejectsLocked cleans the agent worktrees and releases the ones nothing waits for, then persists the
+// batch once. Changes whose blob could not be retained keep their worktree and cleanup hold. The caller holds
+// cleanupMu and must not hold decisionMu.
+func (a *App) finishRejectsLocked(jobs []rejectJob, failed map[string]error) {
+	if a.Coord.WS == nil {
+		seen := map[string]bool{}
+		for _, j := range jobs {
+			if !seen[j.agentID] {
+				seen[j.agentID] = true
+				a.dropCleanup(j.agentID)
+			}
+		}
+		a.persist()
+		return
+	}
+	byAgent := map[string][]string{}
+	var agents []string
+	failedAgents := map[string]bool{}
+	for _, j := range jobs {
+		if _, bad := failed[j.changeID]; bad {
+			failedAgents[j.agentID] = true
+		}
+	}
+	for _, j := range jobs {
+		if _, bad := failed[j.changeID]; bad {
+			continue
+		}
+		if _, err := os.Stat(j.worktree); err != nil || !a.ownWorktree(j.worktree) {
+			continue
+		}
+		tree, err := a.Coord.WS.EnsureTree(j.agentID, false)
+		if err != nil || tree.Path != j.worktree {
+			continue
+		}
+		if _, ok := byAgent[j.agentID]; !ok {
+			agents = append(agents, j.agentID)
+		}
+		byAgent[j.agentID] = append(byAgent[j.agentID], j.path)
+	}
+	for _, agentID := range agents {
+		if err := a.Coord.WS.DiscardMany(agentID, byAgent[agentID]); err != nil {
+			a.Log.Warn("discard worktree files", map[string]any{"agentId": agentID, "error": err.Error()})
+		}
+	}
+	seen := map[string]bool{}
+	for _, j := range jobs {
+		if seen[j.agentID] {
+			continue
+		}
+		seen[j.agentID] = true
+		if failedAgents[j.agentID] {
+			// Keep the hold: the unretained bytes must stay in the worktree.
+			continue
+		}
+		a.dropCleanup(j.agentID)
+		if a.Coord.WS != nil {
+			a.settleLocked(j.agentID)
+		}
+	}
+	if len(failed) > 0 {
+		a.noteRetentionFailures(failed)
+	}
+	a.persist()
+}
+
+func (a *App) noteRetentionFailures(failed map[string]error) {
+	ids := make([]string, 0, len(failed))
+	for id := range failed {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, id+": "+failed[id].Error())
+	}
+	a.Coord.Note("Some rejected changes were left recoverable because their agent copy could not be kept: " + strings.Join(parts, "; "))
+}
+
+// rejectChangeLocked validates and marks one change rejected. Git cleanup and persistence are returned to the
+// caller so they run after decisionMu is released.
+func (a *App) rejectChangeLocked(id string) (any, *rejectJob, error) {
+	return a.rejectChangeLockedAs(id, "", "")
+}
+
+// rejectChangeLockedAs is rejectChangeLocked with the optional discard reason and supersession target that the head
+// resolve path records. Callers hold decisionMu; git cleanup and persistence are deferred by the returned job.
+func (a *App) rejectChangeLockedAs(id, reason, supersededBy string) (any, *rejectJob, error) {
 	ch, ok := a.Coord.FindChange(id)
 	if !ok {
-		return nil, ipc.Fail{C: "not_found", M: "change not found"}
+		return nil, nil, ipc.Fail{C: "not_found", M: "change not found"}
 	}
 	switch ch.Status {
 	case "rejected":
-		return map[string]any{"change": ch}, nil
+		return map[string]any{"change": ch}, nil, nil
 	case "applied":
-		return nil, ipc.Fail{C: "direct_mode", M: "This project is not a Git repository, so the edit was made in place and cannot be reverted. Run git init to get isolated, reviewable changes."}
+		return nil, nil, ipc.Fail{C: "direct_mode", M: "This project is not a Git repository, so the edit was made in place and cannot be reverted. Run git init to get isolated, reviewable changes."}
 	case "accepted":
-		return nil, ipc.Fail{C: "invalid_state", M: "this change was already accepted"}
+		return nil, nil, ipc.Fail{C: "invalid_state", M: "this change was already accepted"}
 	case "proposed":
 	default:
-		return nil, ipc.Fail{C: "invalid_state", M: "this change is not waiting for a decision"}
+		return nil, nil, ipc.Fail{C: "invalid_state", M: "this change is not waiting for a decision"}
 	}
 	if ch.AgentID == "" || ch.Path == "" {
-		return nil, ipc.Fail{C: "invalid_change", M: "change lacks an agent or path"}
+		return nil, nil, ipc.Fail{C: "invalid_change", M: "change lacks an agent or path"}
 	}
-	// The worktree is separate from the workspace, so rejecting never touches the user's files. Discarding the file
-	// there only keeps the agent's tree consistent; if the tree is already gone there is nothing left to do.
-	if _, err := os.Stat(ch.Worktree); err == nil && a.ownWorktree(ch.Worktree) {
-		if err := a.Coord.WS.KeepChangeBlob(ch.ID, ch.Worktree, ch.Path); err != nil {
-			a.Log.Warn("keep rejected agent blob", map[string]any{"changeId": ch.ID, "path": ch.Path, "error": err.Error()})
+	// The worktree is separate from the workspace, so rejecting never touches the user's files.
+	updated, _ := a.Coord.UpdateChange(id, func(c *orchestrator.Change) {
+		c.Status, c.Conflict, c.Resolving = "rejected", "", false
+		if reason != "" {
+			c.Reason = reason
 		}
-		if tree, terr := a.Coord.WS.EnsureTree(ch.AgentID, false); terr == nil && tree.Path == ch.Worktree {
-			if err := a.Coord.WS.Discard(ch.AgentID, ch.Path); err != nil {
-				a.Log.Warn("discard worktree file", map[string]any{"agentId": ch.AgentID, "path": ch.Path, "error": err.Error()})
-			}
+		if supersededBy != "" {
+			c.SupersededBy = supersededBy
 		}
+	})
+	// A4: dependents stay proposed and keep their Lineage; only their visible state changes. Their worktrees and
+	// blobs are kept because they still wait for a decision.
+	if a.dependent.Load() {
+		a.markDependentsLocked(ch.ID, "parent_rejected", fmt.Sprintf("parent %s was rejected", ch.ID))
 	}
-	updated, _ := a.Coord.UpdateChange(id, func(c *orchestrator.Change) { c.Status, c.Conflict, c.Resolving = "rejected", "", false })
-	a.settle(ch.AgentID)
-	a.persist()
-	return map[string]any{"change": updated}, nil
+	job := &rejectJob{changeID: ch.ID, agentID: ch.AgentID, worktree: ch.Worktree, path: ch.Path}
+	return map[string]any{"change": updated}, job, nil
 }
 
 type bulkFailure struct {
@@ -676,18 +961,21 @@ func (a *App) decideAll(accept bool) (any, error) {
 
 func (a *App) acceptAll(auto bool) (any, error) {
 	a.decisionMu.Lock()
-	out, err, paths := a.acceptAllLocked(auto)
+	out, err, paths, agents := a.acceptAllLocked(auto)
 	a.decisionMu.Unlock()
+	for _, agentID := range agents {
+		a.settle(agentID)
+	}
 	if len(paths) > 0 {
 		a.projectPaths(paths)
 	}
 	return out, err
 }
 
-func (a *App) acceptAllLocked(auto bool) (any, error, []string) {
+func (a *App) acceptAllLocked(auto bool) (any, error, []string, []string) {
 	var waiting []orchestrator.Change
 	for _, ch := range a.Coord.Changes() {
-		if ch.Status == "proposed" && (!auto || (a.autoApply.Load() && autoEligible(ch))) {
+		if ch.Status == "proposed" && (!auto || (a.autoApply.Load() && a.autoEligibleFor(ch))) {
 			waiting = append(waiting, ch)
 		}
 	}
@@ -710,6 +998,9 @@ func (a *App) acceptAllLocked(auto bool) (any, error, []string) {
 				}
 			}
 		}
+	}
+	if a.dependent.Load() {
+		return a.acceptAllComponentsLocked(waiting, auto)
 	}
 	errs := make([]error, len(waiting))
 	skipped := make([]bool, len(waiting))
@@ -737,7 +1028,7 @@ func (a *App) acceptAllLocked(auto bool) (any, error, []string) {
 					errs[i] = ipc.Fail{C: "not_found", M: "change not found"}
 					continue
 				}
-				if auto && (!a.autoApply.Load() || !autoEligible(current)) {
+				if auto && (!a.autoApply.Load() || !a.autoEligibleFor(current)) {
 					skipped[i] = true
 					continue
 				}
@@ -797,30 +1088,141 @@ func (a *App) acceptAllLocked(auto bool) (any, error, []string) {
 	for action, ids := range landed {
 		a.Coord.UpdateChanges(ids, func(c *orchestrator.Change) { c.Landed = action })
 	}
+	if done > 0 || (auto && len(failed) > 0) {
+		a.persist()
+	}
+	released := make([]string, 0, len(agents))
 	for agentID := range agents {
-		a.settle(agentID)
+		released = append(released, agentID)
+	}
+	return map[string]any{"done": done, "failed": failed, "changes": a.Coord.Changes()}, nil, acceptedPaths, released
+}
+
+// componentResult is the outcome of one connected Needs component in a dependent-aware accept-all.
+type componentResult struct {
+	accepted []string
+	failures []bulkFailure
+}
+
+// acceptAllComponentsLocked is A8: each connected Needs component is planned as a unit, then written in dependency
+// order with journaled rollback. Independent components keep partial success and the four-way concurrency bound.
+// The caller holds decisionMu; settling and projection happen in acceptAll after it is released.
+func (a *App) acceptAllComponentsLocked(waiting []orchestrator.Change, auto bool) (any, error, []string, []string) {
+	components := componentsOf(waiting)
+	results := make([]componentResult, len(components))
+	sem := make(chan struct{}, bulkMergeWorkers)
+	var wg sync.WaitGroup
+	for ci, idxs := range components {
+		wg.Add(1)
+		go func(ci int, idxs []int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			var members []orchestrator.Change
+			for _, i := range idxs {
+				current, ok := a.Coord.FindChange(waiting[i].ID)
+				if !ok {
+					results[ci].failures = append(results[ci].failures, bulkFailure{ID: waiting[i].ID, Reason: "change not found"})
+					continue
+				}
+				if auto && (!a.autoApply.Load() || !a.autoEligibleFor(current)) {
+					continue
+				}
+				if current.Status != "proposed" {
+					results[ci].failures = append(results[ci].failures, bulkFailure{ID: current.ID, Path: current.Path, Reason: "this change is not waiting for a decision"})
+					continue
+				}
+				if auto && a.pathDirty(current.Path) {
+					a.blockChange(current.ID, "unsaved_buffer", "the file has unsaved changes in the editor; save it and try again")
+					results[ci].failures = append(results[ci].failures, bulkFailure{ID: current.ID, Path: current.Path, Reason: current.Path + ": the file has unsaved changes in the editor, so nothing was written"})
+					continue
+				}
+				if a.lazy.Load() && (current.Integration == nil || current.Integration.State != "clean") {
+					reason := "the change could not be projected"
+					if current.Integration != nil && current.Integration.Reason != "" {
+						reason = current.Integration.Reason
+					}
+					results[ci].failures = append(results[ci].failures, bulkFailure{ID: current.ID, Path: current.Path, Reason: current.Path + ": " + reason + ". Nothing was changed."})
+					continue
+				}
+				members = append(members, current)
+			}
+			// A component is all-or-nothing: one refused member means no member is written.
+			if len(results[ci].failures) > 0 || len(members) == 0 {
+				return
+			}
+			ordered, fails := a.planGroup(members)
+			if len(fails) > 0 {
+				results[ci].failures = append(results[ci].failures, fails...)
+				return
+			}
+			accepted, failures, _, _ := a.acceptOrderedLocked(ordered)
+			results[ci].accepted = accepted
+			results[ci].failures = append(results[ci].failures, failures...)
+		}(ci, idxs)
+	}
+	wg.Wait()
+
+	done := 0
+	failed := []bulkFailure{}
+	var acceptedPaths []string
+	agents := map[string]bool{}
+	for _, r := range results {
+		done += len(r.accepted)
+		failed = append(failed, r.failures...)
+		for _, id := range r.accepted {
+			if ch, ok := a.Coord.FindChange(id); ok {
+				acceptedPaths = append(acceptedPaths, ch.Path)
+				if ch.AgentID != "" {
+					agents[ch.AgentID] = true
+				}
+			}
+		}
+	}
+	if auto && len(failed) > 0 {
+		for _, f := range failed {
+			a.Coord.UpdateChange(f.ID, func(c *orchestrator.Change) {
+				if c.Conflict == "" {
+					c.Conflict = f.Reason
+				}
+			})
+		}
 	}
 	if done > 0 || (auto && len(failed) > 0) {
 		a.persist()
 	}
-	return map[string]any{"done": done, "failed": failed, "changes": a.Coord.Changes()}, nil, acceptedPaths
+	released := make([]string, 0, len(agents))
+	for agentID := range agents {
+		released = append(released, agentID)
+	}
+	return map[string]any{"done": done, "failed": failed, "changes": a.Coord.Changes()}, nil, acceptedPaths, released
 }
 
 func (a *App) rejectAll() (any, error) {
 	a.decisionMu.Lock()
-	defer a.decisionMu.Unlock()
-
 	done := 0
 	failed := []bulkFailure{}
+	var decisions []rejectDecision
 	for _, ch := range a.Coord.Changes() {
 		if ch.Status != "proposed" {
 			continue
 		}
-		if _, err := a.rejectChangeLocked(ch.ID); err != nil {
-			failed = append(failed, bulkFailure{ID: ch.ID, Path: ch.Path, Reason: err.Error()})
+		if ch.AgentID == "" || ch.Path == "" {
+			failed = append(failed, bulkFailure{ID: ch.ID, Path: ch.Path, Reason: ipc.Fail{C: "invalid_change", M: "change lacks an agent or path"}.Error()})
 			continue
 		}
+		decisions = append(decisions, rejectDecision{changeID: ch.ID, agentID: ch.AgentID, worktree: ch.Worktree, path: ch.Path})
 		done++
+	}
+	if len(decisions) > 0 {
+		// One state update and one event for the whole batch; the per-change git work runs after both locks
+		// are released, so a decision never waits on cleanupMu while holding decisionMu.
+		jobs := a.rejectDecisionsLocked(decisions)
+		a.decisionMu.Unlock()
+		a.cleanupMu.Lock()
+		a.runRejects(jobs)
+	} else {
+		a.decisionMu.Unlock()
 	}
 	return map[string]any{"done": done, "failed": failed, "changes": a.Coord.Changes()}, nil
 }

@@ -52,6 +52,8 @@ Dynamic, not a fixed org chart. Default roles:
 
 Scheduler enforces `relo.maxConcurrentAgents`, tier caps, and hierarchy depth. A task that does not fit shows as a queued agent saying which limit it waits on (at most four wait at a time), and takes a slot the moment one frees, the agent that has waited longest first; a request does not wait for a whole batch of workers to finish before the queue moves. When a run ends with agents still waiting they are retired, not left queued. Duplicate mutating work is isolated with Git worktrees under `.relo/worktrees/<agent-id>/`.
 
+With `relo.scheduler.pathLeases` on (default off), a task may declare the files it will edit. Two tasks whose declared paths overlap are never running together: the later one waits for the earlier to finish, then starts from the same base with the earlier task's pending patches for those paths applied, so the overlap becomes a soft dependency (`needs`) instead of a merge conflict. Tasks with no declared paths are unaffected.
+
 ## Primary loop
 
 1. Build Primary context from objective, decisions, task graph, reports, memory.

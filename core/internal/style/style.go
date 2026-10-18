@@ -182,7 +182,7 @@ func matrix(role agent.Role) (Profile, Scope) {
 		p.Voice, s.Budget = LevelUltra, 6000
 		s.Memory, s.DependencyReportsOnly, s.ReadOnly = false, true, true
 	case agent.Worker, agent.Debug, agent.Integration:
-		p.Voice, p.Craft, s.Budget = LevelFull, LevelFull, 16000
+		p.Voice, p.Craft, s.Budget = LevelFull, LevelLite, 16000
 		s.Classes, s.Memory, s.DependencyReportsOnly, s.MaxItemTokens = []string{"task_state", "code", "report", "finding"}, false, true, 2000
 	case agent.Architect:
 		p.Voice, p.Craft, s.Budget = LevelFull, LevelLite, 16000
@@ -232,9 +232,9 @@ var voiceFragments = map[Level]string{
 }
 
 var craftFragments = map[Level]string{
-	LevelLite:  "Before adding code: need it? Already present? Stdlib? Native feature? Installed dependency? One line? Then minimum working change; prefer deletion. Skip unrequested abstractions and boilerplate. Keep trust-boundary validation, data-loss-safe error handling, security, and accessibility. Leave one small runnable test for non-trivial logic. Mark deliberate shortcuts with `ponytail:` and upgrade trigger. End with skipped work and risks.",
-	LevelFull:  "Need it? Existing code? Stdlib? Native? Installed dependency? One line? Write minimum working change; prefer deletion. No unrequested abstractions or boilerplate. Never cut trust-boundary validation, data-loss-safe error handling, security, or accessibility. Non-trivial logic needs one small runnable test. Mark deliberate shortcuts with `ponytail:` and upgrade trigger. End with skipped work and risks.",
-	LevelUltra: "Need code? Check existing code, stdlib, native feature, installed dependency, one line. Then minimum change; prefer deletion. No unrequested abstractions or boilerplate. Never cut input validation, safe error handling, security, accessibility. Non-trivial logic: one small runnable test. Mark shortcuts with `ponytail:` and upgrade trigger. End with skipped work and risks.",
+	LevelLite:  "Before adding code: need it? Already present? Stdlib? Native feature? Installed dependency? Then make the smallest change that works and fits the surrounding code. No unrequested abstractions, rewrites, or boilerplate. Keep trust-boundary validation, data-loss-safe error handling, security, and accessibility. Add a small runnable test for non-trivial logic. Name deliberate shortcuts and skipped work in the report's risks.",
+	LevelFull:  "Need it? Existing code? Stdlib? Native? Installed dependency? Make the smallest change that works and fits the surrounding code. No unrequested abstractions, rewrites, or boilerplate. Never cut trust-boundary validation, data-loss-safe error handling, security, or accessibility. Non-trivial logic needs one small runnable test. Name deliberate shortcuts and skipped work in the report's risks.",
+	LevelUltra: "Need code? Check existing code, stdlib, native feature, installed dependency first. Then the smallest change that works and fits the surrounding code. No unrequested abstractions, rewrites, or boilerplate. Never cut input validation, safe error handling, security, accessibility. Non-trivial logic: one small runnable test. Name shortcuts and skipped work in the report's risks.",
 }
 
 const reviewFragment = "Review touched code, not diff alone. Report each bug, security risk, load risk, missing test, and cut candidate with consequence and fix. Prioritize concrete failures over style preferences."

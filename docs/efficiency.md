@@ -39,7 +39,7 @@ Two independent axes (Reply brevity, Minimal code), each with four levels:
 
 - **Reply brevity**: terse prose. Applies to report fields, narration between tool calls, findings.
   Never to code, paths, commands, error strings, JSON keys, or the user-facing `userMessage`.
-- **Minimal code**: minimum-code discipline for roles that write code: ladder (need it? stdlib? native?
+- **Minimal code**: minimum-code discipline for roles that write code. It shapes the change, never the file: no markers or comments are asked for in the user's code, and shortcuts are named in the report's risks. Ladder (need it? stdlib? native?
   installed dep? one line? minimal), no unrequested abstractions, validation/security/accessibility never cut,
   one tiny test for non-trivial logic. Reviewer gets the **review lens** variant instead (what breaks, what to cut).
 
@@ -53,7 +53,7 @@ Optional Fewer agents (off by default): one line telling Primary to merge or dro
 | primary | Normal | Off | 24k |
 | head | Short | Off | 12k |
 | probe | Telegraphic | Off | 6k, read-only, no memory, direct-dependency reports only |
-| worker / debug / integration | Terse | Strict | 16k; task, code, report; 2k max per item; dependency reports only |
+| worker / debug / integration | Terse | Light | 16k; task, code, report; 2k max per item; dependency reports only |
 | architect | Terse | Light | 16k |
 | test | Telegraphic | Off | 8k |
 | reviewer | Terse (review format) | review lens | 12k; task, finding, code (diff + acceptance + prior findings) |

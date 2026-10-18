@@ -54,7 +54,7 @@ func (c *Coord) SetEmitterIfUnset(fn func(string, any)) {
 func (c *Coord) Configure(settings Settings, sched *scheduler.Scheduler, route routing.Config) {
 	c.configMu.Lock()
 	if sched == nil {
-		sched = scheduler.New(scheduler.Limits{})
+		sched = scheduler.New(scheduler.Limits{PathLeases: settings.PathLeases})
 	}
 	if !settings.EscalateSet && !settings.Escalate {
 		settings.Escalate = true
@@ -74,6 +74,7 @@ func cloneSession(s *Session) *Session {
 		return nil
 	}
 	out := *s
+	out.Constraints = append([]string(nil), s.Constraints...)
 	out.Messages = append([]Chat(nil), s.Messages...)
 	out.Changes = append([]Change(nil), s.Changes...)
 	out.Verify = append([]verification.Result(nil), s.Verify...)
@@ -153,6 +154,7 @@ func (c *Coord) OpenSession(ctx context.Context, s *Session) {
 		}
 	}
 	c.lineage = map[string][]Dep{}
+	c.lineageProblems = map[string]lineageProblem{}
 	c.Graph, c.Agents, c.Engine = taskgraph.New(), c.newRegistry(), ctxeng.New()
 	c.baseline, c.tasksPlanned = nil, 0
 	opened := cloneSession(c.sess)
@@ -165,6 +167,7 @@ func (c *Coord) Restore(s *Session) {
 	c.mu.Lock()
 	c.sess = cloneSession(s)
 	c.lineage = map[string][]Dep{}
+	c.lineageProblems = map[string]lineageProblem{}
 	clearQueuedMarks(c.sess)
 	if c.sess != nil {
 		c.sess.Running = false
@@ -504,6 +507,9 @@ func (c *Coord) chat(role, text, agentID string) {
 	c.emit("chat.message", m)
 }
 
+// Note adds a visible system message to the current session.
+func (c *Coord) Note(text string) { c.chat("system", text, "") }
+
 func (c *Coord) addChatLocked(m Chat) {
 	if m.ID == "" {
 		m.ID = id.New("msg")
@@ -606,7 +612,7 @@ func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text strin
 		return err
 	}
 	c.emit("context.created", map[string]any{"agentId": primary.ID, "generation": gen.Number, "tokens": gen.Tokens})
-	extra := c.workspaceFacts() + "\nUser message:\n" + text
+	extra := c.workspaceFacts() + c.constraintsNote() + "\nUser message:\n" + text
 	if line := style.PlanLeanLine(settings.Efficiency); line != "" {
 		extra += "\n" + line
 	}
@@ -669,11 +675,15 @@ func (c *Coord) applyTurn(primary agent.Agent, turn Turn) {
 	if s == nil {
 		return
 	}
+	if len(turn.ResolvedChanges) > 0 && c.ResolveChanges != nil {
+		c.ResolveChanges(turn.ResolvedChanges)
+	}
+	c.setConstraints(turn.Constraints)
 	idmap := map[string]string{}
 	turn.Tasks = c.admitTasks(turn.Tasks)
 	for _, spec := range turn.Tasks {
 		role := parseRole(spec.Role)
-		t := c.Graph.Add(taskgraph.Task{Title: spec.Title, Description: spec.Description, Acceptance: spec.Acceptance, Creator: primary.ID, Priority: spec.Priority, Role: string(role), Workspace: s.Workspace, Difficulty: spec.Difficulty, MaxAttempts: settings.MaxRetries, Model: c.modelForDifficulty(role, spec.Difficulty)})
+		t := c.Graph.Add(taskgraph.Task{Title: spec.Title, Description: spec.Description, Acceptance: spec.Acceptance, Creator: primary.ID, Priority: spec.Priority, Role: string(role), Workspace: s.Workspace, Difficulty: spec.Difficulty, MaxAttempts: settings.MaxRetries, Model: c.modelForDifficulty(role, spec.Difficulty), Paths: spec.Paths})
 		idmap[spec.ID] = t.ID
 		c.emit("task.created", t)
 	}
@@ -694,6 +704,33 @@ func (c *Coord) applyTurn(primary agent.Agent, turn Turn) {
 	for _, d := range turn.Decisions {
 		c.Engine.Ingest(primary.ID, []ctxeng.Item{{Class: ctxeng.ClassTask, Source: ctxeng.SourceVerified, Title: "Decision", Content: d, Verified: true, Durability: 0.9}})
 	}
+}
+
+// setConstraints replaces the session's constraints with the Primary's latest list. An empty list is "unchanged": a
+// model that has nothing to add says nothing, and must not wipe what it set earlier.
+func (c *Coord) setConstraints(list []string) {
+	if len(list) == 0 {
+		return
+	}
+	c.mu.Lock()
+	if c.sess == nil || slices.Equal(c.sess.Constraints, list) {
+		c.mu.Unlock()
+		return
+	}
+	c.sess.Constraints = append([]string(nil), list...)
+	c.sess.Updated = time.Now().UTC()
+	s := cloneSession(c.sess)
+	c.mu.Unlock()
+	c.emit("session.updated", s)
+}
+
+// constraintsNote shows the Primary the list it set, so it can keep it, amend it or drop one.
+func (c *Coord) constraintsNote() string {
+	s := c.Current()
+	if s == nil || len(s.Constraints) == 0 {
+		return ""
+	}
+	return "\n## Your standing constraints (every sub agent is given these; send the full list in constraints to change it)\n- " + strings.Join(s.Constraints, "\n- ") + "\n"
 }
 
 // maxPlannedTasks bounds how much work one session can fan out into. A model that keeps re-planning would otherwise
@@ -882,7 +919,7 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 	}
 	c.emit("context.compressed", map[string]any{"agentId": p.ID, "generation": gen.Number})
 	resolvedPrimary := style.Resolve(settings.Efficiency, p.Role, p.Difficulty, p.Attempt, settings.Budget)
-	extra := c.workspaceFacts() + "\nAll scheduled workers finished. If every task is done and no check failed, put what was done in userMessage and return tasks as []. Plan follow-up work only for a task that failed or an acceptance criterion that is still unmet."
+	extra := c.workspaceFacts() + c.constraintsNote() + "\nAll scheduled workers finished. If every task is done and no check failed, put what was done in userMessage and return tasks as []. Plan follow-up work only for a task that failed or an acceptance criterion that is still unmet."
 	if hasQueued {
 		extra += "\nThe user sent this while you were working:\n" + queued
 	}
@@ -908,6 +945,31 @@ func (c *Coord) nextAttempt(t taskgraph.Task, a agent.Agent) (string, bool) {
 		}
 	}
 	return model, t.Attempt <= c.scheduler().Limits.MaxRetry
+}
+
+// rememberFailure keeps why an attempt failed so the attempt that replaces it does not start blind. Attempts are new
+// agents with new contexts; without this the next one repeats the approach that just failed.
+func (c *Coord) rememberFailure(taskID, why string) {
+	c.mu.Lock()
+	if c.failures == nil {
+		c.failures = map[string]string{}
+	}
+	c.failures[taskID] = why
+	c.mu.Unlock()
+}
+
+// failureNote is the item that tells a retried agent what went wrong last time, or nothing on a first attempt.
+func (c *Coord) failureNote(t taskgraph.Task) []ctxeng.Item {
+	c.mu.Lock()
+	why := c.failures[t.ID]
+	c.mu.Unlock()
+	if why == "" {
+		return nil
+	}
+	return []ctxeng.Item{{
+		Class: ctxeng.ClassTask, Source: ctxeng.SourceParent, Title: "Previous attempt failed", Durability: 1,
+		Content: "An earlier attempt at this task failed because " + why + ". Its changes were not kept. Take a different approach to whatever went wrong.",
+	}}
 }
 
 func (c *Coord) retryTask(t taskgraph.Task, a agent.Agent) {
@@ -997,6 +1059,9 @@ func (c *Coord) failTask(t taskgraph.Task, a agent.Agent, cause error) {
 	if cause != nil && !retryable(cause) {
 		c.chat("system", fmt.Sprintf("%q failed and will not be retried: %s.%s", t.Title, strings.TrimRight(cause.Error(), "."), c.keptNote(t, a)), "")
 		return
+	}
+	if cause != nil {
+		c.rememberFailure(t.ID, "it stopped with an error: "+tailText(cause.Error(), 300))
 	}
 	var stalled *stalledError
 	if errors.As(cause, &stalled) {

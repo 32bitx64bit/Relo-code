@@ -2,6 +2,8 @@ package orchestrator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -20,6 +22,7 @@ import (
 	"github.com/relocode/relo/internal/prompt"
 	"github.com/relocode/relo/internal/routing"
 	"github.com/relocode/relo/internal/runtime"
+	"github.com/relocode/relo/internal/scheduler"
 	"github.com/relocode/relo/internal/style"
 	"github.com/relocode/relo/internal/taskgraph"
 	"github.com/relocode/relo/internal/verification"
@@ -88,6 +91,11 @@ func sortedSchemaJSON(schema map[string]any) string {
 }
 
 func (c *Coord) spawn(t taskgraph.Task, role agent.Role) agent.Agent {
+	return c.spawnSoft(t, role, nil)
+}
+
+// spawnSoft cuts the agent's worktree with optional lease-holder work stacked on it.
+func (c *Coord) spawnSoft(t taskgraph.Task, role agent.Role, soft []scheduler.SoftDep) agent.Agent {
 	parent, _ := c.Agents.Primary()
 	s := c.Current()
 	mode, ws := ModeBuild, ""
@@ -132,7 +140,7 @@ func (c *Coord) spawn(t taskgraph.Task, role agent.Role) agent.Agent {
 		}
 		c.noticeSnapshot(snap.HeadFallback, snap.UntrackedTruncated)
 		// An agent that builds on unaccepted work needs a copy of its own to hold it, even a read-only one.
-		stack := c.stackParts(t)
+		stack := c.stackPartsWith(t, soft)
 		isolated := mutating || len(stack) > 0
 		tree, err := wsManager.EnsureTree(a.ID, !isolated)
 		if err != nil {
@@ -276,10 +284,11 @@ func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent)
 		return err
 	}
 	c.emit("context.created", map[string]any{"agentId": a.ID, "generation": gen.Number, "tokens": gen.Tokens})
-	// The task, its acceptance criteria and the objective are in the context pack already; sending them a second time
-	// in the message cost every agent a few hundred tokens in every call.
+	// The task is the message, not an entry in the pack: it was one of several items in the system prompt behind a
+	// generic "do the task in your context", and the model had to find it. The pack keeps only the title, so a
+	// summary of the conversation cannot lose what the agent is for.
 	parts := prompt.ComposePartsWith(a.Role, *gen, "", resolved.Profile.Fragment(a.Role))
-	body, err := c.runAgent(ctx, a, parts, "Do the assigned task described in your context, then return the report as JSON.", prompt.ReportSchema)
+	body, err := c.runAgent(ctx, a, parts, taskBrief(t), prompt.ReportSchema)
 	if err != nil {
 		c.fail(a.ID, err)
 		c.failTask(t, a, err)
@@ -304,6 +313,29 @@ func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent)
 	}
 	c.acceptReport(t, a, rep, outcome)
 	return nil
+}
+
+// taskBrief is the message a worker starts from: its task in full, last, where the model is most likely to act on it.
+func taskBrief(t taskgraph.Task) string {
+	var b strings.Builder
+	b.WriteString("Your task: " + strings.TrimSpace(t.Title) + "\n")
+	if d := strings.TrimSpace(t.Description); d != "" {
+		b.WriteString(d + "\n")
+	}
+	var acceptance []string
+	for _, line := range t.Acceptance {
+		if line = strings.TrimSpace(line); line != "" {
+			acceptance = append(acceptance, "- "+line)
+		}
+	}
+	if len(acceptance) > 0 {
+		b.WriteString("\nAcceptance:\n" + strings.Join(acceptance, "\n") + "\n")
+	}
+	if len(t.Paths) > 0 {
+		b.WriteString("\nFiles in scope: " + strings.Join(t.Paths, ", ") + "\n")
+	}
+	b.WriteString("\nDo this task, then return the report as JSON.")
+	return b.String()
 }
 
 // workerReport turns the model's final message into a report. One repair round is spent only when the reply looks
@@ -381,7 +413,7 @@ type verifyOutcome struct {
 
 func (c *Coord) shouldVerify(a agent.Agent, rep RawReport) bool {
 	sess := c.Current()
-	if sess == nil || sess.Mode != ModeBuild || !c.settings().AutoVerify || strings.EqualFold(rep.Status, "failed") {
+	if sess == nil || sess.Mode != ModeBuild || !c.settings().AutoVerify || strings.EqualFold(rep.Status, "failed") || strings.EqualFold(rep.Status, "blocked") {
 		return false
 	}
 	return a.Role == agent.Worker || a.Role == agent.Debug
@@ -473,6 +505,8 @@ func (c *Coord) clampReport(rep RawReport) RawReport {
 	}
 	rep.Summary = clip(rep.Summary, maxSummary)
 	rep.Cause = clip(rep.Cause, 240)
+	rep.Handoff = clip(rep.Handoff, prompt.ReportHandoffMaxLength)
+	rep.Question = clip(rep.Question, prompt.ReportQuestionMaxLength)
 	rep.Findings, rep.Risks, rep.Next = clampList(rep.Findings), clampList(rep.Risks), clampList(rep.Next)
 	if len(rep.Structured) > 8 {
 		rep.Structured = rep.Structured[:8]
@@ -518,9 +552,17 @@ func (c *Coord) workerSeed(t taskgraph.Task, role agent.Role) []ctxeng.Item {
 	}
 	items := []ctxeng.Item{
 		{Class: ctxeng.ClassTask, Source: ctxeng.SourceUser, Title: "Objective", Content: objective, Pinned: true, Durability: 1},
-		{Class: ctxeng.ClassTask, Source: ctxeng.SourceUser, Title: "Task", Content: t.Title + "\n" + t.Description, Durability: 1},
-		{Class: ctxeng.ClassTask, Source: ctxeng.SourceUser, Title: "Acceptance", Content: strings.Join(t.Acceptance, "\n"), Durability: 1},
+		{Class: ctxeng.ClassTask, Source: ctxeng.SourceUser, Title: "Task", Content: t.Title, Durability: 1},
 	}
+	// The Primary's reading of the request and context. A probe only reads, so the rules about changing things
+	// are not for it.
+	if s != nil && len(s.Constraints) > 0 && role != agent.Probe {
+		items = append(items, ctxeng.Item{
+			Class: ctxeng.ClassTask, Source: ctxeng.SourceParent, Kind: ctxeng.KindConstraint, Title: "Constraints", Pinned: true, Durability: 1,
+			Content: "Follow these; they come from the user's request and the project's context.\n- " + strings.Join(s.Constraints, "\n- "),
+		})
+	}
+	items = append(items, c.failureNote(t)...)
 	scoped := scopedPackRole(role)
 	var deps, scopeFiles map[string]bool
 	if scoped {
@@ -656,7 +698,7 @@ func (c *Coord) depReports(deps map[string]bool) []ctxeng.Item {
 		}
 		it := ctxeng.Item{
 			Class: ctxeng.ClassReport, Source: ctxeng.SourceParent, Title: a.Title,
-			Content:    ctxeng.CompressReport(rep.Summary, files, verify, rep.Risks, rep.Cause),
+			Content:    withHandoff(ctxeng.CompressReport(rep.Summary, files, verify, rep.Risks, rep.Cause), rep.Handoff),
 			Files:      files,
 			AgentID:    a.ID,
 			TaskID:     a.TaskID,
@@ -676,12 +718,36 @@ func (c *Coord) depReports(deps map[string]bool) []ctxeng.Item {
 	return items
 }
 
+// withHandoff appends what the report's author said the next task needs. It is the one part of a report that is not
+// compressed: a signature that lost a parameter on the way is worse than no signature.
+func withHandoff(content, handoff string) string {
+	if handoff = strings.TrimSpace(handoff); handoff == "" {
+		return content
+	}
+	return content + "\n\nHandoff (exact; build on it as given):\n" + handoff
+}
+
 func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, outcome verifyOutcome) {
 	rep = c.clampReport(rep)
 	settings := c.settings()
 	st := agent.Completed
 	if strings.EqualFold(rep.Status, "failed") {
 		st = agent.Failed
+	}
+	// A blocked agent stopped on purpose to ask. It is not retried, since a retry would meet the same question; the
+	// Primary reads the question in the report and answers it in a replacement task, or asks the user.
+	blocked := strings.EqualFold(rep.Status, "blocked")
+	if blocked {
+		st = agent.Interrupted
+		question := strings.TrimSpace(rep.Question)
+		if question == "" {
+			question = firstLine(rep.Summary)
+		}
+		text := "Blocked, needs a decision: " + question
+		if summary := strings.TrimSpace(rep.Summary); summary != "" && summary != question {
+			text += "\n" + summary
+		}
+		rep.Question, rep.Summary = question, text
 	}
 	checksFailed := outcome.ran && !outcome.passed
 	if checksFailed {
@@ -694,7 +760,7 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 	if unchanged {
 		rep.Risks = append([]string{"Changed no files."}, rep.Risks...)
 	}
-	report := agent.Report{Status: st, Summary: rep.Summary, Findings: rep.Findings, Files: rep.Files, Risks: rep.Risks, Next: rep.Next, Cause: rep.Cause, Raw: rep.Summary}
+	report := agent.Report{Status: st, Summary: rep.Summary, Findings: rep.Findings, Files: rep.Files, Risks: rep.Risks, Next: rep.Next, Cause: rep.Cause, Handoff: rep.Handoff, Question: rep.Question, Raw: rep.Summary}
 	for _, v := range rep.Verify {
 		report.Verify = append(report.Verify, agent.Verify{Command: v.Command, Status: v.Status, Output: v.Output})
 	}
@@ -711,6 +777,8 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		x.Files = files
 		x.Generation = c.Engine.CurrentNumber(a.ID)
 		switch {
+		case blocked:
+			x.Status, x.Activity = st, "Needs a decision: "+firstLine(rep.Question)
 		case checksFailed:
 			x.Status, x.Activity = agent.Failed, "Checks failed"
 		case st == agent.Failed:
@@ -735,7 +803,7 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		})
 		c.emit("finding.created", f)
 	}
-	if settings.Memory {
+	if settings.Memory && !blocked {
 		c.Memory.Upsert(memory.Entry{Kind: "finding", Title: firstLine(rep.Summary), Body: ctxeng.CompressReport(rep.Summary, files, verifyLines(rep), rep.Risks, rep.Cause), Files: files, Verified: st == agent.Completed && !checksFailed && a.Role != agent.Probe, Score: 0.6})
 		c.emit("memory.updated", map[string]any{"agentId": a.ID})
 	}
@@ -751,7 +819,7 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 	}
 	c.recordChanges(t, a, changes)
 	gst := taskgraph.Done
-	if st == agent.Failed || checksFailed {
+	if st == agent.Failed || blocked || checksFailed {
 		gst = taskgraph.Failed
 	}
 	updated, err := c.Graph.Update(t.ID, func(x *taskgraph.Task) {
@@ -776,12 +844,15 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 	c.emit("task.failed", updated)
 	c.emit("agent.failed", c.freshAgent(a))
 	switch {
+	case blocked:
+		// The question is in the report the Primary reads next.
 	case checksFailed:
 		// The work is intact in the worktree; a blind retry would redo it from scratch. Say so and let the user decide.
 		c.chat("system", fmt.Sprintf("%q finished, but the project's checks still fail (%s). Its changes are in the Changes tab for you to review.", t.Title, firstLine(outcome.failure)), "")
 	case rep.ValidationError != "":
 		c.chat("system", fmt.Sprintf("%q did not return a usable report (%s).", t.Title, firstLine(rep.Summary)), "")
 	default:
+		c.rememberFailure(t.ID, "the agent reported: "+tailText(firstLine(rep.Summary), 300))
 		c.retryTask(updated, a)
 	}
 }
@@ -826,12 +897,48 @@ func (c *Coord) changesFor(a agent.Agent, rep RawReport) []Change {
 	for _, f := range found {
 		out = append(out, Change{ID: id.New("chg"), AgentID: a.ID, Path: f.Path, Kind: f.Kind, Added: f.Added, Deleted: f.Deleted, Status: "proposed", Worktree: a.Worktree, BaseRev: baseRev, Needs: needs, Lineage: lineage})
 	}
+	if kind, reason := c.lineageState(lineage); kind != "" {
+		for i := range out {
+			out[i].Integration = &Integration{State: "blocked", Kind: kind, Reason: reason, CheckedAt: time.Now().UnixMilli()}
+		}
+	} else if problem, ok := c.lineageProblemOf(a.ID); ok {
+		for i := range out {
+			out[i].Integration = &Integration{State: "blocked", Kind: problem.kind, Reason: problem.reason, CheckedAt: time.Now().UnixMilli()}
+		}
+	}
 	return out
 }
 
 // recordChanges stores an agent's changes on the session. An earlier attempt at the same task is superseded: its
-// proposals are dropped so the same file is never offered twice, and its worktree is released.
+// proposals are dropped so the same file is never offered twice, and its worktree is released. Dependents whose
+// Lineage names a dropped proposal are rewritten to the retry's change when it covers the same path, and become
+// blocked, parent_superseded otherwise.
 func (c *Coord) recordChanges(t taskgraph.Task, a agent.Agent, changes []Change) {
+	addedByPath := make(map[string]Change, len(changes))
+	hashes := make(map[string]string, len(changes))
+	if ws := c.workspace(); ws != nil {
+		for _, ch := range changes {
+			if ch.AgentID == "" || ch.Path == "" {
+				continue
+			}
+			patch, err := ws.PatchPath(ch.AgentID, ch.Path)
+			if err != nil || strings.TrimSpace(patch) == "" {
+				continue
+			}
+			sum := sha256.Sum256([]byte(patch))
+			hashes[ch.Path] = hex.EncodeToString(sum[:])
+		}
+	}
+	oldByID := map[string]Change{}
+	for _, ch := range c.Changes() {
+		if ch.TaskID == t.ID && ch.AgentID != a.ID && ch.Status == "proposed" {
+			oldByID[ch.ID] = ch
+		}
+	}
+	for i := range changes {
+		changes[i].TaskID = t.ID
+		addedByPath[changes[i].Path] = changes[i]
+	}
 	c.mu.Lock()
 	if c.sess == nil {
 		c.mu.Unlock()
@@ -853,20 +960,70 @@ func (c *Coord) recordChanges(t taskgraph.Task, a agent.Agent, changes []Change)
 		}
 		kept2 = append(kept2, ch)
 	}
-	for i := range changes {
-		changes[i].TaskID = t.ID
-	}
 	c.sess.Changes = append(kept2, changes...)
+	now := time.Now().UnixMilli()
+	var audits []string
+	for i := range c.sess.Changes {
+		ch := &c.sess.Changes[i]
+		if ch.AgentID == a.ID || len(ch.Lineage) == 0 {
+			continue
+		}
+		lineage := make([]Dep, 0, len(ch.Lineage))
+		rewritten := false
+		blockedKind, blockedReason := "", ""
+		for _, dep := range ch.Lineage {
+			old, replaced := oldByID[dep.ID]
+			if !replaced {
+				lineage = append(lineage, dep)
+				continue
+			}
+			next, covers := addedByPath[old.Path]
+			if !covers {
+				lineage = append(lineage, dep)
+				if blockedKind == "" {
+					blockedKind = "parent_superseded"
+					blockedReason = fmt.Sprintf("the change this builds on (%s) was replaced by a retry that did not touch %s", dep.ID, old.Path)
+				}
+				continue
+			}
+			lineage = append(lineage, Dep{ID: next.ID, PatchHash: hashes[old.Path]})
+			rewritten = true
+			audits = append(audits, fmt.Sprintf("%s: %s (%s) -> %s (%s)", ch.ID, dep.ID, shortHash(dep.PatchHash), next.ID, shortHash(hashes[old.Path])))
+		}
+		if rewritten {
+			ch.Lineage = lineage
+			ch.Needs = ch.Needs[:0]
+			for _, dep := range lineage {
+				ch.Needs = append(ch.Needs, dep.ID)
+			}
+		}
+		switch {
+		case blockedKind != "":
+			ch.Integration = &Integration{State: "blocked", Kind: blockedKind, Reason: blockedReason, CheckedAt: now}
+		case rewritten && ch.Integration != nil && (ch.Integration.Kind == "parent_superseded" || ch.Integration.Kind == "parent_rejected"):
+			ch.Integration, ch.Conflict = nil, ""
+		}
+	}
 	snapshot := append([]Change(nil), c.sess.Changes...)
 	c.mu.Unlock()
 	if len(changes) > 0 || len(stale) > 0 {
 		c.emit("changes.updated", snapshot)
+	}
+	for _, audit := range audits {
+		c.chat("system", "Dependency rewritten after a retry: "+audit, "")
 	}
 	if ws := c.workspace(); ws != nil {
 		for _, id := range stale {
 			_ = ws.Release(id)
 		}
 	}
+}
+
+func shortHash(hash string) string {
+	if len(hash) > 12 {
+		return hash[:12]
+	}
+	return hash
 }
 
 // runVerify runs the project's checks in the agent's workspace. It reports whether the change is clear of blame: a

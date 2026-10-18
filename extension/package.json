@@ -187,8 +187,20 @@
         "title": "Accept Change"
       },
       {
+        "command": "relo.changes.acceptWithParents",
+        "title": "Relo: Accept Change with Parents"
+      },
+      {
         "command": "relo.changes.reject",
         "title": "Reject Change"
+      },
+      {
+        "command": "relo.changes.rejectWithDependents",
+        "title": "Relo: Reject Change and Dependents"
+      },
+      {
+        "command": "relo.changes.rebaseWithoutParent",
+        "title": "Relo: Rebase Change without Parent"
       },
       {
         "command": "relo.changes.diff",
@@ -293,7 +305,19 @@
           "when": "false"
         },
         {
+          "command": "relo.changes.acceptWithParents",
+          "when": "false"
+        },
+        {
           "command": "relo.changes.reject",
+          "when": "false"
+        },
+        {
+          "command": "relo.changes.rejectWithDependents",
+          "when": "false"
+        },
+        {
+          "command": "relo.changes.rebaseWithoutParent",
           "when": "false"
         },
         {
@@ -522,6 +546,18 @@
           "default": false,
           "scope": "window",
           "description": "Project every proposed change against the workspace after each accept or undo, so conflicts are visible without clicking Resolve conflicts. Off keeps the string-based behavior."
+        },
+        "relo.changes.dependentSemantics": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Refuse to accept a stacked change alone, accept it with its parents as a group, block dependents when a parent is rejected or superseded, and let auto-apply release a dependent only after its parents are accepted."
+        },
+        "relo.scheduler.pathLeases": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Have tasks declare the files they will edit and keep two tasks with overlapping paths from running at once. The later task waits for the earlier to finish, then starts with the earlier task's pending patches applied to those paths and records them as dependencies. Off ignores declared paths."
         },
         "relo.autoVerify": {
           "type": "boolean",

@@ -49,14 +49,14 @@ func TestEfficiencyAutoWorkerContainsFragmentsPrimaryNoCraft(t *testing.T) {
 	if !strings.Contains(r.tasks[0].System, "Answer first.") {
 		t.Fatalf("missing voice fragment")
 	}
-	if !strings.Contains(r.tasks[0].System, "Need it?") {
+	if !strings.Contains(r.tasks[0].System, "smallest change that works") {
 		t.Fatalf("missing craft fragment")
 	}
 
 	// Primary gets voice-or-nothing, never craft marker.
 	prefs := style.Prefs{Preset: "auto"}
 	resolved := style.Resolve(prefs, agent.Primary, "", 0, c.settings().Budget)
-	if strings.Contains(resolved.Profile.Fragment(agent.Primary), "Need it?") {
+	if strings.Contains(resolved.Profile.Fragment(agent.Primary), "smallest change that works") {
 		t.Fatalf("primary craft fragment leaked")
 	}
 }

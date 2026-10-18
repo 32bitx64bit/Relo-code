@@ -96,6 +96,51 @@ func TestSweepPrunesOldJournalAndChangeRefs(t *testing.T) {
 	}
 }
 
+func TestKeepChangeBlobsRetainsEachFile(t *testing.T) {
+	dir := initRepo(t)
+	m := New(dir)
+	if _, err := m.Snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	tree, err := m.EnsureTree("blob-agent", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, tree.Path, "one.txt", "first\n")
+	write(t, tree.Path, "nested/two.txt", "second\n")
+	if err := m.KeepChangeBlobs([]BlobRef{
+		{ChangeID: "chgA", Worktree: tree.Path, Path: "one.txt"},
+		{ChangeID: "chgB", Worktree: tree.Path, Path: "nested/two.txt"},
+		{ChangeID: "chgC", Worktree: tree.Path, Path: "missing.txt"},
+	}); err != nil {
+		t.Fatalf("keep blobs: %v", err)
+	}
+	out, err := gitRaw(m.root, "for-each-ref", "--format=%(refname)", changeRefPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := strings.Fields(out)
+	if len(refs) != 2 {
+		t.Fatalf("change refs = %v, want 2", refs)
+	}
+	got := map[string]string{}
+	for _, ref := range refs {
+		body, err := gitRaw(m.root, "cat-file", "-p", ref)
+		if err != nil {
+			t.Fatalf("cat-file %s: %v", ref, err)
+		}
+		if strings.HasSuffix(ref, "chgA") {
+			got["a"] = body
+		}
+		if strings.HasSuffix(ref, "chgB") {
+			got["b"] = body
+		}
+	}
+	if got["a"] != "first\n" || got["b"] != "second\n" {
+		t.Fatalf("retained blobs = %+v", got)
+	}
+}
+
 func TestPruneChangeRefsDropsRefsOlderThanRetention(t *testing.T) {
 	dir := initRepo(t)
 	m := New(dir)

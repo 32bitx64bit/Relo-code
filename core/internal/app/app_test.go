@@ -117,6 +117,23 @@ func TestApplySettingsIncludesRoutingAndEfficiency(t *testing.T) {
 	}
 }
 
+func TestApplySettingsPathLeases(t *testing.T) {
+	dir := t.TempDir()
+	core, err := New(Config{Workspace: dir, DBPath: filepath.Join(dir, "relo.db"), Runtime: "mock"}, logging.New(&bytes.Buffer{}, logging.Error))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	core.applySettings(map[string]any{"pathLeases": true})
+	if !core.Coord.Settings.PathLeases || !core.Coord.Sched.Limits.PathLeases {
+		t.Fatalf("path leases not enabled: settings=%v scheduler=%v", core.Coord.Settings.PathLeases, core.Coord.Sched.Limits.PathLeases)
+	}
+	core.applySettings(map[string]any{"pathLeases": false})
+	if core.Coord.Settings.PathLeases || core.Coord.Sched.Limits.PathLeases {
+		t.Fatalf("path leases not disabled: settings=%v scheduler=%v", core.Coord.Settings.PathLeases, core.Coord.Sched.Limits.PathLeases)
+	}
+}
+
 func TestCacheGetAndRestore(t *testing.T) {
 	dir := t.TempDir()
 	core, err := New(Config{Workspace: dir, DBPath: filepath.Join(dir, "relo.db"), Runtime: "mock"}, logging.New(&bytes.Buffer{}, logging.Error))

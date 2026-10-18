@@ -37,7 +37,7 @@ let coreLifecycle: Promise<void> = Promise.resolve();
 let postedRepository = "";
 
 // Settings that core consumes; a change to any of them re-applies to the running core.
-const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context", "relo.changes.autoApply", "relo.changes.lazyConflicts"];
+const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context", "relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics", "relo.scheduler.pathLeases"];
 
 export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   output = vscode.window.createOutputChannel("Relo");
@@ -215,7 +215,10 @@ function registerCommands(ctx: vscode.ExtensionContext): void {
     }
   });
   cmd("relo.changes.accept", (item?: unknown) => decideChange("accept", idOf(item)));
+  cmd("relo.changes.acceptWithParents", (item?: unknown) => acceptWithParents(idOf(item)));
   cmd("relo.changes.reject", (item?: unknown) => decideChange("reject", idOf(item)));
+  cmd("relo.changes.rejectWithDependents", (item?: unknown) => rejectWithDependents(idOf(item)));
+  cmd("relo.changes.rebaseWithoutParent", (item?: unknown) => rebaseWithoutParent(idOf(item)));
   cmd("relo.changes.resolveAgent", (item?: unknown) => resolveChange("agent", idOf(item)));
   cmd("relo.changes.resolveMine", (item?: unknown) => resolveChange("mine", idOf(item)));
   cmd("relo.changes.resolveHead", (item?: unknown) => resolveChange("head", idOf(item)));
@@ -708,6 +711,8 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
     workspace,
     autoApply: c.get<boolean>("changes.autoApply", false),
     lazyConflicts: c.get<boolean>("changes.lazyConflicts", false),
+    dependentSemantics: c.get<boolean>("changes.dependentSemantics", false),
+    pathLeases: c.get<boolean>("scheduler.pathLeases", false),
     routingMode: c.get<string>("routing.mode", "simple"),
     contextLimit: c.get<number>("models.contextLimit", 0),
     providers,
@@ -907,6 +912,52 @@ async function decideChange(kind: "accept" | "reject", id: string | undefined): 
   } catch (err) {
     // The core's message says which file and why (for example "a.ts: your edits and the agent's edits overlap").
     void vscode.window.showErrorMessage(`Relo: could not ${kind} the change. ${errorText(err)}`);
+  }
+}
+
+async function acceptWithParents(id: string | undefined): Promise<void> {
+  if (!id) return;
+  try {
+    const chg = state.changes.find((c) => c.id === id);
+    const parents = (chg?.needs ?? []).map((need) => state.changes.find((c) => c.id === need)).filter(Boolean);
+    const paths = [chg?.path, ...parents.map((p) => p?.path)].filter((p): p is string => !!p);
+    const choice = await gateDirty(paths, "accepting the change with its parents");
+    if (choice !== "Save") return;
+    await client.request("changes.accept", { id, withParents: true });
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Relo: could not accept the change with its parents. ${errorText(err)}`);
+  }
+}
+
+async function rebaseWithoutParent(id: string | undefined): Promise<void> {
+  if (!id) return;
+  const chg = state.changes.find((c) => c.id === id);
+  const ok = await vscode.window.showWarningMessage(
+    `Rebase ${chg?.path ?? "this change"} without the parent it was built on? The change was authored and verified with that parent present.`,
+    { modal: true },
+    "Rebase without parent",
+  );
+  if (ok !== "Rebase without parent") return;
+  try {
+    await client.request("changes.rebase", { id, apply: true });
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Relo: could not rebase the change. ${errorText(err)}`);
+  }
+}
+
+async function rejectWithDependents(id: string | undefined): Promise<void> {
+  if (!id) return;
+  const chg = state.changes.find((c) => c.id === id);
+  const ok = await vscode.window.showWarningMessage(
+    `Reject ${chg?.path ?? "this change"} and every change that builds on it? The agents' versions stay recoverable; your files are not touched.`,
+    { modal: true },
+    "Reject all",
+  );
+  if (ok !== "Reject all") return;
+  try {
+    await client.request("changes.reject", { id, withDependents: true });
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Relo: could not reject the changes. ${errorText(err)}`);
   }
 }
 

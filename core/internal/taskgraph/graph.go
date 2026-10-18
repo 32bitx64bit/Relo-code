@@ -31,6 +31,7 @@ type Task struct {
 	Status      Status    `json:"status"`
 	Priority    int       `json:"priority"`
 	Depends     []string  `json:"dependencies"`
+	Paths       []string  `json:"paths,omitempty"` // files this task will edit; used by advisory path leases
 	Children    []string  `json:"children"`
 	Workspace   string    `json:"workspace"`
 	Difficulty  string    `json:"difficulty"`

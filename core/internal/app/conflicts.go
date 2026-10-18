@@ -120,6 +120,80 @@ func isConflicted(ch orchestrator.Change) bool {
 	return ch.Conflict != ""
 }
 
+// resolveHeadChanges discards the conflicted or resolving changes the head listed in resolvedChanges. Each goes
+// through the reject path, so the workspace is untouched and the agent blob is retained. Ids that do not qualify are
+// refused with a visible system note.
+func (a *App) resolveHeadChanges(ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	a.decisionMu.Lock()
+	changes := a.Coord.Changes()
+	seen := map[string]bool{}
+	discarding := map[string]bool{}
+	var valid []orchestrator.Change
+	var refused []string
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		ch, ok := a.Coord.FindChange(id)
+		if !ok {
+			refused = append(refused, id+": change not found in this session")
+			continue
+		}
+		if ch.Status != "proposed" || (!isConflicted(ch) && !ch.Resolving) {
+			refused = append(refused, id+": only a conflicted or resolving change can be resolved")
+			continue
+		}
+		if ch.AgentID == "" || ch.Path == "" {
+			refused = append(refused, id+": change lacks an agent or path")
+			continue
+		}
+		valid = append(valid, ch)
+		discarding[id] = true
+	}
+	var decisions []rejectDecision
+	for _, ch := range valid {
+		newer := newerChangeOnPath(ch, changes, discarding)
+		decisions = append(decisions, rejectDecision{
+			changeID: ch.ID, agentID: ch.AgentID, worktree: ch.Worktree, path: ch.Path,
+			reason: "resolved by agent", supersededBy: newer,
+		})
+	}
+	if len(decisions) > 0 {
+		// One changes.updated event for the whole batch, and no wait on cleanupMu under decisionMu.
+		jobs := a.rejectDecisionsLocked(decisions)
+		a.decisionMu.Unlock()
+		a.cleanupMu.Lock()
+		a.runRejects(jobs)
+	} else {
+		a.decisionMu.Unlock()
+	}
+	if len(refused) > 0 {
+		a.Coord.Note("Resolved changes were ignored: " + strings.Join(refused, "; "))
+	}
+}
+
+// newerChangeOnPath returns the newest proposed, non-conflicted change for ch's path that comes after ch and is not
+// being discarded in the same turn.
+func newerChangeOnPath(ch orchestrator.Change, changes []orchestrator.Change, discarding map[string]bool) string {
+	seen := false
+	newer := ""
+	for _, c := range changes {
+		if c.ID == ch.ID {
+			seen = true
+			continue
+		}
+		if !seen || c.Path != ch.Path || c.Status != "proposed" || isConflicted(c) || c.SupersededBy != "" || discarding[c.ID] {
+			continue
+		}
+		newer = c.ID
+	}
+	return newer
+}
+
 // proposedPaths returns the workspace-relative paths that still wait for a decision.
 func (a *App) proposedPaths() []string {
 	seen := map[string]bool{}
@@ -159,7 +233,17 @@ func (a *App) projectChange(ch orchestrator.Change) orchestrator.IntegrationUpda
 	lock.Lock()
 	defer lock.Unlock()
 
-	if a.projectionFresh(ch) {
+	// A stacked dependent's base already holds its proposed parents' patches. Project it against those patches as
+	// in-memory bytes, exactly as planGroup does, so a parent that is only proposed is never read as an overlap.
+	// Any stored projection for a dependent may predate this overlay, so it is not reused.
+	dependent := a.dependent.Load() && len(needsOf(ch)) > 0
+	planned, parentReason := a.plannedParentSide(ch)
+	if parentReason != "" {
+		reason := "parent " + parentReason
+		integ := &orchestrator.Integration{State: "blocked", Kind: "needs_parent", Reason: reason, CheckedAt: time.Now().UnixMilli()}
+		return orchestrator.IntegrationUpdate{ID: ch.ID, Integration: integ, Conflict: reason}
+	}
+	if !dependent && a.projectionFresh(ch) {
 		since := a.sinceFor(ch, integration.Analysis{Ours: ch.Integration.Ours})
 		if !reflect.DeepEqual(since, ch.Integration.Since) {
 			updated := *ch.Integration
@@ -169,7 +253,7 @@ func (a *App) projectChange(ch orchestrator.Change) orchestrator.IntegrationUpda
 		return orchestrator.IntegrationUpdate{ID: ch.ID, Integration: ch.Integration, Conflict: ch.Conflict}
 	}
 	now := time.Now().UnixMilli()
-	analysis, err := a.analyzeChange(ch)
+	analysis, err := a.analyzeChangeAgainst(ch, planned)
 	if err != nil {
 		reason := err.Error()
 		state, kind := "unknown", "check_failed"
@@ -364,8 +448,100 @@ func (a *App) conflictReason(ch orchestrator.Change) (string, error) {
 	return analysis.Reason, nil
 }
 
+// plannedOurs is the workspace side an earlier member of a planned group would leave at a path. It lets the
+// group's later members be checked against the bytes the earlier members would write, without writing them.
+type plannedOurs struct {
+	data   []byte
+	exists bool
+}
+
 // analyzeChange projects the change against the workspace file as it is now, without writing.
 func (a *App) analyzeChange(ch orchestrator.Change) (integration.Analysis, error) {
+	return a.analyzeChangeAgainst(ch, nil)
+}
+
+// plannedParentSide returns the workspace bytes at ch's path after the patches of its proposed Lineage parents are
+// applied in memory. A parent that is already accepted is skipped because its bytes are the live workspace. When a
+// parent cannot be planned the returned reason says why, and the dependent must be marked needs_parent instead of
+// being checked against a workspace that does not hold that parent yet.
+func (a *App) plannedParentSide(ch orchestrator.Change) (*plannedOurs, string) {
+	if !a.dependent.Load() {
+		return nil, ""
+	}
+	if len(needsOf(ch)) == 0 {
+		return nil, ""
+	}
+	byID := map[string]orchestrator.Change{}
+	for _, c := range a.Coord.Changes() {
+		byID[c.ID] = c
+	}
+	var proposed []orchestrator.Change
+	seen := map[string]bool{}
+	var collect func(orchestrator.Change) string
+	collect = func(cur orchestrator.Change) string {
+		for _, need := range needsOf(cur) {
+			if seen[need] {
+				continue
+			}
+			seen[need] = true
+			parent, ok := byID[need]
+			if !ok {
+				return fmt.Sprintf("%s no longer exists", need)
+			}
+			if reason := collect(parent); reason != "" {
+				return reason
+			}
+			switch parent.Status {
+			case "accepted":
+				// Already written; its bytes are read from the live workspace below.
+			case "proposed":
+				if parent.Path == ch.Path {
+					proposed = append(proposed, parent)
+				}
+			default:
+				return fmt.Sprintf("%s is %s", need, parent.Status)
+			}
+		}
+		return ""
+	}
+	if reason := collect(ch); reason != "" {
+		return nil, reason
+	}
+	if len(proposed) == 0 {
+		return nil, ""
+	}
+	ordered, fails := orderGroup(proposed)
+	if len(fails) > 0 {
+		return nil, fails[0].Reason
+	}
+	planned := map[string]plannedOurs{}
+	for _, parent := range ordered {
+		var side *plannedOurs
+		if prior, ok := planned[parent.Path]; ok {
+			side = &prior
+		}
+		analysis, err := a.analyzeChangeAgainst(parent, side)
+		if err != nil {
+			return nil, fmt.Sprintf("%s: %v", parent.ID, err)
+		}
+		if analysis.Reason != "" {
+			return nil, fmt.Sprintf("%s: %s", parent.ID, analysis.Reason)
+		}
+		switch analysis.Action {
+		case "created", "updated", "merged":
+			planned[parent.Path] = plannedOurs{data: analysis.Merged, exists: true}
+		case "deleted":
+			planned[parent.Path] = plannedOurs{exists: false}
+		}
+	}
+	if side, ok := planned[ch.Path]; ok {
+		return &side, ""
+	}
+	return nil, ""
+}
+
+// analyzeChangeAgainst is analyzeChange with an optional in-memory workspace side for the change's path.
+func (a *App) analyzeChangeAgainst(ch orchestrator.Change, planned *plannedOurs) (integration.Analysis, error) {
 	// Do not recreate a released worktree: its proposed edits are no longer available.
 	if _, err := os.Stat(ch.Worktree); err != nil {
 		return integration.Analysis{}, fmt.Errorf("the agent's worktree is unavailable: %w", err)
@@ -381,7 +557,12 @@ func (a *App) analyzeChange(ch orchestrator.Change) (integration.Analysis, error
 	if err != nil {
 		return integration.Analysis{}, ipc.Fail{C: "integration_failed", M: fmt.Sprintf("%s: %v", ch.Path, err)}
 	}
-	analysis, err := integration.Analyze(a.Cfg.Workspace, ch.Worktree, ch.Path, base, hadBase)
+	var analysis integration.Analysis
+	if planned != nil {
+		analysis, err = integration.AnalyzeWithOurs(a.Cfg.Workspace, ch.Worktree, ch.Path, base, hadBase, planned.data, planned.exists)
+	} else {
+		analysis, err = integration.Analyze(a.Cfg.Workspace, ch.Worktree, ch.Path, base, hadBase)
+	}
 	if err != nil {
 		return integration.Analysis{}, ipc.Fail{C: "integration_failed", M: fmt.Sprintf("%s: %v", ch.Path, err)}
 	}
@@ -393,7 +574,9 @@ func (a *App) analyzeChange(ch orchestrator.Change) (integration.Analysis, error
 func (a *App) conflictPrompt(conflicted []orchestrator.Change) string {
 	var b strings.Builder
 	b.WriteString("Resolve conflicts. These proposed changes overlap with edits made in the workspace after the agent started, so none was applied. " +
-		"Re-apply each change's intent on the current tree, keep the user's edits, and delegate the work. The changes below will be replaced by the new ones.\n")
+		"Re-apply each change's intent on the current tree, keep the user's edits, and delegate the work. The changes below will be replaced by the new ones.\n" +
+		"After you have delegated the replacement work, list the id of each change below that you resolved in the turn's resolvedChanges array. " +
+		"Each listed change is discarded: its agent copy is kept for recovery and nothing in the workspace is written. Only the ids below qualify.\n")
 	for _, ch := range conflicted {
 		title := ch.Path
 		if t, ok := a.Coord.Graph.Get(ch.TaskID); ok && t.Title != "" {
@@ -566,7 +749,6 @@ func (a *App) clearResolvingLoaded() {
 // change is kept with SupersededBy set and its agent blob retained; it is not silently discarded.
 func (a *App) supersedeStale() {
 	a.decisionMu.Lock()
-	defer a.decisionMu.Unlock()
 
 	changes := a.Coord.Changes()
 	newest := map[string]orchestrator.Change{}
@@ -576,6 +758,7 @@ func (a *App) supersedeStale() {
 		}
 		newest[ch.Path] = ch
 	}
+	var decisions []rejectDecision
 	for _, old := range changes {
 		if old.Status != "proposed" || !isConflicted(old) {
 			continue
@@ -584,13 +767,22 @@ func (a *App) supersedeStale() {
 		if !ok || newer.ID == old.ID {
 			continue
 		}
-		if _, err := a.rejectChangeLocked(old.ID); err != nil {
-			a.Log.Warn("supersede conflicted change", map[string]any{"changeId": old.ID, "error": err.Error()})
+		if old.AgentID == "" || old.Path == "" {
+			a.Log.Warn("supersede conflicted change", map[string]any{"changeId": old.ID, "error": "change lacks an agent or path"})
 			continue
 		}
-		a.Coord.UpdateChange(old.ID, func(c *orchestrator.Change) {
-			c.Superseded, c.SupersededBy, c.Conflict, c.Resolving = true, newer.ID, "", false
+		decisions = append(decisions, rejectDecision{
+			changeID: old.ID, agentID: old.AgentID, worktree: old.Worktree, path: old.Path,
+			supersededBy: newer.ID, superseded: true,
 		})
+	}
+	if len(decisions) > 0 {
+		jobs := a.rejectDecisionsLocked(decisions)
+		a.decisionMu.Unlock()
+		a.cleanupMu.Lock()
+		a.runRejects(jobs)
+	} else {
+		a.decisionMu.Unlock()
 	}
 }
 

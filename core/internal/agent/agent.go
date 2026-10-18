@@ -93,7 +93,11 @@ type Report struct {
 	Risks    []string `json:"remainingRisks"`
 	Next     []string `json:"recommendedNextActions"`
 	Cause    string   `json:"rootCause,omitempty"`
-	Raw      string   `json:"raw,omitempty"`
+	// Handoff is what tasks that build on this one need, kept whole when the summary is clipped for the Primary.
+	Handoff string `json:"handoff,omitempty"`
+	// Question is the decision a blocked agent needs.
+	Question string `json:"question,omitempty"`
+	Raw      string `json:"raw,omitempty"`
 }
 
 type Verify struct {

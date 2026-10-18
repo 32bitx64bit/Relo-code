@@ -147,7 +147,7 @@ func (c *Coord) stepQueued(ctx context.Context) {
 	}
 	c.emit("context.compressed", map[string]any{"agentId": p.ID, "generation": gen.Number})
 	resolved := style.Resolve(settings.Efficiency, p.Role, p.Difficulty, p.Attempt, settings.Budget)
-	extra := c.workspaceFacts() + "\nThe user sent this while you were working. Fold it into the plan now, say briefly how you are handling it, and keep the sub agents going:\n" + text
+	extra := c.workspaceFacts() + c.constraintsNote() + "\nThe user sent this while you were working. Fold it into the plan now, say briefly how you are handling it, and keep the sub agents going:\n" + text
 	parts := prompt.ComposePartsWith(p.Role, *gen, extra, resolved.Profile.Fragment(p.Role))
 	turn, err := c.primaryTurn(ctx, p, parts, "Incorporate the user's guidance and return the structured turn.")
 	c.closeAgentSession(p.ID)

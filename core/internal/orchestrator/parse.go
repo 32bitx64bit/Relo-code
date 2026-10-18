@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/relocode/relo/internal/agent"
+	"github.com/relocode/relo/internal/prompt"
 	"github.com/relocode/relo/internal/routing"
 	"github.com/relocode/relo/internal/taskgraph"
 )
@@ -32,13 +34,18 @@ func ParseJSON[T any](s string) (T, error) {
 }
 
 type Turn struct {
-	Status      string     `json:"status"`
-	UserMessage string     `json:"userMessage"`
-	Objective   string     `json:"objective"`
-	Decisions   []string   `json:"decisions"`
+	Status      string   `json:"status"`
+	UserMessage string   `json:"userMessage"`
+	Objective   string   `json:"objective"`
+	Decisions   []string `json:"decisions"`
+	// Constraints are the rules the Primary read out of the request and context for every sub agent to follow. A
+	// non-empty list replaces the session's; an empty one leaves it as it was.
+	Constraints []string   `json:"constraints"`
 	Risks       []string   `json:"risks"`
 	RefreshSelf bool       `json:"refreshSelf"`
 	Tasks       []TurnTask `json:"tasks"`
+	// ResolvedChanges names conflicted changes the head has replaced. Core discards them through the reject path.
+	ResolvedChanges []string `json:"resolvedChanges"`
 }
 
 type TurnTask struct {
@@ -49,6 +56,7 @@ type TurnTask struct {
 	Acceptance  []string `json:"acceptance"`
 	Priority    int      `json:"priority"`
 	Deps        []string `json:"deps"`
+	Paths       []string `json:"paths"`
 	Scope       string   `json:"scope"`
 	Difficulty  string   `json:"difficulty"`
 }
@@ -62,6 +70,8 @@ type RawReport struct {
 	Risks           []string     `json:"remainingRisks"`
 	Next            []string     `json:"recommendedNextActions"`
 	Cause           string       `json:"rootCause"`
+	Handoff         string       `json:"handoff"`
+	Question        string       `json:"question"`
 	Structured      []RawFinding `json:"structuredFindings"`
 	ValidationError string       `json:"-"`
 }
@@ -92,6 +102,7 @@ func (r *RawReport) UnmarshalJSON(data []byte) error {
 	}
 	*r = RawReport{
 		Status: looseText(fields["status"]), Summary: looseText(fields["summary"]), Cause: looseText(fields["rootCause"]),
+		Handoff: looseText(fields["handoff"]), Question: looseText(fields["question"]),
 		Findings: looseList(fields["findings"]), Files: looseList(fields["filesChanged"]),
 		Risks: looseList(fields["remainingRisks"]), Next: looseList(fields["recommendedNextActions"]),
 	}
@@ -249,6 +260,26 @@ func ParseTurn(body string, known func(id string) bool) (Turn, error) {
 			task.Role = string(role)
 		}
 		task.Difficulty = routing.NormalizeDifficulty(task.Difficulty)
+		seenPaths := map[string]bool{}
+		declared := make([]string, 0, len(task.Paths))
+		for _, raw := range task.Paths {
+			p := strings.TrimSpace(strings.ReplaceAll(raw, "\\", "/"))
+			if p == "" {
+				problems = append(problems, prefix+` has an empty path`)
+				continue
+			}
+			p = path.Clean(p)
+			if p == "." || p == ".." || path.IsAbs(p) || strings.HasPrefix(p, "../") {
+				problems = append(problems, fmt.Sprintf("%s has path %q outside the workspace", prefix, raw))
+				continue
+			}
+			if seenPaths[p] {
+				continue
+			}
+			seenPaths[p] = true
+			declared = append(declared, p)
+		}
+		task.Paths = declared
 	}
 	graphTasks := make([]taskgraph.Task, 0, len(turn.Tasks))
 	for _, task := range turn.Tasks {
@@ -260,7 +291,30 @@ func ParseTurn(body string, known func(id string) bool) (Turn, error) {
 	if len(problems) > 0 {
 		return Turn{}, fmt.Errorf("invalid turn: %s", strings.Join(problems, "; "))
 	}
+	turn.Constraints = cleanConstraints(turn.Constraints)
 	return turn, nil
+}
+
+// cleanConstraints trims, drops repeats and keeps what the schema allows. A model that writes more is not worth a
+// repair round; what it wrote first is what it thought mattered most.
+func cleanConstraints(in []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, raw := range in {
+		line := strings.Join(strings.Fields(raw), " ")
+		if r := []rune(line); len(r) > prompt.PrimaryConstraintMaxLength {
+			line = string(r[:prompt.PrimaryConstraintMaxLength-1]) + "…"
+		}
+		key := strings.ToLower(line)
+		if line == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		if out = append(out, line); len(out) == prompt.PrimaryConstraintsMaxItems {
+			break
+		}
+	}
+	return out
 }
 
 func ParseReport(body string) (agent.Report, error) {
@@ -272,6 +326,9 @@ func ParseReport(body string) (agent.Report, error) {
 	// a finished report: failing either would cost a repair round for a formality.
 	if strings.TrimSpace(report.Summary) == "" && len(report.Findings) > 0 {
 		report.Summary = strings.Join(report.Findings, "; ")
+	}
+	if strings.TrimSpace(report.Summary) == "" && strings.TrimSpace(report.Question) != "" {
+		report.Summary = report.Question
 	}
 	if strings.TrimSpace(report.Summary) == "" {
 		return agent.Report{}, fmt.Errorf("invalid report: report field \"summary\" is required and must not be empty")
@@ -286,7 +343,7 @@ func ParseReport(body string) (agent.Report, error) {
 	}
 	return agent.Report{
 		Status: status, Summary: report.Summary, Findings: report.Findings, Files: report.Files, Verify: verify,
-		Risks: report.Risks, Next: report.Next, Cause: report.Cause, Raw: report.Summary,
+		Risks: report.Risks, Next: report.Next, Cause: report.Cause, Handoff: report.Handoff, Question: report.Question, Raw: report.Summary,
 	}, nil
 }
 

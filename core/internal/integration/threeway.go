@@ -68,6 +68,17 @@ var MergeShadow func(path string, defaultClean, histogramClean bool)
 // Analyze decides what accepting one file would do to the workspace, without touching it. It returns the conflict
 // kind and hunk locations as well as the reason, so a caller can store and display them.
 func Analyze(root, worktree, rel string, baseText []byte, hadBase bool) (Analysis, error) {
+	return analyze(root, worktree, rel, baseText, hadBase, false, nil, false)
+}
+
+// AnalyzeWithOurs is Analyze with the workspace side supplied by the caller instead of read from root. A group
+// accept uses it to check a later member against the bytes an earlier member of the same group would write, so a
+// dependent's stacked base is not mistaken for a conflict while its parent is still only planned.
+func AnalyzeWithOurs(root, worktree, rel string, baseText []byte, hadBase bool, ours []byte, hasOurs bool) (Analysis, error) {
+	return analyze(root, worktree, rel, baseText, hadBase, true, ours, hasOurs)
+}
+
+func analyze(root, worktree, rel string, baseText []byte, hadBase bool, overrideOurs bool, givenOurs []byte, givenHasOurs bool) (Analysis, error) {
 	AnalyzeCount.Add(1)
 	path, err := normalizePath(rel)
 	if err != nil {
@@ -85,10 +96,17 @@ func Analyze(root, worktree, rel string, baseText []byte, hadBase bool) (Analysi
 	}
 	oursPath := filepath.Join(root, filepath.FromSlash(path))
 	theirsPath := filepath.Join(worktree, filepath.FromSlash(path))
-	ours, oursErr := os.ReadFile(oursPath)
-	hasOurs := oursErr == nil
-	if oursErr != nil && !os.IsNotExist(oursErr) {
-		return out, oursErr
+	var ours []byte
+	var hasOurs bool
+	if overrideOurs {
+		ours, hasOurs = givenOurs, givenHasOurs
+	} else {
+		var oursErr error
+		ours, oursErr = os.ReadFile(oursPath)
+		hasOurs = oursErr == nil
+		if oursErr != nil && !os.IsNotExist(oursErr) {
+			return out, oursErr
+		}
 	}
 	theirs, theirsErr := os.ReadFile(theirsPath)
 	hasTheirs := theirsErr == nil

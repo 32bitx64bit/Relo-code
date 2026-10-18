@@ -70,9 +70,18 @@ type App struct {
 
 	// sessMu serialises writes of the session to the database with switching sessions, so one session's agents are
 	// never saved under another's id.
-	sessMu       sync.Mutex
-	decisionMu   sync.Mutex // serialises change decisions for the current session
+	sessMu     sync.Mutex
+	decisionMu sync.Mutex // serialises change decisions for the current session
+	cleanupMu  sync.Mutex // serialises worktree discard and release outside decisionMu
+	// cleanupHoldMu guards cleanupHolds. A rejected agent is held here from the decision until its blob is
+	// retained, so a concurrent accept cannot release the worktree in between.
+	cleanupHoldMu sync.Mutex
+	cleanupHolds  map[string]int
+	// keepBlobs and keepBlob are test seams for injected retention failures; nil uses the workspace manager.
+	keepBlobs    func([]workspace.BlobRef) error
+	keepBlob     func(changeID, worktree, rel string) error
 	lazy         atomic.Bool
+	dependent    atomic.Bool // P4: dependent/stacked accept and reject semantics
 	projMu       sync.Mutex
 	projLocks    map[string]*sync.Mutex // workspace-relative path -> projection lock
 	projMemo     map[string]projectionMemo
@@ -167,10 +176,11 @@ func New(cfg Config, log *logging.Logger) (*App, error) {
 		return nil, err
 	}
 	a := &App{Cfg: cfg, Log: log, Store: store, Coord: orchestrator.New(log)}
+	a.Coord.ResolveChanges = a.resolveHeadChanges
 	ws := workspace.New(cfg.Workspace)
 	a.Coord.SetWorkspaceManager(ws)
 	a.Coord.Verify = verification.Runner{Root: cfg.Workspace}
-	a.Coord.Configure(a.Coord.Settings, scheduler.New(scheduler.Limits{}), a.Coord.Route)
+	a.Coord.Configure(a.Coord.Settings, scheduler.New(scheduler.Limits{PathLeases: a.Coord.Settings.PathLeases}), a.Coord.Route)
 	if _, err := ws.Snapshot(); err != nil {
 		log.Warn("workspace snapshot", map[string]any{"error": err.Error(), "workspace": cfg.Workspace})
 	}
@@ -356,8 +366,14 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 		}
 		return []any{}, nil
 	case "changes.accept":
+		if withParents, _ := p["withParents"].(bool); withParents {
+			return a.acceptWithParents(str(p, "id", ""))
+		}
 		return a.acceptChangeExpect(str(p, "id", ""), str(p, "expect", ""))
 	case "changes.reject":
+		if withDependents, _ := p["withDependents"].(bool); withDependents {
+			return a.rejectWithDependents(str(p, "id", ""))
+		}
 		return a.rejectChange(str(p, "id", ""))
 	case "changes.acceptAll":
 		return a.decideAll(true)
@@ -367,6 +383,9 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 		return a.undoChange(str(p, "id", ""))
 	case "changes.diff":
 		return a.changeDiff(str(p, "id", ""))
+	case "changes.rebase":
+		apply, _ := p["apply"].(bool)
+		return a.rebaseChange(str(p, "id", ""), apply)
 	case "workspace.dirty":
 		var paths []string
 		if raw, ok := p["paths"].([]any); ok {
@@ -484,7 +503,7 @@ func (a *App) initialize(ctx context.Context, p map[string]any) (any, error) {
 	}
 	a.refreshModels(ctx)
 	settings := a.Coord.SettingsSnapshot()
-	a.Coord.Configure(settings, scheduler.New(scheduler.Limits{MaxTotal: settings.MaxTotal, MaxTier1: settings.MaxTier1, MaxTier2: settings.MaxTier2, MaxDepth: settings.MaxDepth, MaxRetry: settings.MaxRetries}), settings.RouteConfig())
+	a.Coord.Configure(settings, scheduler.New(scheduler.Limits{MaxTotal: settings.MaxTotal, MaxTier1: settings.MaxTier1, MaxTier2: settings.MaxTier2, MaxDepth: settings.MaxDepth, MaxRetry: settings.MaxRetries, PathLeases: settings.PathLeases}), settings.RouteConfig())
 	return map[string]any{
 		"session":  a.Coord.Current(),
 		"backend":  st,
@@ -502,7 +521,13 @@ func (a *App) applySettings(p map[string]any) {
 	if enabled, ok := p["lazyConflicts"].(bool); ok {
 		a.lazy.Store(enabled)
 	}
+	if enabled, ok := p["dependentSemantics"].(bool); ok {
+		a.dependent.Store(enabled)
+	}
 	s := a.Coord.SettingsSnapshot()
+	if enabled, ok := p["pathLeases"].(bool); ok {
+		s.PathLeases = enabled
+	}
 	if v := str(p, "primaryModel", ""); v != "" {
 		s.PrimaryModel = v
 	}
@@ -621,7 +646,7 @@ func (a *App) applySettings(p map[string]any) {
 	if level := str(p, "logLevel", ""); level != "" && a.Log != nil {
 		a.Log.SetLevel(logging.ParseLevel(level))
 	}
-	a.Coord.Configure(s, scheduler.New(scheduler.Limits{MaxTotal: s.MaxTotal, MaxTier1: s.MaxTier1, MaxTier2: s.MaxTier2, MaxDepth: s.MaxDepth, MaxRetry: s.MaxRetries}), s.RouteConfig())
+	a.Coord.Configure(s, scheduler.New(scheduler.Limits{MaxTotal: s.MaxTotal, MaxTier1: s.MaxTier1, MaxTier2: s.MaxTier2, MaxDepth: s.MaxDepth, MaxRetry: s.MaxRetries, PathLeases: s.PathLeases}), s.RouteConfig())
 	a.Coord.UpdateSettings(func(ss *orchestrator.Settings) { ss.Efficiency = s.Efficiency })
 	if a.Cfg.Runtime == "" {
 		a.Cfg.Runtime = str(p, "runtime", "opencode")

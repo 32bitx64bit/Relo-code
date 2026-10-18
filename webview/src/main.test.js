@@ -608,6 +608,36 @@ test("changes drawer: letter follows kind, decided changes are dimmed and locked
   assert.ok(!one.includes("acceptAll"), "a single change needs no bulk buttons");
 });
 
+function manyChanges(n, extra = {}) {
+  return Array.from({ length: n }, (_, i) => ({ id: "c" + i, path: "f" + i + ".ts", status: "accepted", kind: "modified", createdAt: new Date(1000 + i * 1000).toISOString(), ...(extra[i] || {}) }));
+}
+
+test("lists cap at 20 newest with Show more, and proposed or conflicted changes stay visible", () => {
+  const changes = manyChanges(25, { 2: { status: "proposed" }, 3: { status: "proposed", integration: { state: "conflicted", kind: "overlap" } } });
+  const html = mainApi.drawerHtml("changes", { changes });
+  assert.ok(html.includes('data-id="c24"') && html.includes('data-id="c5"'));
+  assert.ok(!html.includes('data-id="c4"'), "older accepted change is hidden");
+  assert.ok(html.includes('data-id="c2"') && html.includes('data-id="c3"'), "action items stay visible past the cap");
+  assert.ok(html.includes("Show more (3)"));
+  assert.ok(html.includes("Accept all (2)"), "accept count uses the full list");
+  mainApi.setListExpanded("changes", true);
+  const full = mainApi.drawerHtml("changes", { changes });
+  assert.ok(full.includes('data-id="c0"') && full.includes("Show less"));
+  mainApi.setListExpanded("changes", false);
+});
+
+test("agents and tasks cap at 20 newest and keep live work visible", () => {
+  const agents = manyChanges(22).map((c, i) => ({ id: "a" + i, title: "A" + i, role: "worker", status: i === 0 ? "running" : "completed", createdAt: c.createdAt }));
+  const agentsHtml = mainApi.drawerHtml("agents", { agents });
+  assert.ok(agentsHtml.includes("relo.agent.stop"), "running agent keeps its stop button past the cap");
+  assert.ok(agentsHtml.includes("Show more (1)"));
+  assert.ok(!agentsHtml.includes("A1 <span"), "oldest completed agent is hidden");
+  const tasks = manyChanges(22).map((c, i) => ({ id: "t" + i, title: "T" + i, status: i === 0 ? "running" : "completed", createdAt: c.createdAt }));
+  const tasksHtml = mainApi.drawerHtml("tasks", { tasks });
+  assert.ok(tasksHtml.includes("T0") && tasksHtml.includes("Show more (1)"));
+  assert.ok(!tasksHtml.includes("T1<"), "oldest completed task is hidden");
+});
+
 test("changes drawer says what the changes are measured against, only while something waits", () => {
   const waiting = mainApi.drawerHtml("changes", { changes: [{ id: "c1", path: "a.ts", status: "proposed", kind: "modified" }] });
   assert.ok(waiting.includes("Compared with your files when the agent started") && waiting.includes("until you accept it"));
@@ -687,6 +717,26 @@ test("changes drawer: integration state, kind, hunks, cause and resolve actions"
   assert.ok(!clean.includes('class="badge" title="overlap"'));
   const superseded = mainApi.drawerHtml("changes", { changes: [{ id: "c3", path: "c.ts", status: "proposed", supersededBy: "c4" }] });
   assert.ok(!superseded.includes("c.ts"), "supersededBy hides the old proposal");
+});
+
+test("changes drawer: blocked dependent offers accept with parents and rebase without parent", () => {
+  const html = mainApi.drawerHtml("changes", {
+    changes: [
+      { id: "parent", path: "a.ts", status: "proposed", kind: "modified" },
+      {
+        id: "child", path: "b.ts", status: "proposed", kind: "modified", needs: ["parent"],
+        integration: { state: "blocked", kind: "parent_rejected", reason: "the change this builds on was rejected" },
+      },
+    ],
+  });
+  assert.ok(html.includes('class="badge" title="parent_rejected"'));
+  assert.ok(html.includes("the change this builds on was rejected"));
+  assert.ok(html.includes("relo.changes.acceptWithParents"));
+  assert.ok(html.includes("relo.changes.rebaseWithoutParent"));
+  assert.ok(html.includes("relo.changes.rejectWithDependents"));
+  const clean = mainApi.drawerHtml("changes", { changes: [{ id: "solo", path: "c.ts", status: "proposed", kind: "modified" }] });
+  assert.ok(!clean.includes("relo.changes.acceptWithParents"));
+  assert.ok(!clean.includes("relo.changes.rebaseWithoutParent"));
 });
 
 test("chips count only changes still waiting for a decision", () => {

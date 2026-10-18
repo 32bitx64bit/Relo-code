@@ -43,10 +43,48 @@ func TestParseTurn(t *testing.T) {
 	}
 }
 
+// paths are normalized and deduplicated, and a path outside the workspace is refused.
+func TestParseTurnPaths(t *testing.T) {
+	body := `{"status":"working","userMessage":"x","tasks":[{"id":"a","title":"A","role":"worker","paths":["./core/a.go","core/a.go","core/./b.go"]}]}`
+	turn, err := ParseTurn(body, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := turn.Tasks[0].Paths
+	if len(got) != 2 || got[0] != "core/a.go" || got[1] != "core/b.go" {
+		t.Fatalf("paths = %v", got)
+	}
+	for _, bad := range []string{`"/etc/passwd"`, `"../outside"`, `""`} {
+		body := `{"status":"working","userMessage":"x","tasks":[{"id":"a","title":"A","role":"worker","paths":[` + bad + `]}]}`
+		if _, err := ParseTurn(body, nil); err == nil {
+			t.Fatalf("path %s was accepted", bad)
+		}
+	}
+}
+
 func TestParseTurnKnownDependency(t *testing.T) {
 	body := `{"status":"working","userMessage":"Continue","tasks":[{"id":"b","title":"Build","role":"worker","deps":["existing"]}]}`
 	if _, err := ParseTurn(body, func(id string) bool { return id == "existing" }); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// resolvedChanges is optional: a turn without it still parses, and one with it carries the ids to the app.
+func TestParseTurnResolvedChanges(t *testing.T) {
+	body := `{"status":"working","userMessage":"Resolved","tasks":[],"resolvedChanges":["chg_a","chg_b"]}`
+	turn, err := ParseTurn(body, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turn.ResolvedChanges) != 2 || turn.ResolvedChanges[0] != "chg_a" || turn.ResolvedChanges[1] != "chg_b" {
+		t.Fatalf("resolvedChanges = %#v", turn.ResolvedChanges)
+	}
+	plain, err := ParseTurn(`{"status":"working","userMessage":"Plan","tasks":[]}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain.ResolvedChanges != nil {
+		t.Fatalf("omitted resolvedChanges = %#v, want nil", plain.ResolvedChanges)
 	}
 }
 

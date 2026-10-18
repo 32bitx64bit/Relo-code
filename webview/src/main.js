@@ -368,6 +368,7 @@
   let openPicker = null; // { id, query, active } for the one open model picker
   let rendering = false;
   let settingsScroll = 0;
+  let expandedLists = {};
   // Provider form draft. The API key lives only in providerKeyDraft: never persisted, never rendered into an attribute.
   let providerForm = null;
   let providerKeyDraft = "";
@@ -427,7 +428,8 @@
   function drawerRowsAgents(s) {
     const agents = s.agents || [];
     if (!agents.length) return `<div class="drawer-row mini">No agents</div>`;
-    return agents.map((a) => {
+    const capped = cappedList("agents", agents, (a) => LIVE_STATUSES.includes(a.status));
+    return capped.shown.map((a) => {
       const model = a.escalatedFrom ? `${a.escalatedFrom} → ${a.model}` : (a.model || "");
       const name = esc(a.title || a.role || a.id);
       const stopable = a.status === "running" || a.status === "starting" || a.status === "queued";
@@ -442,13 +444,14 @@
           ${rowBtn("command", "relo.agent.openWorktree", a.id, "folder-opened", "Open worktree")}
         </span>
       </div>`;
-    }).join("");
+    }).join("") + capped.toggle;
   }
 
   function drawerRowsTasks(s) {
     const tasks = s.tasks || [];
     if (!tasks.length) return `<div class="drawer-row mini">No tasks</div>`;
-    return tasks.map((t) => {
+    const capped = cappedList("tasks", tasks, (t) => ["queued", "blocked", "running"].includes(t.status));
+    return capped.shown.map((t) => {
       const deps = (t.dependencies || []).length;
       const diff = t.difficulty ? `<span class="badge" title="Difficulty">${esc(t.difficulty)}</span>` : "";
       return `<div class="drawer-row" role="treeitem" aria-level="1">
@@ -457,7 +460,7 @@
         ${diff}
         ${deps ? `<span class="mini" title="Dependencies">${deps} dep${deps === 1 ? "" : "s"}</span>` : ""}
       </div>`;
-    }).join("");
+    }).join("") + capped.toggle;
   }
 
   function drawerRowsContext(s) {
@@ -486,6 +489,23 @@
     return st === "accepted" || st === "rejected";
   }
 
+  function isWaiting(c) {
+    return !isDecided(c) && String(c.status || "").toLowerCase() !== "applied";
+  }
+
+  // Newest 20 by added time, plus every item that needs action. Ties keep later array entries first.
+  const LIST_CAP = 20;
+  function cappedList(name, items, needsAction) {
+    const ordered = items.map((x, i) => ({ x, i })).sort((a, b) => toMs(b.x.createdAt) - toMs(a.x.createdAt) || b.i - a.i).map((e) => e.x);
+    const open = !!expandedLists[name];
+    const shown = open ? ordered : ordered.filter((x, i) => i < LIST_CAP || needsAction(x));
+    const hidden = ordered.length - shown.length;
+    const toggle = ordered.length > LIST_CAP
+      ? `<div class="drawer-row mini"><button type="button" class="link-btn" data-list-toggle="${name}" aria-expanded="${open ? "true" : "false"}">${open ? "Show less" : `Show more (${hidden})`}</button></div>`
+      : "";
+    return { shown, toggle };
+  }
+
   function drawerRowsChanges(s) {
     const autoApply = !!valueOf("relo.changes.autoApply");
     const repo = settingsCache && settingsCache.repository;
@@ -496,7 +516,8 @@
     if (!changes.length) return controls + `<div class="drawer-row mini">No changes</div>`;
     const resolving = changes.filter((c) => c.resolving && !isDecided(c)).length;
     const banner = resolving ? `<div class="drawer-row mini" role="status">Resolving ${resolving} conflict${resolving === 1 ? "" : "s"} via head agent</div>` : "";
-    const rows = changes.map((c) => {
+    const capped = cappedList("changes", changes, (c) => isWaiting(c) || (c.integration && c.integration.state === "conflicted") || !!c.conflict);
+    const rows = capped.shown.map((c) => {
       const status = String(c.status || "").toLowerCase();
       const applied = status === "applied";
       const decided = isDecided(c);
@@ -509,6 +530,7 @@
       const state = decided ? `<span class="mini">${esc(status)}</span>` : "";
       const integ = c.integration || null;
       const conflicted = integ ? integ.state === "conflicted" : !!c.conflict;
+      const blockedState = !!(integ && integ.state === "blocked");
       const kind = (integ && integ.kind) || c.conflict || "";
       const reason = (integ && integ.reason) || c.conflict || "";
       const hunks = integ && Array.isArray(integ.hunks) ? integ.hunks.filter((h) => h && h.conflicting).length : 0;
@@ -516,8 +538,19 @@
       const cause = since.length ? `Since ${since.join(", ")}` : "";
       const hunkNote = hunks ? `${hunks} conflicting hunk${hunks === 1 ? "" : "s"}` : "";
       const detail = [reason, cause, hunkNote].filter(Boolean).join(" · ");
-      const conflictBadge = conflicted && !decided
-        ? `<span class="badge" title="${attr(kind || "conflict")}">${esc(kind || "conflict")}</span>${detail ? `<div class="mini" role="note">${esc(detail)}</div>` : ""}`
+      const conflictBadge = (conflicted || blockedState) && !decided
+        ? `<span class="badge" title="${attr(kind || "conflict")}">${esc(kind || (blockedState ? "blocked" : "conflict"))}</span>${detail ? `<div class="mini" role="note">${esc(detail)}</div>` : ""}`
+        : "";
+      const needs = Array.isArray(c.needs) ? c.needs : [];
+      const unmet = needs.filter((id) => {
+        const parent = changes.find((x) => x && x.id === id);
+        return !parent || String(parent.status || "").toLowerCase() !== "accepted";
+      });
+      const parentActions = !decided && status === "proposed" && unmet.length
+        ? rowBtn("command", "relo.changes.acceptWithParents", c.id, "git-merge", "Accept with parents")
+        : "";
+      const blockedActions = !decided && blockedState && (kind === "parent_rejected" || kind === "parent_superseded")
+        ? `${rowBtn("command", "relo.changes.rebaseWithoutParent", c.id, "git-branch", "Rebase without parent")}${rowBtn("command", "relo.changes.rejectWithDependents", c.id, "close-all", "Reject with dependents")}`
         : "";
       const resolveActions = conflicted && !decided
         ? `${rowBtn("command", "relo.changes.resolveAgent", c.id, "arrow-right", "Take the agent's version")}${rowBtn("command", "relo.changes.resolveMine", c.id, "discard", "Keep mine")}${rowBtn("command", "relo.changes.resolveHead", c.id, "comment-discussion", "Send to head agent")}`
@@ -529,11 +562,13 @@
         <span class="actions shown">
           ${rowBtn("command", "relo.changes.accept", c.id, "check", "Accept change", off)}
           ${rowBtn("command", "relo.changes.reject", c.id, "close", "Reject change", off)}
+          ${parentActions}
+          ${blockedActions}
           ${resolveActions}
         </span>
       </div>`;
-    }).join("");
-    const pending = changes.filter((c) => !isDecided(c) && String(c.status || "").toLowerCase() !== "applied").length;
+    }).join("") + capped.toggle;
+    const pending = changes.filter(isWaiting).length;
     const note = pending ? `<div class="drawer-row mini">Compared with your files when the agent started. Nothing here is in your files until you accept it.</div>` : "";
     const bulk = pending > 1 ? `<button type="button" class="secondary" data-cmd="relo.changes.acceptAll">Accept all (${pending})</button>
       <button type="button" class="secondary" data-cmd="relo.changes.rejectAll">Reject all</button>` : "";
@@ -738,7 +773,7 @@
     { id: "efficiency", title: "Token saving", keys: ["relo.efficiency.preset", "relo.efficiency.voice", "relo.efficiency.craft", "relo.efficiency.planLean", "relo.efficiency.roles"] },
     { id: "agents", title: "Agents", keys: ["relo.maxConcurrentAgents", "relo.maxTier1Agents", "relo.maxTier2Agents", "relo.maxHierarchyDepth", "relo.maxRetries"] },
     { id: "context", title: "Context", keys: ["relo.context.compactAt", "relo.context.autoRefresh", "relo.context.refreshThreshold", "relo.context.maxUtilization", "relo.context.compressionStrategy", "relo.context.keepRawHistory", "relo.context.projectMemory"] },
-    { id: "changes", title: "Changes", keys: ["relo.changes.autoApply"] },
+    { id: "changes", title: "Changes", keys: ["relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics"] },
     { id: "verification", title: "Verification", keys: ["relo.autoVerify", "relo.autoReview", "relo.report.maxChars"] },
     { id: "permissions", title: "Permissions", keys: ["relo.permissions.read", "relo.permissions.write", "relo.permissions.test", "relo.permissions.build", "relo.permissions.install", "relo.permissions.delete", "relo.permissions.gitCommit", "relo.permissions.gitPush", "relo.permissions.network", "relo.permissions.outside", "relo.permissions.destructive"] },
     { id: "advanced", title: "Advanced", keys: ["relo.runtime", "relo.openCode.path", "relo.logLevel"] },
@@ -1431,6 +1466,7 @@
       efficiencyHtml: (eff) => efficiencyHtml(eff),
       stripHtml: (s) => withState(s, () => strip(s)),
       drawerHtml: (name, s, cache) => withSettings(cache, "", () => withState(s, () => drawerBody(name, s))),
+      setListExpanded: (name, open) => { expandedLists = { ...expandedLists, [name]: open }; },
       toolbarHtml: (s) => withState(s, () => toolbar(s)),
       chipCounts: (s) => chipCounts(s || {}),
       contextPct: (s) => contextPct(s || {}),
@@ -1477,6 +1513,7 @@
   page = ["settings", "history"].includes(saved.page) ? saved.page : "chat";
   settingsQuery = saved.settingsQuery || "";
   settingsScroll = saved.settingsScroll || 0;
+  expandedLists = saved.expandedLists && typeof saved.expandedLists === "object" ? saved.expandedLists : {};
   composerDraft = typeof saved.draft === "string" ? saved.draft : "";
   const post = (message) => vscode.postMessage(message);
 
@@ -1484,7 +1521,7 @@
   let persistTimer = 0;
   function writeState() {
     const sp = document.getElementById("settings-page");
-    vscode.setState({ state, drawer: openDrawerName, page, settingsQuery, settingsScroll: sp ? sp.scrollTop : settingsScroll, draft: composerDraft });
+    vscode.setState({ state, drawer: openDrawerName, page, settingsQuery, settingsScroll: sp ? sp.scrollTop : settingsScroll, expandedLists, draft: composerDraft });
   }
   function persist() {
     if (persistTimer) return;
@@ -1725,6 +1762,13 @@
     if (at("#more")) { setMenu(!menuOpen, true); return; }
     if ((el = at("[data-cmd]"))) { post({ type: "command", command: el.getAttribute("data-cmd") }); return; }
     if ((el = at("[data-command]"))) { post({ type: "command", command: el.getAttribute("data-command"), id: el.getAttribute("data-id") }); return; }
+    if ((el = at("[data-list-toggle]"))) {
+      const name = el.getAttribute("data-list-toggle");
+      expandedLists = { ...expandedLists, [name]: !expandedLists[name] };
+      persist();
+      render();
+      return;
+    }
     if ((el = at("[data-toggle-check]"))) {
       const i = el.getAttribute("data-toggle-check");
       checkOpen[i] = !checkOpen[i];

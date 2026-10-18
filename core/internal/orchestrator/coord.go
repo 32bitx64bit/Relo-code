@@ -72,6 +72,8 @@ type Change struct {
 	Landed string `json:"landed,omitempty"`
 	// Integration is the result of the last projection of this change against the workspace.
 	Integration *Integration `json:"integration,omitempty"`
+	// Reason is why a change was discarded, such as "resolved by agent". Empty for other decisions.
+	Reason string `json:"reason,omitempty"`
 }
 
 // Dep is a dependency applied when a change's base was stacked.
@@ -147,6 +149,7 @@ type Settings struct {
 	MaxTier2       int               `json:"maxTier2Agents"`
 	MaxDepth       int               `json:"maxHierarchyDepth"`
 	MaxRetries     int               `json:"maxRetries"`
+	PathLeases     bool              `json:"pathLeases"`
 	MaxUtil        float64           `json:"maxUtilization"`
 	CompactAt      float64           `json:"compactAt"`
 	AutoRefresh    bool              `json:"autoRefresh"`
@@ -182,19 +185,21 @@ func DefaultSettings() Settings {
 }
 
 type Session struct {
-	ID        string                `json:"id"`
-	Workspace string                `json:"workspace"`
-	Objective string                `json:"objective"`
-	Mode      Mode                  `json:"mode"`
-	Status    string                `json:"status"`
-	Created   time.Time             `json:"createdAt"`
-	Updated   time.Time             `json:"updatedAt"`
-	Messages  []Chat                `json:"messages,omitempty"`
-	Changes   []Change              `json:"changes,omitempty"`
-	Verify    []verification.Result `json:"verification,omitempty"`
-	Usage     map[string]any        `json:"usage,omitempty"`
-	Paused    bool                  `json:"paused"`
-	Running   bool                  `json:"running"` // a Submit is in flight; the UI's single source for "busy"
+	ID        string `json:"id"`
+	Workspace string `json:"workspace"`
+	Objective string `json:"objective"`
+	// Constraints are the Primary's reading of what the request and context require of every sub agent.
+	Constraints []string              `json:"constraints,omitempty"`
+	Mode        Mode                  `json:"mode"`
+	Status      string                `json:"status"`
+	Created     time.Time             `json:"createdAt"`
+	Updated     time.Time             `json:"updatedAt"`
+	Messages    []Chat                `json:"messages,omitempty"`
+	Changes     []Change              `json:"changes,omitempty"`
+	Verify      []verification.Result `json:"verification,omitempty"`
+	Usage       map[string]any        `json:"usage,omitempty"`
+	Paused      bool                  `json:"paused"`
+	Running     bool                  `json:"running"` // a Submit is in flight; the UI's single source for "busy"
 }
 
 type PendingPerm struct {
@@ -221,6 +226,9 @@ type Coord struct {
 	Cache    *metrics.CacheStats
 	Settings Settings
 	Emit     func(string, any)
+	// ResolveChanges is installed by the app to discard changes the head marked resolved. It is nil in tests that
+	// do not need the app's reject path.
+	ResolveChanges func([]string)
 
 	mu              sync.Mutex
 	configMu        sync.RWMutex
@@ -228,9 +236,10 @@ type Coord struct {
 	emitFn          func(string, any)
 	cacheMu         sync.RWMutex
 	sess            *Session
-	lineage         map[string][]Dep        // agent ID -> dependencies applied to its base at stack time; guarded by mu
-	inbox           map[string][]queuedNote // session ID -> user messages waiting for the head's next step; guarded by mu
-	wake            chan struct{}           // buffered nudge: the inbox has something for a head waiting on its sub agents
+	lineage         map[string][]Dep          // agent ID -> dependencies applied to its base at stack time; guarded by mu
+	lineageProblems map[string]lineageProblem // agent ID -> a recorded base that could not be re-stacked; guarded by mu
+	inbox           map[string][]queuedNote   // session ID -> user messages waiting for the head's next step; guarded by mu
+	wake            chan struct{}             // buffered nudge: the inbox has something for a head waiting on its sub agents
 	sessionCtx      context.Context
 	runCancel       context.CancelFunc
 	runID           uint64
@@ -240,11 +249,12 @@ type Coord struct {
 	runtimeMu       sync.Mutex
 	runtimeSessions map[string]*runtimeSession
 	escalations     map[string]string
-	directSem       chan struct{}   // guarded by mu; one mutating agent at a time in direct mode
-	directNotified  string          // session ID that already received the direct-mode notice; guarded by mu
-	snapshotNoticed map[string]bool // session ID -> the snapshot notice was already shown; guarded by mu
-	baseline        map[string]bool // "baseline dir\x00command" -> command already fails without the agent's change; guarded by mu
-	tasksPlanned    int             // tasks Primary has added this session; guarded by mu
+	failures        map[string]string // task ID -> why its last attempt failed, for the attempt that replaces it; guarded by mu
+	directSem       chan struct{}     // guarded by mu; one mutating agent at a time in direct mode
+	directNotified  string            // session ID that already received the direct-mode notice; guarded by mu
+	snapshotNoticed map[string]bool   // session ID -> the snapshot notice was already shown; guarded by mu
+	baseline        map[string]bool   // "baseline dir\x00command" -> command already fails without the agent's change; guarded by mu
+	tasksPlanned    int               // tasks Primary has added this session; guarded by mu
 }
 
 func New(log *logging.Logger) *Coord {
@@ -263,6 +273,8 @@ func New(log *logging.Logger) *Coord {
 		wake:            make(chan struct{}, 1),
 		runtimeSessions: map[string]*runtimeSession{},
 		escalations:     map[string]string{},
+		failures:        map[string]string{},
+		lineageProblems: map[string]lineageProblem{},
 		Emit:            func(string, any) {},
 	}
 	c.Agents = c.newRegistry()

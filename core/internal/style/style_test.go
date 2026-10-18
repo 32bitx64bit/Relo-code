@@ -42,9 +42,9 @@ func TestRoleMatrix(t *testing.T) {
 		{agent.Primary, LevelOff, LevelOff, 24000, false, true},
 		{agent.Head, LevelLite, LevelOff, 12000, false, true},
 		{agent.Probe, LevelUltra, LevelOff, 6000, true, false},
-		{agent.Worker, LevelFull, LevelFull, 16000, false, false},
-		{agent.Debug, LevelFull, LevelFull, 16000, false, false},
-		{agent.Integration, LevelFull, LevelFull, 16000, false, false},
+		{agent.Worker, LevelFull, LevelLite, 16000, false, false},
+		{agent.Debug, LevelFull, LevelLite, 16000, false, false},
+		{agent.Integration, LevelFull, LevelLite, 16000, false, false},
 		{agent.Architect, LevelFull, LevelLite, 16000, false, true},
 		{agent.Test, LevelUltra, LevelOff, 8000, false, true},
 		{agent.Reviewer, LevelFull, LevelOff, 12000, false, false},
@@ -86,13 +86,13 @@ func TestModifiers(t *testing.T) {
 		craft      Level
 		budget     int
 	}{
-		{"trivial boosts and halves", agent.Worker, routing.Trivial, 1, LevelUltra, LevelFull, 8000},
-		{"easy boosts and halves", agent.Worker, routing.Easy, 1, LevelUltra, LevelFull, 8000},
+		{"trivial boosts and halves", agent.Worker, routing.Trivial, 1, LevelUltra, LevelLite, 8000},
+		{"easy boosts and halves", agent.Worker, routing.Easy, 1, LevelUltra, LevelLite, 8000},
 		{"expert caps", agent.Worker, routing.Expert, 1, LevelLite, LevelLite, 16000},
-		{"retry downshifts voice", agent.Worker, routing.Medium, 2, LevelLite, LevelFull, 16000},
+		{"retry downshifts voice", agent.Worker, routing.Medium, 2, LevelLite, LevelLite, 16000},
 		{"expert then retry", agent.Worker, routing.Expert, 2, LevelOff, LevelLite, 16000},
 		{"max preset", agent.Architect, routing.Medium, 1, LevelUltra, LevelLite, 12000},
-		{"base budget caps adjusted", agent.Worker, routing.Easy, 1, LevelUltra, LevelFull, 5000},
+		{"base budget caps adjusted", agent.Worker, routing.Easy, 1, LevelUltra, LevelLite, 5000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			preset := "auto"
@@ -123,7 +123,7 @@ func TestPresetsOverridesAndUnknownValues(t *testing.T) {
 		t.Errorf("overrides = %+v", r.Profile)
 	}
 	r = Resolve(Prefs{Preset: "auto", Voice: "unknown", Craft: "bad", Roles: map[string]RolePref{"worker": {Voice: "bad"}}}, agent.Worker, routing.Medium, 1, 0)
-	if r.Profile.Voice != LevelFull || r.Profile.Craft != LevelFull {
+	if r.Profile.Voice != LevelFull || r.Profile.Craft != LevelLite {
 		t.Errorf("unknown settings should inherit matrix: %+v", r.Profile)
 	}
 	r = Resolve(Prefs{Preset: "typo"}, agent.Worker, routing.Medium, 1, 0)
@@ -153,7 +153,7 @@ func TestProfileIDsAndFragments(t *testing.T) {
 			if first != profile.Fragment(role) {
 				t.Errorf("fragment differs for role %s", role)
 			}
-			if role == agent.Primary && strings.Contains(first, "Need it?") {
+			if role == agent.Primary && strings.Contains(first, "smallest change that works") {
 				t.Errorf("primary received craft: %s", first)
 			}
 			t.Logf("role=%s profile=%s tokens=%d", role, profile.ID(), ctxeng.Counter(first))
@@ -207,5 +207,14 @@ func TestFragmentJoinsWithRealNewlines(t *testing.T) {
 	out := Profile{Voice: LevelFull, Craft: LevelFull}.Fragment(agent.Worker)
 	if strings.Contains(out, `\n`) || strings.Count(out, "\n") != 1 {
 		t.Fatalf("want one real newline, no literal backslash-n: %q", out)
+	}
+}
+
+// The Minimal code text is a rule for the model, not a convention for the user's code: nothing in it may ask for markers in the source.
+func TestCraftFragmentsDoNotAskForMarkersInCode(t *testing.T) {
+	for level, text := range craftFragments {
+		if strings.Contains(strings.ToLower(text), "ponytail") || strings.Contains(text, "prefer deletion") {
+			t.Errorf("craft %s: %s", level, text)
+		}
 	}
 }

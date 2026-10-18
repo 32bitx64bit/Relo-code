@@ -8,6 +8,7 @@ import (
 
 	"github.com/relocode/relo/internal/agent"
 	ctxeng "github.com/relocode/relo/internal/context"
+	"github.com/relocode/relo/internal/scheduler"
 	"github.com/relocode/relo/internal/taskgraph"
 	"github.com/relocode/relo/internal/workspace"
 )
@@ -28,8 +29,14 @@ type stackPart struct {
 
 // stackParts collects the unaccepted changes of every task t builds on, oldest first.
 func (c *Coord) stackParts(t taskgraph.Task) []stackPart {
+	return c.stackPartsWith(t, nil)
+}
+
+// stackPartsWith adds the pending changes of earlier path holders. For a required dependency every path is stacked;
+// for a lease holder only the paths the two tasks declared overlap, because the lease promised nothing else.
+func (c *Coord) stackPartsWith(t taskgraph.Task, soft []scheduler.SoftDep) []stackPart {
 	ws := c.workspace()
-	if ws == nil || ws.Direct() || len(t.Depends) == 0 {
+	if ws == nil || ws.Direct() || (len(t.Depends) == 0 && len(soft) == 0) {
 		return nil
 	}
 	var order []taskgraph.Task
@@ -54,13 +61,16 @@ func (c *Coord) stackParts(t taskgraph.Task) []stackPart {
 	}
 	changes := c.Changes()
 	var parts []stackPart
-	for _, d := range order {
+	add := func(d taskgraph.Task, only []string) {
 		if d.AgentID == "" {
-			continue
+			return
 		}
 		part := stackPart{title: d.Title}
 		for _, ch := range changes {
 			if ch.AgentID != d.AgentID || ch.Status != "proposed" {
+				continue
+			}
+			if len(only) > 0 && !declaredPath(ch.Path, only) {
 				continue
 			}
 			patch, err := ws.PatchPath(d.AgentID, ch.Path)
@@ -77,7 +87,93 @@ func (c *Coord) stackParts(t taskgraph.Task) []stackPart {
 			parts = append(parts, part)
 		}
 	}
+	for _, d := range order {
+		add(d, nil)
+	}
+	for _, sd := range soft {
+		if sd.TaskID == t.ID || seen[sd.TaskID] {
+			continue
+		}
+		seen[sd.TaskID] = true
+		d, ok := c.Graph.Get(sd.TaskID)
+		if !ok {
+			continue
+		}
+		add(d, sd.Paths)
+	}
 	return parts
+}
+
+// declaredPath reports whether a change is one of the paths a task declared, including files below a declared
+// directory.
+func declaredPath(changePath string, declared []string) bool {
+	for _, d := range declared {
+		d = strings.TrimSpace(strings.ReplaceAll(d, "\\", "/"))
+		if d == "" {
+			continue
+		}
+		d = strings.TrimSuffix(d, "/")
+		if changePath == d || strings.HasPrefix(changePath, d+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// leaseLineage adds the pending changes of earlier path holders that are not recorded yet, so a queued task that is
+// re-cut onto a fresh base stacks the work it waited for.
+func (c *Coord) leaseLineage(a agent.Agent, soft []scheduler.SoftDep) {
+	if len(soft) == 0 {
+		return
+	}
+	ws := c.workspace()
+	if ws == nil || ws.Direct() {
+		return
+	}
+	current := c.lineageOf(a.ID)
+	next := append([]Dep(nil), current...)
+	index := map[string]int{}
+	for i, dep := range current {
+		index[dep.ID] = i
+	}
+	changed := false
+	changes := c.Changes()
+	for _, sd := range soft {
+		if sd.TaskID == a.TaskID {
+			continue
+		}
+		holder, ok := c.Graph.Get(sd.TaskID)
+		if !ok || holder.AgentID == "" {
+			continue
+		}
+		for _, ch := range changes {
+			if ch.AgentID != holder.AgentID || ch.Status != "proposed" {
+				continue
+			}
+			if !declaredPath(ch.Path, sd.Paths) {
+				continue
+			}
+			patch, err := ws.PatchPath(ch.AgentID, ch.Path)
+			if err != nil || strings.TrimSpace(patch) == "" {
+				continue
+			}
+			sum := sha256.Sum256([]byte(patch))
+			hash := hex.EncodeToString(sum[:])
+			if i, recorded := index[ch.ID]; recorded {
+				if next[i].PatchHash != hash {
+					next[i].PatchHash = hash
+					changed = true
+				}
+				continue
+			}
+			next = append(next, Dep{ID: ch.ID, PatchHash: hash})
+			index[ch.ID] = len(next) - 1
+			changed = true
+		}
+	}
+	if changed {
+		c.setLineage(a.ID, next)
+	}
 }
 
 // stackInto applies the parts to a's worktree and returns what the agent should be told about its workspace, plus

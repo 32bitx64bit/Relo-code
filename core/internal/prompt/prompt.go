@@ -112,10 +112,12 @@ Responsibilities:
 4. Run work concurrently only with named, disjoint file ownership. A test or review task must list the worker it checks in deps, or it sees code without the change. Relo runs the project's checks itself, so ask workers to implement, not to re-verify. Tell a worker where to look: the files and line ranges a probe found, with the probe in deps so its report is attached. When a task is to run one of the project's own commands (build, install, package), put the exact command from the facts in the description and mark it trivial or easy.
 5. Relo already reviews large or hard changes, so plan a reviewer only when the user asks for a review or the change is security-sensitive. On noisy, stale, oversized or contradictory context, extract decisions, then set refreshSelf=true.
 6. Redirect a failed worker with a tighter task. When every task is done and no check failed, put what happened in userMessage and return tasks as []; do not plan more work only to confirm it.
+7. Set constraints: rules every sub agent must follow that the request and context imply, even unstated ones (files or behavior to leave alone, conventions, scope limits). Interpret the request, do not copy it. One short, checkable rule each. Resend the full list when it changes; leave it empty otherwise.
+8. A blocked worker is asking a question. Answer it from the request and context in a replacement task; ask the user only when the decision is theirs.
 
 Set each task's difficulty (trivial, easy, medium, hard, expert) to match cost and strength. Never make mechanical code edits; delegate them.
 
-Return JSON: status (working|blocked|completed), concise userMessage, objective, decisions, risks, refreshSelf, tasks, and usually-empty spawns. Each task has {id,title,role,description,acceptance,priority,deps}; role is probe|worker|architect|debug|test|reviewer|integration|head. Use stable task-id slugs; deps reference ids. Relo schedules tasks.
+Return JSON: status (working|blocked|completed), concise userMessage, objective, decisions, constraints, risks, refreshSelf, tasks, and usually-empty spawns. Each task has {id,title,role,description,acceptance,priority,deps,paths}; role is probe|worker|architect|debug|test|reviewer|integration|head. Use stable task-id slugs; deps reference ids. Put the files a task will edit in paths so two tasks are never cut from each other's missing work. Relo schedules tasks. When a conflict prompt asks you to resolve changes, list the ids you have replaced in resolvedChanges; every listed change is discarded and its agent copy is kept for recovery.
 `
 
 const Head = Shared + `
@@ -124,7 +126,7 @@ You coordinate an objective subsystem (such as backend or frontend); never send 
 Report shipped work, verification, remaining work, and changed files to Primary. Spawn only within scope; prevent duplicate work.
 `
 
-const Worker = Shared + ReadNarrowly + RunNarrowly + `
+const Worker = Shared + ReadNarrowly + RunNarrowly + AskWhenBlocked + HandOff + `
 Implement assigned work from a curated generation: objective, acceptance, relevant files, verified findings, recent failures.
 
 Implement only assigned task; do not expand scope. Prefer supplied files. Report durable discoveries as findings.
@@ -141,6 +143,13 @@ const ReadNarrowly = "\nRead narrowly. Find lines with `grep -n`, then read only
 // each time and silent until it ended, again and again; Relo runs the project's checks itself when a worker finishes.
 const RunNarrowly = "\nRun narrowly. Relo runs the project's checks itself when you finish, so run only the tests for what you changed (one test or target), not the whole suite. A command that takes more than two minutes is the wrong command: run it under `timeout 120`.\n"
 
+// AskWhenBlocked is the one case where stopping beats guessing. A guess that is wrong costs a whole attempt and a
+// retry that repeats it; a question costs one report.
+const AskWhenBlocked = "\nStop and ask only when you cannot go on without a decision that is not yours: the task contradicts the code, or two readings change which files you touch. Return status \"blocked\" and put one specific question in `question`. Decide and look up everything else yourself.\n"
+
+// HandOff is what lets a task that depends on this one start from facts instead of from a clipped summary.
+const HandOff = "\nIf another task builds on yours, put exactly what it needs in `handoff`: names, signatures, file paths, decisions. Leave it out otherwise.\n"
+
 const Probe = Shared + ReadNarrowly + `
 You investigate repositories; do not make large edits.
 
@@ -149,13 +158,13 @@ Return concise structured findings: subsystem locations, symbols, build/test com
 Prefer findings to patches; name files/symbols and mark confidence. Verify only facts observed in the repository.
 `
 
-const Architect = Shared + ReadNarrowly + `
+const Architect = Shared + ReadNarrowly + AskWhenBlocked + HandOff + `
 Design changes concretely enough for workers to execute without re-deriving the plan.
 
 Return decisions, module boundaries, file plan, risks, and verification needs. Separate requirements from hypotheses.
 `
 
-const Debug = Shared + ReadNarrowly + RunNarrowly + `
+const Debug = Shared + ReadNarrowly + RunNarrowly + AskWhenBlocked + HandOff + `
 Start from latest failures and verified findings, not exploratory dumps.
 
 Reproduce, isolate cause, minimally fix, and verify. If edits loop on the same failure, report it and request context refresh instead of repeating the patch.
@@ -176,7 +185,7 @@ Check correctness, regressions, security, concurrency, error handling, architect
 Report findings; recommend tasks if needed. Do not rubber-stamp or make unrelated changes.
 `
 
-const Integration = Shared + ReadNarrowly + `
+const Integration = Shared + ReadNarrowly + AskWhenBlocked + HandOff + `
 Integrate isolated worker changes. Apply compatible patches; detect conflicts and never overwrite pre-existing user changes.
 
 Never overwrite another worker blindly. Report conflicts structurally with a resolution plan.
@@ -187,6 +196,8 @@ const (
 	PrimaryDescriptionMaxLength = 600
 	PrimaryAcceptanceMaxItems   = 6
 	PrimaryAcceptanceMaxLength  = 200
+	PrimaryConstraintsMaxItems  = 8
+	PrimaryConstraintMaxLength  = 200
 	ReportSummaryMaxLength      = 1200
 	ReportFindingsMaxItems      = 12
 	ReportFindingMaxLength      = 400
@@ -194,6 +205,8 @@ const (
 	ReportFileMaxLength         = 400
 	ReportRisksMaxItems         = 8
 	ReportRiskMaxLength         = 300
+	ReportHandoffMaxLength      = 800
+	ReportQuestionMaxLength     = 300
 	ReportNextActionsMaxItems   = 8
 	ReportNextActionMaxLength   = 300
 )
@@ -202,14 +215,16 @@ var PrimarySchema = map[string]any{
 	"type":     "object",
 	"required": []string{"status", "userMessage", "tasks"},
 	"properties": map[string]any{
-		"status":      map[string]any{"type": "string"},
-		"userMessage": map[string]any{"type": "string"},
-		"objective":   map[string]any{"type": "string"},
-		"decisions":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-		"risks":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-		"refreshSelf": map[string]any{"type": "boolean"},
-		"tasks":       map[string]any{"type": "array", "items": taskSchema},
-		"spawns":      map[string]any{"type": "array"},
+		"status":          map[string]any{"type": "string"},
+		"userMessage":     map[string]any{"type": "string"},
+		"objective":       map[string]any{"type": "string"},
+		"decisions":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		"constraints":     map[string]any{"type": "array", "maxItems": PrimaryConstraintsMaxItems, "items": map[string]any{"type": "string", "maxLength": PrimaryConstraintMaxLength}, "description": "Rules every sub agent must respect, interpreted from the request and context. Send the full list when it changes; empty means unchanged."},
+		"risks":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		"refreshSelf":     map[string]any{"type": "boolean"},
+		"tasks":           map[string]any{"type": "array", "items": taskSchema},
+		"spawns":          map[string]any{"type": "array"},
+		"resolvedChanges": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Ids of conflicted changes you have resolved and replaced. Core discards each one without touching the workspace."},
 	},
 }
 
@@ -223,6 +238,7 @@ var taskSchema = map[string]any{
 		"acceptance":  map[string]any{"type": "array", "maxItems": PrimaryAcceptanceMaxItems, "items": map[string]any{"type": "string", "maxLength": PrimaryAcceptanceMaxLength}},
 		"priority":    map[string]any{"type": "number"},
 		"deps":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		"paths":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Files this task will edit, relative to the workspace. Declaring them lets Relo keep two tasks off the same file at once."},
 		"scope":       map[string]any{"type": "string"},
 		"difficulty":  map[string]any{"type": "string", "enum": []string{"trivial", "easy", "medium", "hard", "expert"}, "description": "How hard the task is; Primary uses it to pick a cheaper or stronger model."},
 	},
@@ -232,8 +248,10 @@ var ReportSchema = map[string]any{
 	"type":     "object",
 	"required": []string{"status", "summary"},
 	"properties": map[string]any{
-		"status":                 map[string]any{"type": "string"},
+		"status":                 map[string]any{"type": "string", "description": "completed, failed, or blocked (cannot go on without a decision; put the question in question)"},
 		"summary":                map[string]any{"type": "string", "maxLength": ReportSummaryMaxLength},
+		"question":               map[string]any{"type": "string", "maxLength": ReportQuestionMaxLength, "description": "With status blocked: the one decision you need."},
+		"handoff":                map[string]any{"type": "string", "maxLength": ReportHandoffMaxLength, "description": "What a task that builds on this one needs: names, signatures, file paths, decisions."},
 		"findings":               map[string]any{"type": "array", "maxItems": ReportFindingsMaxItems, "items": map[string]any{"type": "string", "maxLength": ReportFindingMaxLength}},
 		"filesChanged":           map[string]any{"type": "array", "maxItems": ReportFilesMaxItems, "items": map[string]any{"type": "string", "maxLength": ReportFileMaxLength}},
 		"verification":           map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}, "status": map[string]any{"type": "string"}, "output": map[string]any{"type": "string"}}}},

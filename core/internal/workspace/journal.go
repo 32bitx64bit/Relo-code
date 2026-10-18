@@ -221,6 +221,10 @@ func (m *Manager) KeepChangeBlob(changeID, worktree, rel string) error {
 	}
 	m.journalMu.Lock()
 	defer m.journalMu.Unlock()
+	return m.keepChangeBlobLocked(changeID, worktree, rel)
+}
+
+func (m *Manager) keepChangeBlobLocked(changeID, worktree, rel string) error {
 	if err := validateRelative(rel); err != nil {
 		return err
 	}
@@ -238,6 +242,71 @@ func (m *Manager) KeepChangeBlob(changeID, worktree, rel string) error {
 	name := changeRefPrefix + strconv.FormatInt(time.Now().UnixNano(), 10) + "-" + changeRefID(changeID)
 	_, err = git(m.root, "update-ref", name, sha)
 	return err
+}
+
+// BlobRef names one agent file that must stay recoverable after a decision.
+type BlobRef struct {
+	ChangeID string
+	Worktree string
+	Path     string
+}
+
+// KeepChangeBlobs retains several agent files with one hash-object call and one update-ref call, so a bulk
+// reject does not spawn git once per change.
+func (m *Manager) KeepChangeBlobs(refs []BlobRef) error {
+	if !isGit(m.root) || len(refs) == 0 {
+		return nil
+	}
+	m.journalMu.Lock()
+	defer m.journalMu.Unlock()
+	var kept []BlobRef
+	var paths []string
+	for _, r := range refs {
+		if r.ChangeID == "" || r.Path == "" {
+			continue
+		}
+		if err := validateRelative(r.Path); err != nil {
+			return err
+		}
+		full := filepath.Join(r.Worktree, filepath.FromSlash(r.Path))
+		if _, err := os.Stat(full); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		kept = append(kept, r)
+		paths = append(paths, filepath.ToSlash(full))
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	out, err := gitStdin(m.root, strings.Join(paths, "\n")+"\n", "hash-object", "-w", "--no-filters", "--stdin-paths")
+	if err != nil {
+		return m.keepChangeBlobsOne(kept)
+	}
+	shas := strings.Fields(out)
+	if len(shas) != len(kept) {
+		return m.keepChangeBlobsOne(kept)
+	}
+	stamp := time.Now().UnixNano()
+	var refsIn strings.Builder
+	for i, r := range kept {
+		fmt.Fprintf(&refsIn, "update %s%d-%s %s\n", changeRefPrefix, stamp+int64(i), changeRefID(r.ChangeID), shas[i])
+	}
+	_, err = gitStdin(m.root, refsIn.String(), "update-ref", "--stdin")
+	return err
+}
+
+// keepChangeBlobsOne is the fallback that isolates a path hash-object could not read, so one bad file does
+// not drop every retained blob in the batch.
+func (m *Manager) keepChangeBlobsOne(refs []BlobRef) error {
+	for _, r := range refs {
+		if err := m.keepChangeBlobLocked(r.ChangeID, r.Worktree, r.Path); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func changeRefID(id string) string {

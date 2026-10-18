@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/relocode/relo/internal/agent"
 	"github.com/relocode/relo/internal/taskgraph"
@@ -14,6 +15,9 @@ type Limits struct {
 	MaxTier2 int
 	MaxDepth int
 	MaxRetry int
+	// PathLeases enables advisory path leases (relo.scheduler.pathLeases). Off by default: tasks that declare no
+	// paths, and every task while this is off, are scheduled exactly as before.
+	PathLeases bool
 }
 
 func (l Limits) WithDefaults() Limits {
@@ -53,12 +57,24 @@ type Scheduler struct {
 	paused   bool
 	reserved map[string]agent.Agent
 	resumed  chan struct{}
+
+	// Path lease state; guarded by mu.
+	leases      map[string]leaseHolder // normalized path -> current holder
+	lastLease   map[string]leaseHolder // path -> most recent holder, kept after release
+	heldPaths   map[string][]string    // task ID -> paths it holds
+	leaseWait   map[string]time.Time   // task ID -> first time a lease refused it
+	leaseDelays []time.Duration
+	seq         uint64
 }
 
 func New(l Limits) *Scheduler {
 	resumed := make(chan struct{})
 	close(resumed)
-	return &Scheduler{Limits: l.WithDefaults(), reserved: map[string]agent.Agent{}, resumed: resumed}
+	return &Scheduler{
+		Limits: l.WithDefaults(), reserved: map[string]agent.Agent{}, resumed: resumed,
+		leases: map[string]leaseHolder{}, lastLease: map[string]leaseHolder{},
+		heldPaths: map[string][]string{}, leaseWait: map[string]time.Time{},
+	}
 }
 
 func (s *Scheduler) Pause() {

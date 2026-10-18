@@ -1,6 +1,12 @@
 package orchestrator
 
-import "reflect"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"reflect"
+	"strings"
+)
 
 // IntegrationUpdate is one change's new projection and derived wire state. A nil Integration leaves the stored
 // projection unchanged.
@@ -97,13 +103,95 @@ func (c *Coord) setLineage(agentID string, deps []Dep) {
 		c.lineage = map[string][]Dep{}
 	}
 	c.lineage[agentID] = append([]Dep(nil), deps...)
+	delete(c.lineageProblems, agentID)
 }
 
-// lineageOf returns the dependencies applied to an agent's base.
-func (c *Coord) lineageOf(agentID string) []Dep {
+type lineageProblem struct {
+	kind   string
+	reason string
+}
+
+func (c *Coord) setLineageProblem(agentID, kind, reason string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]Dep(nil), c.lineage[agentID]...)
+	if c.lineageProblems == nil {
+		c.lineageProblems = map[string]lineageProblem{}
+	}
+	c.lineageProblems[agentID] = lineageProblem{kind: kind, reason: reason}
+}
+
+func (c *Coord) lineageProblemOf(agentID string) (lineageProblem, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, ok := c.lineageProblems[agentID]
+	return p, ok
+}
+
+// lineageOf returns the dependencies applied to an agent's base. When the in-memory map was reset by a restart,
+// fall back to the Lineage persisted on any of that agent's changes.
+func (c *Coord) lineageOf(agentID string) []Dep {
+	c.mu.Lock()
+	if deps, ok := c.lineage[agentID]; ok && len(deps) > 0 {
+		out := append([]Dep(nil), deps...)
+		c.mu.Unlock()
+		return out
+	}
+	var out []Dep
+	if c.sess != nil {
+		for _, ch := range c.sess.Changes {
+			if ch.AgentID == agentID && len(ch.Lineage) > 0 {
+				out = append([]Dep(nil), ch.Lineage...)
+				break
+			}
+		}
+	}
+	c.mu.Unlock()
+	return out
+}
+
+// lineageState reports why a recorded base cannot be trusted any more. accepted parents are already in the
+// workspace; a proposed parent must still produce the exact patch that was stacked. A rejected or missing parent
+// blocks the dependent without rewriting its Lineage.
+func (c *Coord) lineageState(lineage []Dep) (kind, reason string) {
+	if len(lineage) == 0 {
+		return "", ""
+	}
+	changes := c.Changes()
+	ws := c.workspace()
+	for _, dep := range lineage {
+		var parent Change
+		found := false
+		for _, ch := range changes {
+			if ch.ID == dep.ID {
+				parent, found = ch, true
+				break
+			}
+		}
+		if !found {
+			return "parent_superseded", fmt.Sprintf("the change this builds on (%s) is no longer available", dep.ID)
+		}
+		switch parent.Status {
+		case "accepted":
+			continue
+		case "rejected":
+			return "parent_rejected", fmt.Sprintf("the change this builds on (%s) was rejected", dep.ID)
+		case "proposed":
+			if dep.PatchHash == "" || ws == nil {
+				continue
+			}
+			patch, err := ws.PatchPath(parent.AgentID, parent.Path)
+			if err != nil || strings.TrimSpace(patch) == "" {
+				return "parent_superseded", fmt.Sprintf("the change this builds on (%s) can no longer be read", dep.ID)
+			}
+			sum := sha256.Sum256([]byte(patch))
+			if hex.EncodeToString(sum[:]) != dep.PatchHash {
+				return "parent_superseded", fmt.Sprintf("the change this builds on (%s) changed after it was stacked", dep.ID)
+			}
+		default:
+			return "parent_superseded", fmt.Sprintf("the change this builds on (%s) is %s", dep.ID, parent.Status)
+		}
+	}
+	return "", ""
 }
 
 // UpdateChange edits one change in place under the Coord lock, so a worker recording new changes at the same time

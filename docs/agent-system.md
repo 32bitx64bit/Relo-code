@@ -1,6 +1,6 @@
 # Agent system
 
-Primary is the engineering director. It returns a structured turn: objective, decisions, risks, and a dependency-aware task graph. Relo materializes that graph; OpenCode does not.
+Primary is the engineering director. It returns a structured turn: objective, decisions, constraints, risks, and a dependency-aware task graph. Relo materializes that graph; OpenCode does not.
 
 ## Roles
 
@@ -28,11 +28,24 @@ Workers must return JSON:
   "filesChanged": [],
   "verification": [{"command": "go test ./…", "status": "passed"}],
   "remainingRisks": [],
-  "recommendedNextActions": []
+  "recommendedNextActions": [],
+  "handoff": "",
+  "question": ""
 }
 ```
 
 Parents consume this report, not the worker transcript.
+
+- `handoff` is what tasks that build on this one need (names, signatures, file paths, decisions). It is the one part of a report that is not compressed: dependent tasks receive it whole, up to 800 characters.
+- `status: "blocked"` with a `question` is for a decision that is not the agent's to make. The task ends without a retry, the agent shows "Needs a decision", and the Primary reads the question in the report and answers it in a replacement task or asks the user.
+
+## Worker start
+
+A worker's first message is its task in full: title, description, acceptance criteria and the files in scope, last in the message. The context pack keeps only the title. A retried task also gets a "Previous attempt failed" item with the reason the last attempt gave.
+
+## Constraints
+
+Primary reads the user's request and the context and returns `constraints`: short, checkable rules every sub agent must follow, including ones the user did not spell out. A non-empty list replaces the session's list; an empty one leaves it unchanged. Core stores the list in the session, shows it to the Primary each turn, and pins it in the context of every sub agent except probes.
 
 ## Failure modes Relo blocks
 

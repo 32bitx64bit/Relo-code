@@ -150,6 +150,29 @@ func TestDiscardAndPrune(t *testing.T) {
 	}
 }
 
+func TestDiscardManyRestoresModifiedAndRemovesNew(t *testing.T) {
+	dir := initRepo(t)
+	m := New(dir)
+	if _, err := m.Snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	tree, err := m.EnsureTree("many-agent", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, tree.Path, "README.md", "changed\n")
+	write(t, tree.Path, "new.txt", "new\n")
+	if err := m.DiscardMany("many-agent", []string{"README.md", "new.txt"}); err != nil {
+		t.Fatalf("discard many: %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(tree.Path, "README.md")); string(got) != "hi\n" {
+		t.Fatalf("tracked file = %q, want base content", got)
+	}
+	if _, err := os.Stat(filepath.Join(tree.Path, "new.txt")); !os.IsNotExist(err) {
+		t.Fatalf("discard left untracked file: %v", err)
+	}
+}
+
 func initRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
