@@ -430,9 +430,9 @@ func TestVerificationFailureFailsAndBoundsRetry(t *testing.T) {
 	if len(results) != 1 || results[0].Command != "make test" || results[0].Status != "failed" {
 		t.Fatalf("verify did not run the project's test target: %+v", results)
 	}
-	// Checks that still fail after the repair rounds end the task as failed but are not retried: the work is intact
+	// Checks that still fail after the repair attempts end the task as failed but are not retried: the work is intact
 	// in the worktree and a fresh attempt would only redo it.
-	c.acceptReport(task, a, RawReport{Status: "completed", Summary: "changed files"}, verifyOutcome{ran: true, failure: failure, repairs: maxRepairRounds})
+	c.acceptReport(task, a, RawReport{Status: "completed", Summary: "changed files"}, verifyOutcome{ran: true, failure: failure, repairs: 2})
 	got, _ := c.Graph.Get(task.ID)
 	if got.Status != taskgraph.Failed {
 		t.Fatalf("failing checks did not fail the task: %+v", got)

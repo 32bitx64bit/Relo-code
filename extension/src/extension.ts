@@ -9,6 +9,7 @@ import { checkCommand, checkSessionId, checkSetting, modelsSignature, settingsRe
 import { applyCollapse, cleanCollapsed, type Collapsed } from "./uiState";
 import { CrashBreaker } from "./crashBreaker";
 import { PROVIDER_ID_RE, sanitizeDiscovered, sanitizeProviderList, secretKey, validateBaseURL, validateProvider, MAX_PROVIDERS, type ProviderConfig } from "./providers";
+import { dirtyPathsFor } from "./dirtyGate";
 
 let client: CoreClient;
 let state: ReloState = emptyState();
@@ -36,7 +37,7 @@ let coreLifecycle: Promise<void> = Promise.resolve();
 let postedRepository = "";
 
 // Settings that core consumes; a change to any of them re-applies to the running core.
-const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context", "relo.changes.autoApply"];
+const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context", "relo.changes.autoApply", "relo.changes.lazyConflicts"];
 
 export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   output = vscode.window.createOutputChannel("Relo");
@@ -64,6 +65,10 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       }
       if (CORE_SETTING_SECTIONS.some((section) => e.affectsConfiguration(section))) scheduleCoreApply();
     }),
+    vscode.workspace.onDidChangeTextDocument(() => scheduleDirtyPush()),
+    vscode.workspace.onDidSaveTextDocument(() => scheduleDirtyPush()),
+    vscode.workspace.onDidOpenTextDocument(() => scheduleDirtyPush()),
+    vscode.workspace.onDidCloseTextDocument(() => scheduleDirtyPush()),
   );
 
   client.on("event", (method: string, params: unknown) => {
@@ -211,8 +216,12 @@ function registerCommands(ctx: vscode.ExtensionContext): void {
   });
   cmd("relo.changes.accept", (item?: unknown) => decideChange("accept", idOf(item)));
   cmd("relo.changes.reject", (item?: unknown) => decideChange("reject", idOf(item)));
+  cmd("relo.changes.resolveAgent", (item?: unknown) => resolveChange("agent", idOf(item)));
+  cmd("relo.changes.resolveMine", (item?: unknown) => resolveChange("mine", idOf(item)));
+  cmd("relo.changes.resolveHead", (item?: unknown) => resolveChange("head", idOf(item)));
   cmd("relo.changes.acceptAll", () => decideAll("accept"));
   cmd("relo.changes.rejectAll", () => decideAll("reject"));
+  cmd("relo.changes.undo", (item?: unknown) => undoChange(idOf(item)));
   cmd("relo.changes.diff", (item?: unknown) => openChangeDiff(idOf(item)));
   cmd("relo.changes.resolveConflicts", () => resolveConflicts());
 }
@@ -404,7 +413,7 @@ function workspacePath(): string {
 }
 
 function settingTarget(subkey: string): vscode.ConfigurationTarget {
-  return (subkey === "repository" || subkey === "changes.autoApply") && vscode.workspace.workspaceFolders?.length
+  return (subkey === "repository" || subkey === "changes.autoApply" || subkey === "changes.lazyConflicts") && vscode.workspace.workspaceFolders?.length
     ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
 }
 
@@ -698,6 +707,7 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
   return {
     workspace,
     autoApply: c.get<boolean>("changes.autoApply", false),
+    lazyConflicts: c.get<boolean>("changes.lazyConflicts", false),
     routingMode: c.get<string>("routing.mode", "simple"),
     contextLimit: c.get<number>("models.contextLimit", 0),
     providers,
@@ -813,18 +823,124 @@ async function deleteSession(id: string): Promise<void> {
   chat.send({ type: "sessions", sessions: Array.isArray(res?.sessions) ? res.sessions : [] });
 }
 
+function relativeDocumentPath(fsPath: string): string | undefined {
+  const rel = path.relative(workspacePath(), fsPath);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return undefined;
+  return rel.split(path.sep).join("/");
+}
+
+let dirtyTimer: ReturnType<typeof setTimeout> | undefined;
+
+// The core needs the dirty set to refuse an accept or auto-apply it cannot see. Debounced so typing does not flood
+// the connection.
+function scheduleDirtyPush(): void {
+  if (!client) return;
+  if (dirtyTimer) clearTimeout(dirtyTimer);
+  dirtyTimer = setTimeout(() => void pushDirty(), 250);
+}
+
+async function pushDirty(): Promise<void> {
+  if (dirtyTimer) {
+    clearTimeout(dirtyTimer);
+    dirtyTimer = undefined;
+  }
+  const paths = vscode.workspace.textDocuments
+    .filter((doc) => doc.isDirty && !doc.isUntitled)
+    .map((doc) => relativeDocumentPath(doc.uri.fsPath))
+    .filter((p): p is string => Boolean(p));
+  try {
+    await client.request("workspace.dirty", { paths });
+  } catch {
+    /* the core may be restarting; the next edit pushes again */
+  }
+}
+
+function dirtyDocumentsFor(paths: string[]): vscode.TextDocument[] {
+  const docs = vscode.workspace.textDocuments.map((doc) => ({
+    doc,
+    path: relativeDocumentPath(doc.uri.fsPath) ?? "",
+    isDirty: doc.isDirty,
+  }));
+  const dirty = new Set(dirtyPathsFor(paths, docs));
+  return docs.filter((d) => d.isDirty && dirty.has(d.path)).map((d) => d.doc);
+}
+
+type DirtyChoice = "Save" | "Skip" | "Cancel";
+
+// Save proceeds, Skip leaves the dirty changes for later (the core refuses them), Cancel aborts the whole action.
+async function gateDirty(paths: string[], action: string): Promise<DirtyChoice> {
+  const dirty = dirtyDocumentsFor(paths);
+  if (!dirty.length) return "Save";
+  const names = dirty.slice(0, 3).map((doc) => path.basename(doc.uri.fsPath)).join(", ");
+  const more = dirty.length > 3 ? ` and ${dirty.length - 3} more` : "";
+  const choice = await vscode.window.showWarningMessage(
+    `Relo: ${names}${more} ${dirty.length === 1 ? "has" : "have"} unsaved changes. Save before ${action}?`,
+    { modal: true },
+    "Save",
+    "Skip",
+    "Cancel",
+  );
+  if (choice === "Save") {
+    for (const doc of dirty) {
+      if (!(await doc.save())) return "Cancel";
+    }
+    await pushDirty();
+    return "Save";
+  }
+  if (choice === "Skip") {
+    await pushDirty();
+    return "Skip";
+  }
+  return "Cancel";
+}
+
 async function decideChange(kind: "accept" | "reject", id: string | undefined): Promise<void> {
   if (!id) return;
   try {
-    await client.request(kind === "accept" ? "changes.accept" : "changes.reject", { id });
+    const chg = state.changes.find((c) => c.id === id);
+    if (kind === "accept") {
+      const choice = await gateDirty(chg?.path ? [chg.path] : [], "accepting it");
+      if (choice !== "Save") return;
+    }
+    const expect = kind === "accept" ? chg?.integration?.fingerprint : undefined;
+    await client.request(kind === "accept" ? "changes.accept" : "changes.reject", expect ? { id, expect } : { id });
   } catch (err) {
     // The core's message says which file and why (for example "a.ts: your edits and the agent's edits overlap").
     void vscode.window.showErrorMessage(`Relo: could not ${kind} the change. ${errorText(err)}`);
   }
 }
 
+async function resolveChange(choice: "agent" | "mine" | "head", id: string | undefined): Promise<void> {
+  if (!id) return;
+  const chg = state.changes.find((c) => c.id === id);
+  if (choice === "agent") {
+    const picked = await gateDirty(chg?.path ? [chg.path] : [], "taking the agent's version");
+    if (picked !== "Save") return;
+    const ok = await vscode.window.showWarningMessage(
+      `Replace ${chg?.path ?? "this file"} with the agent's version? Your current bytes are kept in the undo journal.`,
+      { modal: true },
+      "Take agent's version",
+    );
+    if (ok !== "Take agent's version") return;
+  }
+  if (choice === "mine") {
+    const ok = await vscode.window.showWarningMessage(
+      `Keep your version of ${chg?.path ?? "this file"}? The agent's version stays recoverable.`,
+      { modal: true },
+      "Keep mine",
+    );
+    if (ok !== "Keep mine") return;
+  }
+  try {
+    await client.request("changes.resolve", { id, choice });
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Relo: could not resolve the change. ${errorText(err)}`);
+  }
+}
+
 async function decideAll(kind: "accept" | "reject"): Promise<void> {
-  const pending = state.changes.filter((c) => c.status === "proposed").length;
+  const pendingChanges = state.changes.filter((c) => c.status === "proposed");
+  const pending = pendingChanges.length;
   if (!pending) {
     void vscode.window.showInformationMessage("Relo: there are no changes waiting for a decision.");
     return;
@@ -832,11 +948,31 @@ async function decideAll(kind: "accept" | "reject"): Promise<void> {
   if (kind === "reject") {
     const choice = await vscode.window.showWarningMessage(`Reject all ${pending} change${pending === 1 ? "" : "s"}? The agents' versions are discarded; your files are not touched.`, { modal: true }, "Reject all");
     if (choice !== "Reject all") return;
+  } else {
+    const choice = await gateDirty(pendingChanges.map((c) => c.path), "accepting all changes");
+    if (choice === "Cancel") return;
+    // Skip leaves the dirty paths in the core's set, so accept-all lands the other paths and reports them.
   }
   const res = await client.request<{ done?: number; failed?: { path: string; reason: string }[] }>(kind === "accept" ? "changes.acceptAll" : "changes.rejectAll", {});
   const failed = res?.failed ?? [];
   if (failed.length) {
     void vscode.window.showWarningMessage(`Relo: ${res?.done ?? 0} done, ${failed.length} need attention. ${failed.slice(0, 3).map((f) => f.reason).join(" | ")}`);
+  }
+}
+
+async function undoChange(id: string | undefined): Promise<void> {
+  if (!id) return;
+  const chg = state.changes.find((c) => c.id === id);
+  const choice = await vscode.window.showWarningMessage(
+    `Undo the accept of ${chg?.path ?? "this change"} and restore the bytes from before it?`,
+    { modal: true },
+    "Undo",
+  );
+  if (choice !== "Undo") return;
+  try {
+    await client.request("changes.undo", { id });
+  } catch (err) {
+    void vscode.window.showErrorMessage(`Relo: could not undo the change. ${errorText(err)}`);
   }
 }
 

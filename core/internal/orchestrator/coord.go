@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,6 +57,85 @@ type Change struct {
 	Resolving bool `json:"resolving,omitempty"`
 	// Superseded is set when a newer proposal for the same path replaced this conflicted change.
 	Superseded bool `json:"superseded,omitempty"`
+
+	// The fields below are additive. Rows written before they existed load with zero values.
+
+	// BaseRev is the commit this change is diffed against: the agent's base, or the stacked commit when Needs is set.
+	BaseRev string `json:"baseRev,omitempty"`
+	// Needs lists the ids of the changes stacked into BaseRev. It is derived from Lineage.
+	Needs []string `json:"needs,omitempty"`
+	// Lineage holds the dependencies applied at stack time. It is written once and survives status changes and recuts.
+	Lineage []Dep `json:"lineage,omitempty"`
+	// SupersededBy replaces the Superseded bool: the superseded change is kept, not discarded.
+	SupersededBy string `json:"supersededBy,omitempty"`
+	// Landed is the accept outcome: created, updated, merged, deleted or unchanged.
+	Landed string `json:"landed,omitempty"`
+	// Integration is the result of the last projection of this change against the workspace.
+	Integration *Integration `json:"integration,omitempty"`
+}
+
+// Dep is a dependency applied when a change's base was stacked.
+type Dep struct {
+	ID        string `json:"id"`        // parent change id
+	PatchHash string `json:"patchHash"` // sha256 of the parent patch as stacked
+}
+
+// Integration is the visible state of a change against the workspace at CheckedAt.
+type Integration struct {
+	State     string   `json:"state"`            // clean | conflicted | blocked | unknown
+	Kind      string   `json:"kind,omitempty"`   // overlap, modify_delete, delete_modify, add_add, binary, symlink, protected, ...
+	Reason    string   `json:"reason,omitempty"` // text derived from Kind
+	Ours      string   `json:"ours,omitempty"`   // blob id of the workspace file the check ran against; "-" if absent
+	Hunks     []Hunk   `json:"hunks,omitempty"`  // hunk locations, with conflicting hunks marked
+	Since     []string `json:"since,omitempty"`  // accepted change ids, or "user", that moved the file after BaseRev
+	CheckedAt int64    `json:"checkedAt,omitempty"`
+	// Fingerprint identifies the three inputs this projection was computed from. An accept that carries it is
+	// refused as stale_preview when the inputs changed since the preview.
+	Fingerprint string `json:"fingerprint,omitempty"`
+}
+
+// Hunk is one changed region of a three-way merge. A side with no change has a zero start and length.
+type Hunk struct {
+	OursStart   int  `json:"oursStart"`
+	OursLen     int  `json:"oursLen"`
+	TheirsStart int  `json:"theirsStart"`
+	TheirsLen   int  `json:"theirsLen"`
+	Conflicting bool `json:"conflicting"`
+}
+
+// NormalizeIntegration fills Integration from the legacy Conflict string for rows written before Integration
+// existed. It does nothing when an Integration is already present. It reports whether it filled the state.
+func (ch *Change) NormalizeIntegration() bool {
+	if ch.Integration != nil {
+		return false
+	}
+	if ch.Conflict == "" {
+		return false
+	}
+	ch.Integration = &Integration{State: "conflicted", Kind: LegacyConflictKind(ch.Conflict), Reason: ch.Conflict}
+	return true
+}
+
+// LegacyConflictKind classifies a stored Conflict reason from before Integration existed.
+func LegacyConflictKind(reason string) string {
+	lower := strings.ToLower(reason)
+	switch {
+	case strings.Contains(lower, "binary"):
+		return "binary"
+	case strings.Contains(lower, "agent deleted it"):
+		return "modify_delete"
+	case strings.Contains(lower, "you deleted this file"):
+		return "delete_modify"
+	case strings.Contains(lower, "agent created"):
+		return "add_add"
+	case strings.Contains(lower, "protected"):
+		return "protected"
+	case strings.Contains(lower, "symlink"):
+		return "symlink"
+	case strings.Contains(lower, "overlap"):
+		return "overlap"
+	}
+	return "overlap"
 }
 
 type Settings struct {
@@ -148,6 +228,7 @@ type Coord struct {
 	emitFn          func(string, any)
 	cacheMu         sync.RWMutex
 	sess            *Session
+	lineage         map[string][]Dep        // agent ID -> dependencies applied to its base at stack time; guarded by mu
 	inbox           map[string][]queuedNote // session ID -> user messages waiting for the head's next step; guarded by mu
 	wake            chan struct{}           // buffered nudge: the inbox has something for a head waiting on its sub agents
 	sessionCtx      context.Context
@@ -161,9 +242,9 @@ type Coord struct {
 	escalations     map[string]string
 	directSem       chan struct{}   // guarded by mu; one mutating agent at a time in direct mode
 	directNotified  string          // session ID that already received the direct-mode notice; guarded by mu
+	snapshotNoticed map[string]bool // session ID -> the snapshot notice was already shown; guarded by mu
 	baseline        map[string]bool // "baseline dir\x00command" -> command already fails without the agent's change; guarded by mu
 	tasksPlanned    int             // tasks Primary has added this session; guarded by mu
-	replans         int             // follow-up planning turns spent on the current request; guarded by mu
 }
 
 func New(log *logging.Logger) *Coord {

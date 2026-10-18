@@ -164,28 +164,6 @@ func initRepo(t *testing.T) string {
 	return dir
 }
 
-func TestProtectUserDirty(t *testing.T) {
-	dir := t.TempDir()
-	run(t, dir, "git", "init")
-	run(t, dir, "git", "config", "user.email", "relo@test")
-	run(t, dir, "git", "config", "user.name", "Relo")
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	run(t, dir, "git", "add", ".")
-	run(t, dir, "git", "commit", "-m", "init")
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("user\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	m := New(dir)
-	if _, err := m.Snapshot(); err != nil {
-		t.Fatal(err)
-	}
-	if !m.UserProtected("a.txt") {
-		t.Fatal("user dirty file not protected")
-	}
-}
-
 func run(t *testing.T, dir, name string, args ...string) {
 	t.Helper()
 	cmd := exec.Command(name, args...)

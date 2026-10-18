@@ -91,3 +91,141 @@ func TestDependentTasksSeeTheChangesTheyDependOn(t *testing.T) {
 		t.Fatalf("an independent probe got a worktree: %s", p.Worktree)
 	}
 }
+
+// A change that was recorded on a stacked base must say what it needs, not just look like a standalone proposal.
+func TestRecordedChangesCarryNeedsAndBaseRev(t *testing.T) {
+	dir := gitRepo(t)
+	c := New(logging.New(nil, logging.Error))
+	c.SetWorkspaceManager(workspace.New(dir))
+	c.SetRuntime(newDispatchRuntime(`{"status":"completed","summary":"done"}`, `{"status":"completed","summary":"done"}`))
+	s := c.CreateSession(dir, "stack", ModeBuild)
+	c.Settings.AutoVerify, c.Settings.AutoReview = false, false
+	c.Agents.Create(agent.Agent{Role: agent.Primary, Workspace: s.Workspace, Model: "mock/p"})
+	c.refreshSnapshot()
+
+	work := c.Graph.Add(taskgraph.Task{Title: "First", Role: string(agent.Worker), Workspace: dir, Model: "mock/t1", Difficulty: "medium"})
+	w := c.spawn(work, agent.Worker)
+	if err := os.WriteFile(filepath.Join(w.Worktree, "a.txt"), []byte("one\nfirst\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Graph.Update(work.ID, func(x *taskgraph.Task) { x.AgentID = w.ID }); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.execWorker(context.Background(), work, w); err != nil {
+		t.Fatal(err)
+	}
+	first := c.Changes()
+	if len(first) != 1 || first[0].Status != "proposed" {
+		t.Fatalf("first change = %+v", first)
+	}
+
+	next := c.Graph.Add(taskgraph.Task{Title: "Second", Role: string(agent.Worker), Workspace: dir, Model: "mock/t1", Difficulty: "easy", Depends: []string{work.ID}})
+	b := c.spawn(next, agent.Worker)
+	if err := os.WriteFile(filepath.Join(b.Worktree, "a.txt"), []byte("one\nfirst\nsecond\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Graph.Update(next.ID, func(x *taskgraph.Task) { x.AgentID = b.ID }); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.execWorker(context.Background(), next, b); err != nil {
+		t.Fatal(err)
+	}
+	var got Change
+	for _, ch := range c.Changes() {
+		if ch.AgentID == b.ID {
+			got = ch
+		}
+	}
+	if got.ID == "" {
+		t.Fatal("the dependent agent recorded no change")
+	}
+	if len(got.Needs) != 1 || got.Needs[0] != first[0].ID {
+		t.Fatalf("needs = %v, want [%s]", got.Needs, first[0].ID)
+	}
+	if len(got.Lineage) != 1 || got.Lineage[0].ID != first[0].ID || got.Lineage[0].PatchHash == "" {
+		t.Fatalf("lineage = %+v, want the parent with its patch hash", got.Lineage)
+	}
+	if got.BaseRev == "" {
+		t.Fatal("the change has no BaseRev")
+	}
+}
+
+// A worker spawned after an accept must be cut from the accepted file, not from an older base (R1b).
+func TestSpawnAfterAcceptSeesTheAcceptedFile(t *testing.T) {
+	dir := gitRepo(t)
+	c := New(logging.New(nil, logging.Error))
+	c.SetWorkspaceManager(workspace.New(dir))
+	s := c.CreateSession(dir, "r1b", ModeBuild)
+	c.Settings.AutoVerify, c.Settings.AutoReview = false, false
+	c.Agents.Create(agent.Agent{Role: agent.Primary, Workspace: s.Workspace, Model: "mock/p"})
+	c.refreshSnapshot()
+
+	early := c.spawn(c.Graph.Add(taskgraph.Task{Title: "Early", Role: string(agent.Worker), Workspace: dir, Model: "mock/t1", Difficulty: "easy"}), agent.Worker)
+	if _, err := os.Stat(early.Worktree); err != nil {
+		t.Fatal(err)
+	}
+	// The user accepts a change into the workspace while agents are running.
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("one\naccepted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	late := c.spawn(c.Graph.Add(taskgraph.Task{Title: "Late", Role: string(agent.Worker), Workspace: dir, Model: "mock/t1", Difficulty: "easy"}), agent.Worker)
+	if got, _ := os.ReadFile(filepath.Join(late.Worktree, "a.txt")); string(got) != "one\naccepted\n" {
+		t.Fatalf("the late agent saw %q, want the accepted file", got)
+	}
+}
+
+// A queued worker is re-cut onto a fresh base and re-stacks its recorded parent. A parent whose patch hash no longer
+// matches refuses the recut and keeps the old base.
+func TestRecutQueuedRestacksLineageOntoFreshBase(t *testing.T) {
+	dir := gitRepo(t)
+	c := New(logging.New(nil, logging.Error))
+	c.SetWorkspaceManager(workspace.New(dir))
+	c.SetRuntime(newDispatchRuntime(`{"status":"completed","summary":"done"}`))
+	s := c.CreateSession(dir, "recut", ModeBuild)
+	c.Settings.AutoVerify, c.Settings.AutoReview = false, false
+	c.Agents.Create(agent.Agent{Role: agent.Primary, Workspace: s.Workspace, Model: "mock/p"})
+	c.refreshSnapshot()
+
+	work := c.Graph.Add(taskgraph.Task{Title: "First", Role: string(agent.Worker), Workspace: dir, Model: "mock/t1", Difficulty: "medium"})
+	w := c.spawn(work, agent.Worker)
+	if err := os.WriteFile(filepath.Join(w.Worktree, "a.txt"), []byte("one\nfirst\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Graph.Update(work.ID, func(x *taskgraph.Task) { x.AgentID = w.ID }); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.execWorker(context.Background(), work, w); err != nil {
+		t.Fatal(err)
+	}
+	parent := c.Changes()[0]
+
+	next := c.Graph.Add(taskgraph.Task{Title: "Second", Role: string(agent.Worker), Workspace: dir, Model: "mock/t1", Difficulty: "easy", Depends: []string{work.ID}})
+	b := c.spawn(next, agent.Worker)
+	lineage := c.lineageOf(b.ID)
+	if len(lineage) != 1 || lineage[0].ID != parent.ID {
+		t.Fatalf("lineage = %+v, want the parent", lineage)
+	}
+
+	// The user writes a file after the queued worker was cut; the recut must pick it up.
+	if err := os.WriteFile(filepath.Join(dir, "c.txt"), []byte("accepted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c.setLineage(b.ID, []Dep{{ID: parent.ID, PatchHash: "stale"}})
+	c.recutQueued(next, b)
+	if _, err := os.Stat(filepath.Join(b.Worktree, "c.txt")); err == nil {
+		t.Fatal("a hash-mismatched parent must keep the old base")
+	}
+
+	c.setLineage(b.ID, lineage)
+	c.recutQueued(next, b)
+	if got, _ := os.ReadFile(filepath.Join(b.Worktree, "c.txt")); string(got) != "accepted\n" {
+		t.Fatalf("recut worktree c.txt = %q, want the fresh base", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(b.Worktree, "a.txt")); string(got) != "one\nfirst\n" {
+		t.Fatalf("recut worktree a.txt = %q, want the re-stacked parent", got)
+	}
+	if got := c.lineageOf(b.ID); len(got) != 1 || got[0].ID != parent.ID {
+		t.Fatalf("lineage after recut = %+v, want the parent", got)
+	}
+}

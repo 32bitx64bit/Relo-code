@@ -118,6 +118,19 @@ func (c *Coord) spawn(t taskgraph.Task, role agent.Role) agent.Agent {
 	}
 	var stackNotes []ctxeng.Item
 	if wsManager := c.workspace(); wsManager != nil {
+		// Refresh first: an accept that landed since the last request must be in the base the new agent is cut
+		// from, not only in the user's folder.
+		snap, err := wsManager.Snapshot()
+		if err != nil {
+			// Fail closed: do not cut a worktree from a base that could not be verified.
+			c.noticeSnapshotFailure(err)
+			c.Agents.Update(a.ID, func(x *agent.Agent) {
+				x.Status, x.Activity = agent.Failed, "Snapshot failed: "+err.Error()
+			})
+			a.Status, a.Activity = agent.Failed, "Snapshot failed: "+err.Error()
+			return a
+		}
+		c.noticeSnapshot(snap.HeadFallback, snap.UntrackedTruncated)
 		// An agent that builds on unaccepted work needs a copy of its own to hold it, even a read-only one.
 		stack := c.stackParts(t)
 		isolated := mutating || len(stack) > 0
@@ -134,7 +147,9 @@ func (c *Coord) spawn(t taskgraph.Task, role agent.Role) agent.Agent {
 			if tree.Direct {
 				c.noticeDirectMode()
 			} else if len(stack) > 0 {
-				stackNotes = c.stackInto(wsManager, a, stack)
+				var deps []Dep
+				stackNotes, deps = c.stackInto(wsManager, a, stack)
+				c.setLineage(a.ID, deps)
 			}
 		}
 	}
@@ -177,6 +192,41 @@ func (c *Coord) noticeDirectMode() {
 	c.directNotified = c.sess.ID
 	c.mu.Unlock()
 	c.chat("system", "Workspace is not a Git repository. Changes are applied directly with no isolation or undo. Run `git init` to enable isolated worktrees.", "")
+}
+
+// noticeSnapshot tells the user once per session when the base an agent was cut from is not the whole truth:
+// the snapshot fell back to HEAD, or it left out untracked files above the cap.
+func (c *Coord) noticeSnapshot(headFallback, truncated bool) {
+	if headFallback {
+		c.snapshotNoticeOnce("fallback", "Relo could not record your working tree, so this agent was cut from HEAD and does not see your uncommitted edits.")
+	}
+	if truncated {
+		c.snapshotNoticeOnce("truncated", "Relo found more than 2000 untracked files and recorded only tracked files. This agent does not see the extra new files.")
+	}
+}
+
+// noticeSnapshotFailure reports the fail-closed path: no agent runs on a base that could not be verified.
+func (c *Coord) noticeSnapshotFailure(err error) {
+	c.snapshotNoticeOnce("failed", "Relo could not record a consistent snapshot of your working tree after 3 attempts, so no agent was started against it. Nothing was changed. "+err.Error())
+}
+
+func (c *Coord) snapshotNoticeOnce(kind, text string) {
+	c.mu.Lock()
+	if c.sess == nil {
+		c.mu.Unlock()
+		return
+	}
+	key := kind + ":" + c.sess.ID
+	if c.snapshotNoticed == nil {
+		c.snapshotNoticed = map[string]bool{}
+	}
+	if c.snapshotNoticed[key] {
+		c.mu.Unlock()
+		return
+	}
+	c.snapshotNoticed[key] = true
+	c.mu.Unlock()
+	c.chat("system", text, "")
 }
 
 func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent) error {
@@ -321,9 +371,6 @@ func (c *Coord) workerReport(ctx context.Context, a agent.Agent, parts prompt.Pa
 	return rep, nil
 }
 
-// maxRepairRounds is how many times a worker is sent back, in its own session and worktree, to fix failing checks.
-const maxRepairRounds = 2
-
 // verifyOutcome is what the project's checks said about a worker's result.
 type verifyOutcome struct {
 	ran     bool
@@ -341,7 +388,8 @@ func (c *Coord) shouldVerify(a agent.Agent, rep RawReport) bool {
 }
 
 // verifyAndRepair runs the checks and, when they fail because of the agent's change, sends the agent back with the
-// failure output instead of throwing the work away and starting a fresh (and pricier) attempt.
+// failure output instead of throwing the work away and starting a fresh (and pricier) attempt. It returns when the
+// checks pass or the run is cancelled.
 func (c *Coord) verifyAndRepair(ctx context.Context, a agent.Agent, parts prompt.Parts, rep RawReport) (RawReport, verifyOutcome, error) {
 	var out verifyOutcome
 	if len(c.changesFor(a, rep)) == 0 {
@@ -354,12 +402,12 @@ func (c *Coord) verifyAndRepair(ctx context.Context, a agent.Agent, parts prompt
 			return rep, out, ctx.Err()
 		}
 		out.ran, out.passed, out.failure = true, passed, failure
-		if passed || out.repairs >= maxRepairRounds {
+		if passed {
 			return rep, out, nil
 		}
 		out.repairs++
 		c.Agents.Update(a.ID, func(x *agent.Agent) {
-			x.Status, x.Phase, x.Activity = agent.Running, "model", fmt.Sprintf("Fixing failed checks (%d/%d)", out.repairs, maxRepairRounds)
+			x.Status, x.Phase, x.Activity = agent.Running, "model", fmt.Sprintf("Fixing failed checks (attempt %d)", out.repairs)
 		})
 		body, err := c.runAgent(ctx, a, parts, "The project's checks failed on your change:\n\n"+failure+"\n\nFix the cause in your worktree, then return the worker report JSON again.", prompt.ReportSchema)
 		if err != nil {
@@ -762,9 +810,21 @@ func (c *Coord) changesFor(a agent.Agent, rep RawReport) []Change {
 		c.logWarn("list worktree changes", err)
 		return nil
 	}
+	baseRev := ""
+	if tree, ok := ws.Tree(a.ID); ok {
+		baseRev = tree.Base
+	}
+	lineage := c.lineageOf(a.ID)
+	var needs []string
+	if len(lineage) > 0 {
+		needs = make([]string, 0, len(lineage))
+		for _, d := range lineage {
+			needs = append(needs, d.ID)
+		}
+	}
 	out := make([]Change, 0, len(found))
 	for _, f := range found {
-		out = append(out, Change{ID: id.New("chg"), AgentID: a.ID, Path: f.Path, Kind: f.Kind, Added: f.Added, Deleted: f.Deleted, Status: "proposed", Worktree: a.Worktree})
+		out = append(out, Change{ID: id.New("chg"), AgentID: a.ID, Path: f.Path, Kind: f.Kind, Added: f.Added, Deleted: f.Deleted, Status: "proposed", Worktree: a.Worktree, BaseRev: baseRev, Needs: needs, Lineage: lineage})
 	}
 	return out
 }

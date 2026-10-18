@@ -297,6 +297,208 @@ func TestAcceptAllMergesSamePathChangesFromDifferentAgents(t *testing.T) {
 	}
 }
 
+func TestAcceptWritesJournalAndUndoRestoresBytes(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n"})
+	ch := proposeChange(t, core, dir, "a.txt", func(p string) {
+		_ = os.WriteFile(p, []byte("agent\n"), 0o644)
+	})
+	if _, err := core.acceptChange(ch.ID); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "agent\n" {
+		t.Fatalf("accepted file = %q", got)
+	}
+	if _, _, err := core.Coord.WS.JournalEntryFor(ch.ID); err != nil {
+		t.Fatalf("accepted change has no journal entry: %v", err)
+	}
+	if _, err := core.undoChange(ch.ID); err != nil {
+		t.Fatalf("undo: %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "one\n" {
+		t.Fatalf("undo restored %q, want the pre-image", got)
+	}
+	if now, _ := core.Coord.FindChange(ch.ID); now.Status != "rejected" {
+		t.Fatalf("status after undo = %q", now.Status)
+	}
+}
+
+func TestUndoRefusesAfterTheUserEditsTheFile(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n"})
+	ch := proposeChange(t, core, dir, "a.txt", func(p string) {
+		_ = os.WriteFile(p, []byte("agent\n"), 0o644)
+	})
+	if _, err := core.acceptChange(ch.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("user\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.undoChange(ch.ID); err == nil {
+		t.Fatal("undo after a user edit was not refused")
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "user\n" {
+		t.Fatalf("refused undo touched the file: %q", got)
+	}
+}
+
+func TestDirtyPathIsRefusedAndOtherPathsStillLand(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n", "b.txt": "uno\n"})
+	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
+	tree, err := core.Coord.WS.EnsureTree("agent_dirty", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(tree.Path, "a.txt"), []byte("agent a\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(tree.Path, "b.txt"), []byte("agent b\n"), 0o644)
+	s := core.Coord.Current()
+	s.Changes = []orchestrator.Change{
+		{ID: "d1", AgentID: "agent_dirty", Path: "a.txt", Status: "proposed", Worktree: tree.Path},
+		{ID: "d2", AgentID: "agent_dirty", Path: "b.txt", Status: "proposed", Worktree: tree.Path},
+	}
+	core.Coord.Restore(s)
+
+	core.setDirtyPaths([]string{"a.txt"})
+	if _, err := core.acceptChange("d1"); err == nil {
+		t.Fatal("a dirty path was accepted")
+	}
+	now, _ := core.Coord.FindChange("d1")
+	if now.Status != "proposed" || now.Integration == nil || now.Integration.Kind != "unsaved_buffer" {
+		t.Fatalf("dirty change = %+v", now)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "one\n" {
+		t.Fatalf("dirty path was written: %q", got)
+	}
+
+	res, err := core.decideAll(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := res.(map[string]any)
+	if m["done"] != 1 || len(m["failed"].([]bulkFailure)) != 1 {
+		t.Fatalf("bulk result = %+v", m)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "b.txt")); string(got) != "agent b\n" {
+		t.Fatalf("clean path did not land: %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "one\n" {
+		t.Fatalf("dirty path was written by accept-all: %q", got)
+	}
+}
+
+func TestAutoApplySkipsADirtyPath(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "base\n"})
+	ch := proposeChange(t, core, dir, "a.txt", func(p string) {
+		_ = os.WriteFile(p, []byte("agent\n"), 0o644)
+	})
+	core.setDirtyPaths([]string{"a.txt"})
+	core.applySettings(map[string]any{"autoApply": true})
+	waitAutoApply(t, core)
+	now, _ := core.Coord.FindChange(ch.ID)
+	if now.Status != "proposed" {
+		t.Fatalf("auto-apply accepted a dirty path: %+v", now)
+	}
+	if now.Integration == nil || now.Integration.Kind != "unsaved_buffer" {
+		t.Fatalf("dirty auto-apply state = %+v", now.Integration)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "base\n" {
+		t.Fatalf("dirty path was written: %q", got)
+	}
+}
+
+func TestAutoApplyLandsCleanPathBesideADirtyOne(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "base\n", "b.txt": "uno\n"})
+	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
+	tree, err := core.Coord.WS.EnsureTree("agent_t1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(tree.Path, "a.txt"), []byte("agent a\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(tree.Path, "b.txt"), []byte("agent b\n"), 0o644)
+	s := core.Coord.Current()
+	s.Changes = []orchestrator.Change{
+		{ID: "dirty", AgentID: "agent_t1", Path: "a.txt", Status: "proposed", Worktree: tree.Path},
+		{ID: "clean", AgentID: "agent_t1", Path: "b.txt", Status: "proposed", Worktree: tree.Path},
+	}
+	core.Coord.Restore(s)
+	core.setDirtyPaths([]string{"a.txt"})
+	core.applySettings(map[string]any{"autoApply": true})
+	waitAutoApply(t, core)
+	if now, _ := core.Coord.FindChange("dirty"); now.Status != "proposed" || now.Integration == nil || now.Integration.Kind != "unsaved_buffer" {
+		t.Fatalf("dirty change = %+v", now)
+	}
+	if now, _ := core.Coord.FindChange("clean"); now.Status != "accepted" {
+		t.Fatalf("clean change did not land: %+v", now)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "base\n" {
+		t.Fatalf("dirty path was written: %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "b.txt")); string(got) != "agent b\n" {
+		t.Fatalf("clean path not written: %q", got)
+	}
+}
+
+// A journal that cannot be written fails an overwrite closed, but a create still succeeds because it cannot lose
+// user bytes.
+func TestJournalFailureFailsOverwriteClosedAndAllowsCreate(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n"})
+	ch := proposeChange(t, core, dir, "a.txt", func(p string) {
+		_ = os.WriteFile(p, []byte("agent\n"), 0o644)
+	})
+	refs := filepath.Join(dir, ".git", "refs", "relo")
+	if err := os.MkdirAll(refs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(refs, "journal"), []byte("not a directory\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.acceptChange(ch.ID); err == nil {
+		t.Fatal("an overwrite whose journal failed was accepted")
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "one\n" {
+		t.Fatalf("failed journal still wrote the file: %q", got)
+	}
+
+	tree, err := core.Coord.WS.EnsureTree(ch.AgentID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree.Path, "new.txt"), []byte("fresh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := core.Coord.Current()
+	s.Changes = append(s.Changes, orchestrator.Change{ID: "created", AgentID: ch.AgentID, Path: "new.txt", Status: "proposed", Worktree: tree.Path})
+	core.Coord.Restore(s)
+	if _, err := core.acceptChange("created"); err != nil {
+		t.Fatalf("a create with a failed journal was refused: %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "new.txt")); string(got) != "fresh\n" {
+		t.Fatalf("created file = %q", got)
+	}
+}
+
+func TestStalePreviewWritesNothing(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n"})
+	ch := proposeChange(t, core, dir, "a.txt", func(p string) {
+		_ = os.WriteFile(p, []byte("agent\n"), 0o644)
+	})
+	analysis, err := core.analyzeChange(ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.acceptChangeExpect(ch.ID, "not-the-fingerprint"); err == nil {
+		t.Fatal("a stale preview was accepted")
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "one\n" {
+		t.Fatalf("stale preview wrote the file: %q", got)
+	}
+	if _, err := core.acceptChangeExpect(ch.ID, analysis.Fingerprint); err != nil {
+		t.Fatalf("fresh preview refused: %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "agent\n" {
+		t.Fatalf("fresh accept = %q", got)
+	}
+}
+
 func TestSessionHistoryNewOpenDelete(t *testing.T) {
 	core, dir := newGitCore(t, map[string]string{"a.txt": "x\n"})
 	core.Coord.CreateSession(dir, "first goal", orchestrator.ModeBuild)
@@ -339,5 +541,33 @@ func TestSessionHistoryNewOpenDelete(t *testing.T) {
 	}
 	if cur := core.Coord.Current(); cur == nil || cur.ID == firstID {
 		t.Fatalf("deleting the open session must leave a fresh one, got %+v", cur)
+	}
+}
+
+// An accept records what it did to the file, so a later conflict can be attributed to a landed change.
+func TestAcceptsRecordLandedAction(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n", "b.txt": "one\n"})
+	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
+	s := core.Coord.Current()
+	for _, name := range []string{"a.txt", "b.txt"} {
+		agentID := "agent-" + name
+		tree, err := core.Coord.WS.EnsureTree(agentID, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(tree.Path, name), []byte("changed\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		s.Changes = append(s.Changes, orchestrator.Change{ID: "chg-" + name, AgentID: agentID, Path: name, Kind: "modified", Status: "proposed", Worktree: tree.Path})
+	}
+	core.Coord.Restore(s)
+	if _, err := core.acceptAll(false); err != nil {
+		t.Fatalf("acceptAll: %v", err)
+	}
+	for _, name := range []string{"a.txt", "b.txt"} {
+		got, _ := core.Coord.FindChange("chg-" + name)
+		if got.Status != "accepted" || got.Landed != "updated" {
+			t.Fatalf("%s: status=%q landed=%q, want accepted/updated", name, got.Status, got.Landed)
+		}
 	}
 }

@@ -44,6 +44,9 @@ export const COMMAND_ALLOWLIST = new Set<string>([
   "relo.changes.accept",
   "relo.changes.reject",
   "relo.changes.diff",
+  "relo.changes.resolveAgent",
+  "relo.changes.resolveMine",
+  "relo.changes.resolveHead",
   "relo.changes.acceptAll",
   "relo.changes.rejectAll",
   "relo.changes.resolveConflicts",
@@ -58,6 +61,9 @@ export const ID_COMMANDS = new Set<string>([
   "relo.changes.accept",
   "relo.changes.reject",
   "relo.changes.diff",
+  "relo.changes.resolveAgent",
+  "relo.changes.resolveMine",
+  "relo.changes.resolveHead",
 ]);
 
 const SESSION_ID_RE = /^[A-Za-z0-9_.-]{1,200}$/;

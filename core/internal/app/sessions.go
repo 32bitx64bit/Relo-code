@@ -17,6 +17,7 @@ import (
 	"github.com/relocode/relo/internal/integration"
 	"github.com/relocode/relo/internal/ipc"
 	"github.com/relocode/relo/internal/orchestrator"
+	"github.com/relocode/relo/internal/workspace"
 )
 
 // persistDelay is how long state changes are batched before they are written to the database.
@@ -283,8 +284,13 @@ func (a *App) changeDiff(id string) (any, error) {
 	if !filepath.IsLocal(filepath.FromSlash(ch.Path)) {
 		return nil, ipc.Fail{C: "invalid_change", M: "change path is not inside the workspace"}
 	}
+	a.projectPaths([]string{ch.Path})
+	ch, _ = a.Coord.FindChange(id)
 	rel := filepath.FromSlash(ch.Path)
 	out := map[string]any{"id": ch.ID, "path": ch.Path, "kind": ch.Kind, "status": ch.Status}
+	if ch.Integration != nil {
+		out["integration"] = ch.Integration
+	}
 	var before, after string
 	var hasBefore, hasAfter, binary, truncated bool
 	switch ch.Status {
@@ -358,36 +364,180 @@ func (a *App) settle(agentID string) {
 }
 
 func (a *App) acceptChange(id string) (any, error) {
-	a.decisionMu.Lock()
-	defer a.decisionMu.Unlock()
+	return a.acceptChangeExpect(id, "")
+}
 
+// acceptChangeExpect applies a change. When expect is non-empty it must equal the fingerprint of the current
+// projection; otherwise a stale preview is refused and nothing is written.
+func (a *App) acceptChangeExpect(id, expect string) (any, error) {
+	a.decisionMu.Lock()
+	out, err, path := a.acceptChangeLocked(id, expect)
+	a.decisionMu.Unlock()
+	// E1: every other proposal on the written path gets a fresh projection outside decisionMu.
+	if err == nil && path != "" {
+		a.projectPaths([]string{path})
+	}
+	return out, err
+}
+
+func (a *App) acceptChangeLocked(id, expect string) (any, error, string) {
 	ch, ok := a.Coord.FindChange(id)
 	if !ok {
-		return nil, ipc.Fail{C: "not_found", M: "change not found"}
+		return nil, ipc.Fail{C: "not_found", M: "change not found"}, ""
 	}
 	switch ch.Status {
 	case "applied", "accepted":
-		return map[string]any{"change": ch}, nil // direct mode edits are already in place
+		return map[string]any{"change": ch}, nil, "" // direct mode edits are already in place
 	case "rejected":
-		return nil, ipc.Fail{C: "invalid_state", M: "this change was rejected"}
+		return nil, ipc.Fail{C: "invalid_state", M: "this change was rejected"}, ""
 	case "proposed":
 	default:
-		return nil, ipc.Fail{C: "invalid_state", M: "this change is not waiting for a decision"}
+		return nil, ipc.Fail{C: "invalid_state", M: "this change is not waiting for a decision"}, ""
+	}
+	if expect != "" {
+		analysis, err := a.analyzeChange(ch)
+		if err != nil {
+			return nil, err, ""
+		}
+		if analysis.Fingerprint != expect {
+			return nil, ipc.Fail{C: "stale_preview", M: "the file changed after the preview was made, so nothing was written; open the diff again and retry"}, ""
+		}
 	}
 	outcome, err := a.mergeChange(ch)
 	if err != nil {
-		return nil, err
+		return nil, err, ""
 	}
-	updated, _ := a.Coord.UpdateChange(id, func(c *orchestrator.Change) { c.Status, c.Conflict, c.Resolving = "accepted", "", false })
+	updated, _ := a.Coord.UpdateChange(id, func(c *orchestrator.Change) {
+		c.Status, c.Conflict, c.Resolving, c.Landed = "accepted", "", false, outcome.Action
+	})
 	a.settle(ch.AgentID)
 	a.persist()
-	return map[string]any{"change": updated, "integration": outcome}, nil
+	return map[string]any{"change": updated, "integration": outcome}, nil, ch.Path
+}
+
+// resolveChange is the explicit resolution action for one change. head sends it to the head agent, mine rejects it
+// and keeps the agent blob, and agent takes the agent's version through the journal.
+func (a *App) resolveChange(id, choice string) (any, error) {
+	switch choice {
+	case "head":
+		ch, ok := a.Coord.FindChange(id)
+		if !ok {
+			return nil, ipc.Fail{C: "not_found", M: "change not found"}
+		}
+		if ch.Status != "proposed" {
+			return nil, ipc.Fail{C: "invalid_state", M: "this change is not waiting for a decision"}
+		}
+		a.Coord.UpdateChange(id, func(c *orchestrator.Change) { c.Resolving = true })
+		a.sendHead(a.Coord.SessionID(), a.conflictPrompt([]orchestrator.Change{ch}))
+		a.persist()
+		return map[string]any{"change": ch, "choice": "head"}, nil
+	case "mine":
+		return a.rejectChange(id)
+	case "agent":
+		return a.takeAgentChange(id)
+	default:
+		return nil, ipc.Fail{C: "invalid_choice", M: "choice must be agent, mine or head"}
+	}
+}
+
+// takeAgentChange writes the agent's version of a proposed change, journaling the user's pre-image first. It is
+// only reachable through an explicit per-file choice.
+func (a *App) takeAgentChange(id string) (any, error) {
+	a.decisionMu.Lock()
+	out, err, path := a.takeAgentChangeLocked(id)
+	a.decisionMu.Unlock()
+	if err == nil && path != "" {
+		a.projectPaths([]string{path})
+	}
+	return out, err
+}
+
+func (a *App) takeAgentChangeLocked(id string) (any, error, string) {
+	ch, ok := a.Coord.FindChange(id)
+	if !ok {
+		return nil, ipc.Fail{C: "not_found", M: "change not found"}, ""
+	}
+	if ch.Status != "proposed" {
+		return nil, ipc.Fail{C: "invalid_state", M: "this change is not waiting for a decision"}, ""
+	}
+	if !a.ownWorktree(ch.Worktree) || ch.Path == "" {
+		return nil, ipc.Fail{C: "invalid_change", M: "change lacks a worktree or path"}, ""
+	}
+	if a.pathDirty(ch.Path) {
+		a.blockChange(ch.ID, "unsaved_buffer", "the file has unsaved changes in the editor; save it and try again")
+		return nil, ipc.Fail{C: "unsaved_buffer", M: ch.Path + ": the file has unsaved changes in the editor, so nothing was written"}, ""
+	}
+	journal := func(path string, pre []byte, preExists bool, post []byte, postExists bool) error {
+		_, jerr := a.Coord.WS.JournalChange(ch.ID, []workspace.JournalWrite{{Path: path, Post: post, PostExists: postExists}})
+		if jerr == nil {
+			return nil
+		}
+		if !preExists {
+			a.Log.Warn("journal create", map[string]any{"changeId": ch.ID, "path": path, "error": jerr.Error()})
+			return nil
+		}
+		a.blockChange(ch.ID, "journal_failed", "the recovery journal could not be written, so nothing was changed: "+jerr.Error())
+		return ipc.Fail{C: "journal_failed", M: path + ": the recovery journal could not be written, so nothing was changed: " + jerr.Error()}
+	}
+	outcome, err := integration.TakeWithHook(a.Cfg.Workspace, ch.Worktree, ch.Path, journal)
+	if err != nil {
+		var fail ipc.Fail
+		if errors.As(err, &fail) {
+			return nil, fail, ""
+		}
+		return nil, ipc.Fail{C: "integration_failed", M: fmt.Sprintf("%s: %v", ch.Path, err)}, ""
+	}
+	now := time.Now().UnixMilli()
+	updated, _ := a.Coord.UpdateChange(id, func(c *orchestrator.Change) {
+		c.Status, c.Conflict, c.Resolving, c.Landed = "accepted", "", false, outcome.Action
+		c.Integration = &orchestrator.Integration{State: "clean", CheckedAt: now}
+	})
+	a.settle(ch.AgentID)
+	a.persist()
+	return map[string]any{"change": updated, "integration": outcome}, nil, ch.Path
+}
+
+// undoChange restores the journal pre-image of an accepted change when every touched path still holds the bytes
+// Relo wrote. It writes nothing when any path changed since then.
+func (a *App) undoChange(id string) (any, error) {
+	a.decisionMu.Lock()
+	out, err, restored := a.undoChangeLocked(id)
+	a.decisionMu.Unlock()
+	if len(restored) > 0 {
+		a.projectPaths(restored)
+	}
+	return out, err
+}
+
+func (a *App) undoChangeLocked(id string) (any, error, []string) {
+	ch, ok := a.Coord.FindChange(id)
+	if !ok {
+		return nil, ipc.Fail{C: "not_found", M: "change not found"}, nil
+	}
+	if ch.Status != "accepted" {
+		return nil, ipc.Fail{C: "invalid_state", M: "only an accepted change has a journal entry to undo"}, nil
+	}
+	res, err := a.Coord.WS.UndoChange(id)
+	if err != nil {
+		return nil, ipc.Fail{C: "undo_refused", M: err.Error()}, nil
+	}
+	updated, _ := a.Coord.UpdateChange(id, func(c *orchestrator.Change) {
+		c.Status, c.Conflict, c.Resolving, c.Landed = "rejected", "", false, ""
+	})
+	a.persist()
+	return map[string]any{"change": updated, "undo": res}, nil, append([]string(nil), res.Restored...)
 }
 
 // mergeChange three-way merges one proposed change into the workspace. It does not change the status or persist.
+// The write is a compare-and-swap with a journal entry holding the user's pre-image, and an unsaved editor buffer
+// blocks it before anything is read for writing.
 func (a *App) mergeChange(ch orchestrator.Change) (integration.Outcome, error) {
 	if !a.ownWorktree(ch.Worktree) || ch.Path == "" {
 		return integration.Outcome{}, ipc.Fail{C: "invalid_change", M: "change lacks a worktree or path"}
+	}
+	if a.pathDirty(ch.Path) {
+		a.blockChange(ch.ID, "unsaved_buffer", "the file has unsaved changes in the editor; save it and try again")
+		return integration.Outcome{}, ipc.Fail{C: "unsaved_buffer", M: ch.Path + ": the file has unsaved changes in the editor, so nothing was written"}
 	}
 	if _, err := os.Stat(ch.Worktree); err != nil {
 		return integration.Outcome{}, ipc.Fail{C: "not_found", M: "the agent's worktree no longer exists, so this change cannot be applied"}
@@ -400,15 +550,69 @@ func (a *App) mergeChange(ch orchestrator.Change) (integration.Outcome, error) {
 	if err != nil {
 		return integration.Outcome{}, ipc.Fail{C: "integration_failed", M: err.Error()}
 	}
-	outcome, err := integration.Merge(a.Cfg.Workspace, tree.Path, ch.Path, base, hadBase)
+	journal := func(path string, pre []byte, preExists bool, post []byte, postExists bool) error {
+		_, jerr := a.Coord.WS.JournalChange(ch.ID, []workspace.JournalWrite{{Path: path, Post: post, PostExists: postExists}})
+		if jerr == nil {
+			return nil
+		}
+		// Creating a path cannot lose user bytes, so a journal failure there is reported but not fatal.
+		if !preExists {
+			a.Log.Warn("journal create", map[string]any{"changeId": ch.ID, "path": path, "error": jerr.Error()})
+			return nil
+		}
+		a.blockChange(ch.ID, "journal_failed", "the recovery journal could not be written, so nothing was changed: "+jerr.Error())
+		return ipc.Fail{C: "journal_failed", M: path + ": the recovery journal could not be written, so nothing was changed: " + jerr.Error()}
+	}
+	outcome, err := integration.MergeWithHook(a.Cfg.Workspace, tree.Path, ch.Path, base, hadBase, journal)
 	if err != nil {
 		var ce integration.ConflictError
-		if errors.As(err, &ce) {
-			a.Coord.UpdateChange(ch.ID, func(c *orchestrator.Change) { c.Conflict = ce.Report.Reason })
+		switch {
+		case errors.As(err, &ce):
+			integ := &orchestrator.Integration{State: "conflicted", Kind: orchestrator.LegacyConflictKind(ce.Report.Reason), Reason: ce.Report.Reason, CheckedAt: time.Now().UnixMilli()}
+			// Re-run the non-writing analysis for the exact kind, hunks and workspace blob; the merge already
+			// refused, so this is a rare path and adds no write.
+			if analysis, aerr := a.analyzeChange(ch); aerr == nil {
+				integ.Kind, integ.Ours, integ.Hunks = analysis.Kind, analysis.Ours, integrationHunks(analysis.Hunks)
+			}
+			a.Coord.UpdateChange(ch.ID, func(c *orchestrator.Change) { c.Conflict, c.Integration = ce.Report.Reason, integ })
+		case errors.As(err, new(integration.WorkspaceChangedError)):
+			a.blockChange(ch.ID, "workspace_changed", err.Error())
+			return integration.Outcome{}, ipc.Fail{C: "workspace_changed", M: ch.Path + ": the file kept changing while the change was being applied, so nothing was written"}
+		case errors.As(err, new(integration.ConcurrentWriteError)):
+			a.blockChange(ch.ID, "concurrent_write", err.Error())
+			return integration.Outcome{}, ipc.Fail{C: "concurrent_write", M: ch.Path + ": another program wrote the file while the change was being applied; use Undo to restore your bytes"}
+		}
+		var fail ipc.Fail
+		if errors.As(err, &fail) {
+			return integration.Outcome{}, fail
 		}
 		return integration.Outcome{}, conflictFail(err, ch.Path)
 	}
+	if outcome.Action == "unchanged" {
+		// Nothing was written, but every accept still gets an undo record; restoring the same bytes is a no-op.
+		data, rerr := os.ReadFile(filepath.Join(a.Cfg.Workspace, filepath.FromSlash(ch.Path)))
+		if rerr == nil || os.IsNotExist(rerr) {
+			write := workspace.JournalWrite{Path: ch.Path, Post: data, PostExists: rerr == nil}
+			if _, jerr := a.Coord.WS.JournalChange(ch.ID, []workspace.JournalWrite{write}); jerr != nil {
+				a.Log.Warn("journal unchanged", map[string]any{"changeId": ch.ID, "path": ch.Path, "error": jerr.Error()})
+			}
+		}
+	}
+	a.Coord.UpdateChange(ch.ID, func(c *orchestrator.Change) {
+		if c.Integration == nil {
+			c.Integration = &orchestrator.Integration{}
+		}
+		c.Integration.State, c.Integration.Kind, c.Integration.Reason, c.Integration.CheckedAt = "clean", "", "", time.Now().UnixMilli()
+	})
 	return outcome, nil
+}
+
+// blockChange records a write-blocking state without changing the change's status.
+func (a *App) blockChange(id, kind, reason string) {
+	a.Coord.UpdateChange(id, func(c *orchestrator.Change) {
+		c.Conflict = reason
+		c.Integration = &orchestrator.Integration{State: "blocked", Kind: kind, Reason: reason, CheckedAt: time.Now().UnixMilli()}
+	})
 }
 
 func (a *App) rejectChange(id string) (any, error) {
@@ -439,6 +643,9 @@ func (a *App) rejectChangeLocked(id string) (any, error) {
 	// The worktree is separate from the workspace, so rejecting never touches the user's files. Discarding the file
 	// there only keeps the agent's tree consistent; if the tree is already gone there is nothing left to do.
 	if _, err := os.Stat(ch.Worktree); err == nil && a.ownWorktree(ch.Worktree) {
+		if err := a.Coord.WS.KeepChangeBlob(ch.ID, ch.Worktree, ch.Path); err != nil {
+			a.Log.Warn("keep rejected agent blob", map[string]any{"changeId": ch.ID, "path": ch.Path, "error": err.Error()})
+		}
 		if tree, terr := a.Coord.WS.EnsureTree(ch.AgentID, false); terr == nil && tree.Path == ch.Worktree {
 			if err := a.Coord.WS.Discard(ch.AgentID, ch.Path); err != nil {
 				a.Log.Warn("discard worktree file", map[string]any{"agentId": ch.AgentID, "path": ch.Path, "error": err.Error()})
@@ -469,16 +676,44 @@ func (a *App) decideAll(accept bool) (any, error) {
 
 func (a *App) acceptAll(auto bool) (any, error) {
 	a.decisionMu.Lock()
-	defer a.decisionMu.Unlock()
+	out, err, paths := a.acceptAllLocked(auto)
+	a.decisionMu.Unlock()
+	if len(paths) > 0 {
+		a.projectPaths(paths)
+	}
+	return out, err
+}
 
+func (a *App) acceptAllLocked(auto bool) (any, error, []string) {
 	var waiting []orchestrator.Change
 	for _, ch := range a.Coord.Changes() {
 		if ch.Status == "proposed" && (!auto || (a.autoApply.Load() && autoEligible(ch))) {
 			waiting = append(waiting, ch)
 		}
 	}
+	// With lazy projection, a change with no projection (for example a row written before P3) is projected before
+	// any member of the batch is written. Its fresh state then decides whether it may be merged at all.
+	if a.lazy.Load() {
+		var paths []string
+		seen := map[string]bool{}
+		for _, ch := range waiting {
+			if ch.Integration == nil && ch.Path != "" && !seen[ch.Path] {
+				seen[ch.Path] = true
+				paths = append(paths, ch.Path)
+			}
+		}
+		if len(paths) > 0 {
+			a.projectPaths(paths)
+			for i := range waiting {
+				if now, ok := a.Coord.FindChange(waiting[i].ID); ok {
+					waiting[i] = now
+				}
+			}
+		}
+	}
 	errs := make([]error, len(waiting))
 	skipped := make([]bool, len(waiting))
+	actions := make([]string, len(waiting))
 	groups := map[string][]int{}
 	var order []string
 	for i, ch := range waiting {
@@ -510,7 +745,24 @@ func (a *App) acceptAll(auto bool) (any, error) {
 					errs[i] = ipc.Fail{C: "invalid_state", M: "this change is not waiting for a decision"}
 					continue
 				}
-				_, errs[i] = a.mergeChange(current)
+				if auto && a.pathDirty(current.Path) {
+					a.blockChange(current.ID, "unsaved_buffer", "the file has unsaved changes in the editor; save it and try again")
+					errs[i] = ipc.Fail{C: "unsaved_buffer", M: current.Path + ": the file has unsaved changes in the editor, so nothing was written"}
+					continue
+				}
+				// With lazy projection, accept-all writes only changes that already project clean; a conflicted,
+				// blocked or not-yet-projected member is reported and left proposed.
+				if a.lazy.Load() && (current.Integration == nil || current.Integration.State != "clean") {
+					reason := "the change could not be projected"
+					if current.Integration != nil && current.Integration.Reason != "" {
+						reason = current.Integration.Reason
+					}
+					errs[i] = ipc.Fail{C: "integration_conflict", M: current.Path + ": " + reason + ". Nothing was changed."}
+					continue
+				}
+				var outcome integration.Outcome
+				outcome, errs[i] = a.mergeChange(current)
+				actions[i] = outcome.Action
 			}
 		}(groups[key])
 	}
@@ -519,6 +771,8 @@ func (a *App) acceptAll(auto bool) (any, error) {
 	done := 0
 	failed := []bulkFailure{}
 	var accepted []string
+	var acceptedPaths []string
+	landed := map[string][]string{}
 	agents := map[string]bool{}
 	for i, ch := range waiting {
 		if skipped[i] {
@@ -532,17 +786,24 @@ func (a *App) acceptAll(auto bool) (any, error) {
 			continue
 		}
 		accepted = append(accepted, ch.ID)
+		acceptedPaths = append(acceptedPaths, ch.Path)
+		if actions[i] != "" {
+			landed[actions[i]] = append(landed[actions[i]], ch.ID)
+		}
 		agents[ch.AgentID] = true
 		done++
 	}
 	a.Coord.UpdateChanges(accepted, func(c *orchestrator.Change) { c.Status, c.Conflict, c.Resolving = "accepted", "", false })
+	for action, ids := range landed {
+		a.Coord.UpdateChanges(ids, func(c *orchestrator.Change) { c.Landed = action })
+	}
 	for agentID := range agents {
 		a.settle(agentID)
 	}
 	if done > 0 || (auto && len(failed) > 0) {
 		a.persist()
 	}
-	return map[string]any{"done": done, "failed": failed, "changes": a.Coord.Changes()}, nil
+	return map[string]any{"done": done, "failed": failed, "changes": a.Coord.Changes()}, nil, acceptedPaths
 }
 
 func (a *App) rejectAll() (any, error) {

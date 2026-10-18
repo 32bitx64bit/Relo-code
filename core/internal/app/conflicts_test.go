@@ -65,9 +65,8 @@ func TestResolveConflictsRealConflictPromptsHead(t *testing.T) {
 	if now.Status != "proposed" || now.Conflict == "" {
 		t.Fatalf("real conflict: status=%q conflict=%q", now.Status, now.Conflict)
 	}
-	sid := core.Coord.SessionID()
-	if ids := core.conflictSet[sid]["a.txt"]; len(ids) != 1 || ids[0] != ch.ID {
-		t.Fatalf("conflictSet = %v", core.conflictSet)
+	if now.Integration == nil || now.Integration.State != "conflicted" {
+		t.Fatalf("integration = %+v, want conflicted", now.Integration)
 	}
 	if cur, _ := core.Coord.FindChange(ch.ID); !cur.Resolving {
 		t.Fatalf("conflicted change not marked resolving")
@@ -199,8 +198,8 @@ func TestResolveConflictsRechecksStoredReason(t *testing.T) {
 		t.Fatalf("clean recheck result = %+v", m)
 	}
 	now, _ := core.Coord.FindChange(ch.ID)
-	if now.Status != "proposed" || now.Conflict != "" || now.Resolving || len(core.conflictSet) != 0 {
-		t.Fatalf("clean recheck kept conflict state: change=%+v conflictSet=%v", now, core.conflictSet)
+	if now.Status != "proposed" || now.Conflict != "" || now.Resolving || now.Integration == nil || now.Integration.State != "clean" {
+		t.Fatalf("clean recheck kept conflict state: change=%+v", now)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("resolve wrote the workspace file: %v", err)
@@ -228,8 +227,8 @@ func TestNewProposalSupersedesConflictedChange(t *testing.T) {
 	if now.Status != "rejected" {
 		t.Fatalf("old conflicted change status = %q, want rejected", now.Status)
 	}
-	if len(core.conflictSet) != 0 {
-		t.Fatalf("conflictSet not cleared: %v", core.conflictSet)
+	if now.SupersededBy != "chg2" || now.Conflict != "" {
+		t.Fatalf("superseded = %q conflict = %q, want chg2 and no conflict", now.SupersededBy, now.Conflict)
 	}
 }
 
@@ -398,7 +397,107 @@ func TestResolveConflictsSkipsCleanChangesInSessionSet(t *testing.T) {
 	if _, err := core.resolveConflicts(); err != nil {
 		t.Fatalf("second resolveConflicts: %v", err)
 	}
-	if len(core.conflictSet) != 0 {
-		t.Fatalf("clean recheck left conflictSet: %v", core.conflictSet)
+	now, _ := core.Coord.FindChange(proposedID(core))
+	if now.Integration == nil || now.Integration.State != "clean" || now.Conflict != "" {
+		t.Fatalf("clean recheck left conflict state: %+v", now)
+	}
+}
+
+// proposedID returns the id of the only proposed change in the current session.
+func proposedID(a *App) string {
+	for _, ch := range a.Coord.Changes() {
+		if ch.Status == "proposed" {
+			return ch.ID
+		}
+	}
+	return ""
+}
+
+// The projection must survive a restart: it is stored in the session payload, not only in memory.
+func TestIntegrationPersistsAndReloads(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "one\ntwo\n"})
+	ch := proposeChange(t, core, dir, "a.txt", func(p string) {
+		if err := os.WriteFile(p, []byte("agent\ntwo\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("mine\ntwo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	core.headMu.Lock()
+	core.headBusy = true
+	core.headMu.Unlock()
+	if _, err := core.resolveConflicts(); err != nil {
+		t.Fatalf("resolveConflicts: %v", err)
+	}
+	core.persist()
+	sid := core.Coord.Current().ID
+	var stored orchestrator.Session
+	if err := core.Store.Get("sessions", sid, &stored); err != nil {
+		t.Fatalf("read stored session: %v", err)
+	}
+	core.Coord.Restore(&stored)
+	got, _ := core.Coord.FindChange(ch.ID)
+	if got.Integration == nil {
+		t.Fatal("the stored change lost its Integration")
+	}
+	if got.Integration.State != "conflicted" || got.Integration.Kind != "overlap" {
+		t.Fatalf("integration = %+v, want conflicted/overlap", got.Integration)
+	}
+	if len(got.Integration.Hunks) == 0 {
+		t.Fatalf("integration has no hunks: %+v", got.Integration)
+	}
+	if got.Integration.Ours == "" || got.Integration.CheckedAt == 0 {
+		t.Fatalf("integration lacks the workspace blob or check time: %+v", got.Integration)
+	}
+}
+
+// A failure that is not a missing worktree must still store a kind and a check time.
+func TestCheckChangeNonWorktreeErrorStoresKind(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n"})
+	ch := proposeChange(t, core, dir, "a.txt", func(p string) {
+		if err := os.WriteFile(p, []byte("agent\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	})
+	ch.AgentID = "invalid/agent"
+	s := core.Coord.Current()
+	s.Changes = []orchestrator.Change{ch}
+	core.Coord.Restore(s)
+	if _, err := core.checkChange(ch); err != nil {
+		t.Fatalf("checkChange: %v", err)
+	}
+	got, _ := core.Coord.FindChange(ch.ID)
+	if got.Integration == nil || got.Integration.Kind != "check_failed" || got.Integration.CheckedAt == 0 {
+		t.Fatalf("integration = %+v, want a kind and a check time", got.Integration)
+	}
+	if !strings.Contains(got.Integration.Reason, "invalid agent id") {
+		t.Fatalf("reason = %q, want the underlying error", got.Integration.Reason)
+	}
+}
+
+// Rows written before Integration existed must still load with a classified kind.
+func TestLegacyConflictStringMapsToKind(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n"})
+	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
+	s := core.Coord.Current()
+	s.Changes = []orchestrator.Change{
+		{ID: "old-overlap", Path: "a.txt", Status: "proposed", Conflict: "your edits and the agent's edits overlap"},
+		{ID: "old-delete", Path: "a.txt", Status: "proposed", Conflict: "you changed this file after the agent started, and the agent deleted it"},
+		{ID: "old-add", Path: "a.txt", Status: "proposed", Conflict: "the file exists in your workspace and the agent created a different one"},
+	}
+	core.Coord.Restore(s)
+	for id, want := range map[string]string{
+		"old-overlap": "overlap",
+		"old-delete":  "modify_delete",
+		"old-add":     "add_add",
+	} {
+		got, _ := core.Coord.FindChange(id)
+		if got.Integration == nil || got.Integration.Kind != want || got.Integration.State != "conflicted" {
+			t.Fatalf("%s: integration = %+v, want conflicted/%s", id, got.Integration, want)
+		}
+		if got.Integration.Reason != got.Conflict {
+			t.Fatalf("%s: reason = %q, want the legacy text %q", id, got.Integration.Reason, got.Conflict)
+		}
 	}
 }

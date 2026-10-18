@@ -148,7 +148,11 @@ func (c *Coord) OpenSession(ctx context.Context, s *Session) {
 		if c.sess.Usage == nil {
 			c.sess.Usage = map[string]any{}
 		}
+		for i := range c.sess.Changes {
+			c.sess.Changes[i].NormalizeIntegration()
+		}
 	}
+	c.lineage = map[string][]Dep{}
 	c.Graph, c.Agents, c.Engine = taskgraph.New(), c.newRegistry(), ctxeng.New()
 	c.baseline, c.tasksPlanned = nil, 0
 	opened := cloneSession(c.sess)
@@ -160,9 +164,13 @@ func (c *Coord) OpenSession(ctx context.Context, s *Session) {
 func (c *Coord) Restore(s *Session) {
 	c.mu.Lock()
 	c.sess = cloneSession(s)
+	c.lineage = map[string][]Dep{}
 	clearQueuedMarks(c.sess)
 	if c.sess != nil {
 		c.sess.Running = false
+		for i := range c.sess.Changes {
+			c.sess.Changes[i].NormalizeIntegration()
+		}
 	}
 	c.mu.Unlock()
 }
@@ -347,7 +355,6 @@ func (c *Coord) Submit(ctx context.Context, text string, refs []string) error {
 	}
 	c.runID++
 	runID := c.runID
-	c.replans = 0
 	c.runCancel, c.sessionCtx = cancel, runCtx
 	c.runWG.Add(1)
 	c.sess.Running = true
@@ -813,7 +820,7 @@ func (c *Coord) knownTask(taskID string) bool {
 
 func (c *Coord) drive(ctx context.Context) error {
 	sched := c.scheduler()
-	for i := 0; i < maxDriveRounds; i++ {
+	for {
 		if err := sched.Wait(ctx); err != nil {
 			return err
 		}
@@ -833,12 +840,7 @@ func (c *Coord) drive(ctx context.Context) error {
 		c.cancelOrphans()
 		c.repromptPrimary(ctx)
 	}
-	c.chat("system", fmt.Sprintf("Relo stopped after %d rounds of work. Ask it to continue if more is needed.", maxDriveRounds), "")
-	return nil
 }
-
-// maxDriveRounds bounds the plan, run, re-plan loop of one request.
-const maxDriveRounds = 10
 
 // cancelOrphans retires tasks that can never run because something they depend on failed for good. Left Blocked
 // they would keep Primary from ever being asked to wrap up, and the user would see work silently stop.
@@ -862,21 +864,12 @@ func (c *Coord) cancelOrphans() {
 	}
 }
 
-// maxReplans is how many times Primary may be asked to plan again after workers finish. The last of them only
-// reports: a Primary that keeps finding something to double-check never finishes, and each round costs a full set
-// of agents.
-const maxReplans = 3
-
 func (c *Coord) repromptPrimary(ctx context.Context) {
 	settings := c.settings()
 	p, ok := c.Agents.Primary()
 	if !ok || !c.settled() {
 		return
 	}
-	c.mu.Lock()
-	c.replans++
-	final := c.replans >= maxReplans
-	c.mu.Unlock()
 	// Guidance queued while the workers ran is part of this step.
 	queued, refs, hasQueued := c.takeQueued(c.SessionID())
 	if hasQueued {
@@ -890,9 +883,6 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 	c.emit("context.compressed", map[string]any{"agentId": p.ID, "generation": gen.Number})
 	resolvedPrimary := style.Resolve(settings.Efficiency, p.Role, p.Difficulty, p.Attempt, settings.Budget)
 	extra := c.workspaceFacts() + "\nAll scheduled workers finished. If every task is done and no check failed, put what was done in userMessage and return tasks as []. Plan follow-up work only for a task that failed or an acceptance criterion that is still unmet."
-	if final {
-		extra += " This is the last planning turn of this request: return tasks as [] and tell the user what is done and what remains."
-	}
 	if hasQueued {
 		extra += "\nThe user sent this while you were working:\n" + queued
 	}
@@ -906,10 +896,6 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 	}
 	if turn.UserMessage != "" {
 		c.chat("assistant", turn.UserMessage, p.ID)
-	}
-	if final && len(turn.Tasks) > 0 {
-		turn.Tasks = nil
-		c.chat("system", fmt.Sprintf("Relo stopped planning more work after %d follow-up rounds. Ask it to continue if more is needed.", maxReplans), "")
 	}
 	c.applyTurn(p, turn)
 }

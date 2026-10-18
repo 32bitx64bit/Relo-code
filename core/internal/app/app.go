@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,8 +71,13 @@ type App struct {
 	// sessMu serialises writes of the session to the database with switching sessions, so one session's agents are
 	// never saved under another's id.
 	sessMu       sync.Mutex
-	decisionMu   sync.Mutex                     // serialises change decisions for the current session
-	conflictSet  map[string]map[string][]string // session id -> path -> ids of conflicted changes; guarded by decisionMu
+	decisionMu   sync.Mutex // serialises change decisions for the current session
+	lazy         atomic.Bool
+	projMu       sync.Mutex
+	projLocks    map[string]*sync.Mutex // workspace-relative path -> projection lock
+	projMemo     map[string]projectionMemo
+	dirtyMu      sync.Mutex      // guards dirtyPaths
+	dirtyPaths   map[string]bool // workspace-relative paths with an unsaved editor buffer
 	autoApply    atomic.Bool
 	autoMu       sync.Mutex
 	autoDirty    bool
@@ -96,6 +102,50 @@ func (a *App) getStatus() runtime.Health {
 	a.statusMu.RLock()
 	defer a.statusMu.RUnlock()
 	return a.status
+}
+
+// setDirtyPaths replaces the extension-reported set of paths with an unsaved editor buffer.
+func (a *App) setDirtyPaths(paths []string) {
+	next := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		if clean := cleanWorkspacePath(p); clean != "" {
+			next[clean] = true
+		}
+	}
+	a.dirtyMu.Lock()
+	a.dirtyPaths = next
+	a.dirtyMu.Unlock()
+}
+
+// pathDirty reports whether the extension says path has an unsaved buffer.
+func (a *App) pathDirty(path string) bool {
+	clean := cleanWorkspacePath(path)
+	if clean == "" {
+		return false
+	}
+	a.dirtyMu.Lock()
+	defer a.dirtyMu.Unlock()
+	return a.dirtyPaths[clean]
+}
+
+// dirtyPathList returns the current dirty set, sorted for stable output.
+func (a *App) dirtyPathList() []string {
+	a.dirtyMu.Lock()
+	defer a.dirtyMu.Unlock()
+	out := make([]string, 0, len(a.dirtyPaths))
+	for p := range a.dirtyPaths {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func cleanWorkspacePath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" || strings.ContainsAny(p, "\x00\n\r") || filepath.IsAbs(p) || strings.HasPrefix(p, "../") {
+		return ""
+	}
+	return filepath.ToSlash(filepath.Clean(filepath.FromSlash(p)))
 }
 
 // noPersistEvents are streaming/high-frequency events that are forwarded over IPC but not written to the event log.
@@ -300,22 +350,36 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 	case "memory.delete":
 		return map[string]any{"ok": a.Coord.Memory.Delete(str(p, "id", ""))}, nil
 	case "changes.list":
+		a.projectPaths(a.proposedPaths())
 		if s := a.Coord.Current(); s != nil {
 			return s.Changes, nil
 		}
 		return []any{}, nil
 	case "changes.accept":
-		return a.acceptChange(str(p, "id", ""))
+		return a.acceptChangeExpect(str(p, "id", ""), str(p, "expect", ""))
 	case "changes.reject":
 		return a.rejectChange(str(p, "id", ""))
 	case "changes.acceptAll":
 		return a.decideAll(true)
 	case "changes.rejectAll":
 		return a.decideAll(false)
+	case "changes.undo":
+		return a.undoChange(str(p, "id", ""))
 	case "changes.diff":
 		return a.changeDiff(str(p, "id", ""))
+	case "workspace.dirty":
+		var paths []string
+		if raw, ok := p["paths"].([]any); ok {
+			for _, item := range raw {
+				paths = append(paths, fmt.Sprint(item))
+			}
+		}
+		a.setDirtyPaths(paths)
+		return map[string]any{"ok": true, "paths": a.dirtyPathList()}, nil
 	case "changes.resolveConflicts":
 		return a.resolveConflicts()
+	case "changes.resolve":
+		return a.resolveChange(str(p, "id", ""), str(p, "choice", ""))
 	case "verification.list":
 		if s := a.Coord.Current(); s != nil {
 			return s.Verify, nil
@@ -434,6 +498,9 @@ func (a *App) applySettings(p map[string]any) {
 		if enabled {
 			a.scheduleAutoApply()
 		}
+	}
+	if enabled, ok := p["lazyConflicts"].(bool); ok {
+		a.lazy.Store(enabled)
 	}
 	s := a.Coord.SettingsSnapshot()
 	if v := str(p, "primaryModel", ""); v != "" {

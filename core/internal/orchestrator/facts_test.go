@@ -99,20 +99,18 @@ func TestWorkspaceFactsWithNothingYet(t *testing.T) {
 	}
 }
 
-// A Primary that keeps finding something to double-check must still end: after maxReplans follow-up turns the last
-// one only reports, and any work it plans is dropped.
-func TestPrimaryReplanningIsCapped(t *testing.T) {
+// A run past the old round caps (ten drive rounds, three follow-up plans) keeps going until Primary stops planning.
+func TestPrimaryRunPastOldCapContinues(t *testing.T) {
 	plan := func(n int) string {
 		return fmt.Sprintf(`{"status":"working","userMessage":"step %d","tasks":[{"id":"p%d","title":"Probe %d","role":"probe","description":"look"}]}`, n, n, n)
 	}
 	const report = `{"status":"completed","summary":"looked"}`
-	// plan, probe, then maxReplans follow-up plans each followed by its probe, except that the last follow-up's task is dropped.
+	const rounds = 12
 	var script []string
-	script = append(script, plan(0), report)
-	for i := 1; i < maxReplans; i++ {
+	for i := 0; i < rounds; i++ {
 		script = append(script, plan(i), report)
 	}
-	script = append(script, plan(maxReplans))
+	script = append(script, `{"status":"completed","userMessage":"all done","tasks":[]}`)
 	r := newDispatchRuntime(script...)
 	c := New(logging.New(nil, logging.Error))
 	c.SetRuntime(r)
@@ -135,17 +133,13 @@ func TestPrimaryReplanningIsCapped(t *testing.T) {
 			probes++
 		}
 	}
-	if probes != maxReplans {
-		t.Fatalf("%d probes were planned, want %d: the last plan's task must be dropped", probes, maxReplans)
+	if probes != rounds {
+		t.Fatalf("%d probes were planned, want %d: no round may be dropped", probes, rounds)
 	}
-	stopped := 0
 	for _, m := range c.Current().Messages {
-		if m.Role == "system" && strings.Contains(m.Text, "stopped planning more work after") {
-			stopped++
+		if m.Role == "system" && strings.Contains(m.Text, "stopped") {
+			t.Fatalf("run stopped early with notice %q", m.Text)
 		}
-	}
-	if stopped != 1 {
-		t.Fatalf("the stop notice was shown %d times, want once", stopped)
 	}
 	if c.Busy() {
 		t.Fatal("agents still active after the request ended")

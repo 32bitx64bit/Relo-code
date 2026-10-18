@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Snapshot struct {
@@ -21,6 +22,12 @@ type Snapshot struct {
 	// Commit is what agents are cut from: HEAD when the tree is clean, otherwise a commit holding the working tree
 	// exactly as the user has it, uncommitted edits and new files included.
 	Commit string `json:"commit"`
+	// HeadFallback reports that the snapshot could not be recorded and the agent would be cut from HEAD instead.
+	HeadFallback bool `json:"headFallback,omitempty"`
+	// UntrackedTruncated reports that more new files existed than maxSnapshotUntracked, so they were not recorded.
+	UntrackedTruncated bool `json:"untrackedTruncated,omitempty"`
+	// ElapsedMS is how long taking the snapshot took, so its cost can be measured.
+	ElapsedMS int64 `json:"elapsedMs,omitempty"`
 }
 
 type Tree struct {
@@ -39,7 +46,10 @@ type Manager struct {
 	trees map[string]Tree
 	base  Snapshot
 
-	snapTree, snapCommit string // the last working tree recorded as a commit, so an unchanged tree keeps one base
+	snapTree, snapCommit string                        // the last working tree recorded as a commit, so an unchanged tree keeps one base
+	snapshotCommitFn     func(Snapshot) (string, bool) // test seam: forces the HEAD fallback path
+	snapshotValidateFn   func(Snapshot) bool           // test seam: forces a failed snapshot validation
+	journalMu            sync.Mutex                    // serialises journal entries and undo
 }
 
 func New(root string) *Manager {
@@ -47,6 +57,7 @@ func New(root string) *Manager {
 }
 
 func (m *Manager) Snapshot() (Snapshot, error) {
+	start := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := Snapshot{Root: m.root}
@@ -59,7 +70,7 @@ func (m *Manager) Snapshot() (Snapshot, error) {
 	ensureExcluded(m.root, ".relo")
 	s.Branch, _ = git(m.root, "rev-parse", "--abbrev-ref", "HEAD")
 	s.Head, _ = git(m.root, "rev-parse", "HEAD")
-	status, _ := gitRaw(m.root, "status", "--porcelain", "-z")
+	status, _ := gitRaw(m.root, "status", "--porcelain", "-z", "--untracked-files=all")
 	entries := strings.Split(status, "\x00")
 	for i := 0; i < len(entries); i++ {
 		entry := entries[i]
@@ -79,9 +90,49 @@ func (m *Manager) Snapshot() (Snapshot, error) {
 			}
 		}
 	}
-	s.Commit = m.snapshotCommit(s)
-	m.base = s
-	return s, nil
+	s.UntrackedTruncated = len(s.Untracked) > maxSnapshotUntracked
+	var lastErr error
+	for attempt := 0; attempt < snapshotAttempts; attempt++ {
+		if m.snapshotCommitFn != nil {
+			s.Commit, s.HeadFallback = m.snapshotCommitFn(s)
+		} else {
+			s.Commit, s.HeadFallback = m.snapshotCommit(s)
+		}
+		if !m.snapshotConsistent(s) {
+			lastErr = fmt.Errorf("snapshot tree kept changing while it was recorded (%d attempts)", snapshotAttempts)
+			m.snapTree, m.snapCommit = "", ""
+			continue
+		}
+		s.ElapsedMS = time.Since(start).Milliseconds()
+		m.base = s
+		return s, nil
+	}
+	// Fail closed: do not hand the agent a base that could not be verified. The caller must not spawn on it.
+	s.Commit = ""
+	s.ElapsedMS = time.Since(start).Milliseconds()
+	return s, lastErr
+}
+
+// snapshotAttempts is how often a snapshot is re-recorded when the tree it wrote is not the tree it re-reads.
+const snapshotAttempts = 3
+
+// snapshotConsistent re-hashes the snapshot tree. A clean tree is HEAD, and an explicit HEAD fallback is already
+// flagged, so neither needs a tree comparison. A mismatch is retried by Snapshot and then fails closed.
+func (m *Manager) snapshotConsistent(s Snapshot) bool {
+	if s.Commit == "" {
+		return false
+	}
+	if s.HeadFallback || s.Commit == s.Head {
+		return true
+	}
+	if m.snapshotValidateFn != nil {
+		return m.snapshotValidateFn(s)
+	}
+	tree, err := m.snapshotTree(s)
+	if err != nil {
+		return false
+	}
+	return tree == m.snapTree
 }
 
 // maxSnapshotUntracked bounds how many new files a snapshot will read. Past it (a build folder that is not
@@ -92,21 +143,56 @@ const maxSnapshotUntracked = 2000
 // the user's branch, index and files are never touched. Agents are cut from it: a worktree made from HEAD alone
 // would not contain the user's uncommitted work, and every agent would report on a repository the user is not
 // looking at. Returns HEAD when nothing is uncommitted, and also when the snapshot cannot be made.
-func (m *Manager) snapshotCommit(s Snapshot) string {
+func (m *Manager) snapshotCommit(s Snapshot) (string, bool) {
 	if len(s.Dirty) == 0 && len(s.Untracked) == 0 {
-		return s.Head
+		return s.Head, false
 	}
 	if s.Head == "" {
-		return ""
+		return "", false
 	}
+	_, env, cleanup, err := m.snapshotIndex(s)
+	if err != nil {
+		return s.Head, true
+	}
+	defer cleanup()
+	tree, err := gitEnv(m.root, env, "write-tree")
+	if err != nil || tree == "" {
+		return s.Head, true
+	}
+	if tree == m.snapTree && m.snapCommit != "" {
+		if _, err := git(m.root, "cat-file", "-e", m.snapCommit); err == nil {
+			return m.snapCommit, false
+		}
+	}
+	commit, err := gitEnv(m.root, env, "commit-tree", tree, "-p", s.Head, "-m", "relo: working tree snapshot")
+	if err != nil || commit == "" {
+		return s.Head, true
+	}
+	m.snapTree, m.snapCommit = tree, commit
+	return commit, false
+}
+
+// snapshotTree re-reads the working tree into a fresh private index and returns its tree id. It is the re-hash
+// half of snapshot validation; it never moves a ref or touches the user's index.
+func (m *Manager) snapshotTree(s Snapshot) (string, error) {
+	_, env, cleanup, err := m.snapshotIndex(s)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	return gitEnv(m.root, env, "write-tree")
+}
+
+// snapshotIndex builds a private index holding the snapshot's working tree. Starting from the user's own index
+// keeps Git from re-reading every file; the copy is only written into a temporary file.
+func (m *Manager) snapshotIndex(s Snapshot) (index string, env []string, cleanup func(), err error) {
 	tmp, err := os.CreateTemp("", "relo-index-*")
 	if err != nil {
-		return s.Head
+		return "", nil, func() {}, err
 	}
-	index := tmp.Name()
+	index = tmp.Name()
 	_ = tmp.Close()
-	defer os.Remove(index)
-	// Starting from the user's own index keeps git from re-reading every file.
+	cleanup = func() { _ = os.Remove(index) }
 	if path, perr := git(m.root, "rev-parse", "--git-path", "index"); perr == nil {
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(m.root, path)
@@ -115,30 +201,17 @@ func (m *Manager) snapshotCommit(s Snapshot) string {
 			_ = os.WriteFile(index, data, 0o600)
 		}
 	}
-	env := append(os.Environ(), "GIT_INDEX_FILE="+index,
+	env = append(os.Environ(), "GIT_INDEX_FILE="+index,
 		"GIT_AUTHOR_NAME=Relo", "GIT_AUTHOR_EMAIL=relo@localhost", "GIT_COMMITTER_NAME=Relo", "GIT_COMMITTER_EMAIL=relo@localhost")
 	add := "-A"
 	if len(s.Untracked) > maxSnapshotUntracked {
 		add = "-u"
 	}
 	if _, err := gitEnv(m.root, env, "add", add); err != nil {
-		return s.Head
+		cleanup()
+		return "", nil, func() {}, err
 	}
-	tree, err := gitEnv(m.root, env, "write-tree")
-	if err != nil || tree == "" {
-		return s.Head
-	}
-	if tree == m.snapTree && m.snapCommit != "" {
-		if _, err := git(m.root, "cat-file", "-e", m.snapCommit); err == nil {
-			return m.snapCommit
-		}
-	}
-	commit, err := gitEnv(m.root, env, "commit-tree", tree, "-p", s.Head, "-m", "relo: working tree snapshot")
-	if err != nil || commit == "" {
-		return s.Head
-	}
-	m.snapTree, m.snapCommit = tree, commit
-	return commit
+	return index, env, cleanup, nil
 }
 
 func (m *Manager) Base() Snapshot {
@@ -219,43 +292,54 @@ func (m *Manager) EnsureTree(agentID string, readOnly bool) (Tree, error) {
 	return t, nil
 }
 
+// StackResult says whether one patch applied to the agent's worktree, and why not when it did not.
+type StackResult struct {
+	Applied bool   `json:"applied"`
+	Error   string `json:"error,omitempty"`
+}
+
 // Stack applies other agents' changes, which the user has not accepted yet, to this agent's worktree and makes the
 // result the agent's base. The agent then sees the code it is meant to test, review or build on, and its own diff
-// holds only what it adds. A patch that no longer applies is skipped; the error says how many.
-func (m *Manager) Stack(agentID string, patches []string) (applied int, err error) {
+// holds only what it adds. A patch that no longer applies is skipped; the result says which ones applied.
+func (m *Manager) Stack(agentID string, patches []string) ([]StackResult, error) {
 	m.mu.Lock()
 	t, ok := m.trees[agentID]
 	m.mu.Unlock()
 	if !ok || t.Path == m.root {
-		return 0, fmt.Errorf("no isolated worktree for agent %q", agentID)
+		return nil, fmt.Errorf("no isolated worktree for agent %q", agentID)
 	}
+	results := make([]StackResult, len(patches))
 	var failed []string
-	for _, patch := range patches {
+	applied := 0
+	for i, patch := range patches {
 		if strings.TrimSpace(patch) == "" {
+			results[i] = StackResult{Applied: true}
 			continue
 		}
 		if _, perr := gitStdin(t.Path, patch, "apply", "--whitespace=nowarn"); perr != nil {
 			failed = append(failed, perr.Error())
+			results[i] = StackResult{Error: perr.Error()}
 			continue
 		}
 		applied++
+		results[i] = StackResult{Applied: true}
 	}
 	if applied > 0 {
 		env := append(os.Environ(), "GIT_AUTHOR_NAME=Relo", "GIT_AUTHOR_EMAIL=relo@localhost", "GIT_COMMITTER_NAME=Relo", "GIT_COMMITTER_EMAIL=relo@localhost")
 		if _, aerr := git(t.Path, "add", "-A"); aerr != nil {
-			return applied, aerr
+			return results, aerr
 		}
 		tree, werr := gitEnv(t.Path, env, "write-tree")
 		if werr != nil {
-			return applied, werr
+			return results, werr
 		}
 		// Plumbing instead of `git commit`, so no hook or signing setting of the user's can get in the way.
 		commit, cerr := gitEnv(t.Path, env, "commit-tree", tree, "-p", t.Base, "-m", "relo: changes this agent builds on")
 		if cerr != nil {
-			return applied, cerr
+			return results, cerr
 		}
 		if _, uerr := git(t.Path, "update-ref", "HEAD", commit); uerr != nil {
-			return applied, uerr
+			return results, uerr
 		}
 		m.mu.Lock()
 		t.Base = commit
@@ -264,9 +348,35 @@ func (m *Manager) Stack(agentID string, patches []string) (applied int, err erro
 		m.mu.Unlock()
 	}
 	if len(failed) > 0 {
-		return applied, fmt.Errorf("%d of %d patches did not apply: %s", len(failed), len(patches), failed[0])
+		return results, fmt.Errorf("%d of %d patches did not apply: %s", len(failed), len(patches), failed[0])
 	}
-	return applied, nil
+	return results, nil
+}
+
+// Recut resets an unstarted agent's worktree to base, discarding whatever was in it. The caller re-stacks the
+// agent's recorded lineage afterwards; Recut itself never touches the user's workspace.
+func (m *Manager) Recut(agentID, base string) (Tree, error) {
+	if strings.TrimSpace(base) == "" {
+		return Tree{}, fmt.Errorf("no base to re-cut agent %q onto", agentID)
+	}
+	m.mu.Lock()
+	t, ok := m.trees[agentID]
+	m.mu.Unlock()
+	if !ok || t.Path == m.root || t.Direct {
+		return Tree{}, fmt.Errorf("no isolated worktree for agent %q", agentID)
+	}
+	if _, err := git(t.Path, "rev-parse", "--show-toplevel"); err != nil {
+		return Tree{}, fmt.Errorf("re-cut %q: %w", agentID, err)
+	}
+	if _, err := git(t.Path, "reset", "--hard", base); err != nil {
+		return Tree{}, fmt.Errorf("re-cut %q: %w", agentID, err)
+	}
+	m.mu.Lock()
+	t.Base = base
+	m.trees[agentID] = t
+	m.recordBase(agentID, base)
+	m.mu.Unlock()
+	return t, nil
 }
 
 // Direct reports whether the workspace root is not a Git repository, so mutating
@@ -354,26 +464,6 @@ func (m *Manager) Discard(agentID, rel string) error {
 		return err
 	}
 	return os.Remove(path)
-}
-
-func (m *Manager) UserProtected(path string) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	want, err := cleanPath(path)
-	if err != nil {
-		return false
-	}
-	for _, p := range m.base.Dirty {
-		if got, e := cleanPath(p); e == nil && got == want {
-			return true
-		}
-	}
-	for _, p := range m.base.Untracked {
-		if got, e := cleanPath(p); e == nil && got == want {
-			return true
-		}
-	}
-	return false
 }
 
 func (m *Manager) Remove(agentID string) error {
@@ -561,6 +651,8 @@ func (m *Manager) Sweep(keep map[string]bool) (removed int) {
 		removed++
 	}
 	_, _ = git(m.root, "worktree", "prune")
+	m.pruneJournal()
+	m.pruneChangeRefs()
 	// Branches left behind by worktrees that are already gone.
 	if out, err := git(m.root, "for-each-ref", "--format=%(refname:short)", "refs/heads/relo/"); err == nil {
 		for _, ref := range strings.Fields(out) {

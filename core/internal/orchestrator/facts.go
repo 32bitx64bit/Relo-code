@@ -16,9 +16,12 @@ import (
 // has now, not from the last commit or from how the folder looked when the session began.
 func (c *Coord) refreshSnapshot() {
 	if ws := c.workspace(); ws != nil {
-		if _, err := ws.Snapshot(); err != nil {
-			c.logWarn("workspace snapshot", err)
+		snap, err := ws.Snapshot()
+		if err != nil {
+			c.noticeSnapshotFailure(err)
+			return
 		}
+		c.noticeSnapshot(snap.HeadFallback, snap.UntrackedTruncated)
 	}
 }
 

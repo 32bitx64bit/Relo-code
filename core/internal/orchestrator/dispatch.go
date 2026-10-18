@@ -2,6 +2,10 @@ package orchestrator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -134,6 +138,12 @@ func (d *dispatcher) admit() (held bool) {
 				continue
 			}
 			a = c.spawn(task, role)
+			if agent.Terminal(a.Status) {
+				// spawn failed closed (for example an unverifiable snapshot); do not run this agent.
+				c.failTask(task, a, fmt.Errorf("%s", a.Activity))
+				d.discard(a, a.Activity)
+				continue
+			}
 		}
 		release, ok, why := d.sched.Reserve(c.Agents, a)
 		if !ok {
@@ -159,6 +169,9 @@ func (d *dispatcher) admit() (held bool) {
 		}
 		c.Agents.Update(a.ID, func(x *agent.Agent) { x.Status = agent.Starting; x.Phase = "context"; x.Activity = "Starting" })
 		c.Agents.Update(a.ID, func(x *agent.Agent) { x.Attempt = updated.Attempt })
+		if queued {
+			c.recutQueued(updated, a)
+		}
 		c.mu.Lock()
 		delete(c.escalations, task.ID)
 		c.mu.Unlock()
@@ -180,6 +193,102 @@ func (d *dispatcher) forget(runnable []taskgraph.Task) {
 			delete(d.queued, id)
 		}
 	}
+}
+
+// recutQueued moves a worktree that waited for a slot onto a base taken now, then re-stacks the dependencies it was
+// spawned with. A worktree holds no agent edits yet, so resetting it loses nothing; the user's folder is untouched.
+// When a recorded parent's patch no longer hashes to what was stacked, the recut refuses and the worktree keeps its
+// old base. That fails closed: no reset runs unless every recorded parent can be re-stacked.
+func (c *Coord) recutQueued(t taskgraph.Task, a agent.Agent) {
+	ws := c.workspace()
+	if ws == nil || ws.Direct() {
+		return
+	}
+	tree, ok := ws.Tree(a.ID)
+	if !ok || tree.Direct || tree.Path == "" {
+		return
+	}
+	if _, err := os.Stat(tree.Path); err != nil {
+		return
+	}
+	snap, err := ws.Snapshot()
+	if err != nil {
+		c.noticeSnapshotFailure(err)
+		c.logWarn("re-cut queued worktree", err)
+		return
+	}
+	c.noticeSnapshot(snap.HeadFallback, snap.UntrackedTruncated)
+	base := ws.Base().Commit
+	if base == "" {
+		return
+	}
+	patches, patchDeps, accepted, ok := c.lineagePatches(c.lineageOf(a.ID))
+	if !ok {
+		c.logWarn("re-cut queued worktree", fmt.Errorf("agent %s: a recorded dependency is no longer available; keeping the old base", a.ID))
+		return
+	}
+	if _, err := ws.Recut(a.ID, base); err != nil {
+		c.logWarn("re-cut queued worktree", err)
+		return
+	}
+	if len(patches) > 0 {
+		results, err := ws.Stack(a.ID, patches)
+		if err != nil {
+			c.logWarn("re-stack after re-cut", err)
+		}
+		applied := append([]Dep(nil), accepted...)
+		for i, r := range results {
+			if r.Applied && i < len(patchDeps) {
+				applied = append(applied, patchDeps[i])
+			}
+		}
+		c.setLineage(a.ID, applied)
+		return
+	}
+	c.setLineage(a.ID, accepted)
+}
+
+// lineagePatches resolves the patches for recorded dependencies in order. Parents that are already accepted are
+// returned separately and skipped: the fresh base has them, and their worktree may be gone. A proposed parent whose
+// patch no longer hashes to the recorded value, or a rejected or missing parent, makes the whole recut refuse.
+func (c *Coord) lineagePatches(lineage []Dep) (patches []string, patchDeps []Dep, accepted []Dep, ok bool) {
+	if len(lineage) == 0 {
+		return nil, nil, nil, true
+	}
+	ws := c.workspace()
+	changes := c.Changes()
+	for _, dep := range lineage {
+		var parent Change
+		found := false
+		for _, ch := range changes {
+			if ch.ID == dep.ID {
+				parent, found = ch, true
+				break
+			}
+		}
+		if !found {
+			return nil, nil, nil, false
+		}
+		switch parent.Status {
+		case "accepted":
+			accepted = append(accepted, dep)
+			continue
+		case "proposed":
+		default:
+			return nil, nil, nil, false
+		}
+		patch, err := ws.PatchPath(parent.AgentID, parent.Path)
+		if err != nil || strings.TrimSpace(patch) == "" {
+			return nil, nil, nil, false
+		}
+		sum := sha256.Sum256([]byte(patch))
+		if hex.EncodeToString(sum[:]) != dep.PatchHash {
+			return nil, nil, nil, false
+		}
+		patches = append(patches, patch)
+		patchDeps = append(patchDeps, dep)
+	}
+	return patches, patchDeps, accepted, true
 }
 
 func (d *dispatcher) launch(t taskgraph.Task, a agent.Agent) {

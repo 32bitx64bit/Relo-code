@@ -664,6 +664,31 @@ test("changes drawer: conflict badge, resolving state, superseded changes hidden
   assert.ok(!none.includes('class="badge"'));
 });
 
+test("changes drawer: integration state, kind, hunks, cause and resolve actions", () => {
+  const html = mainApi.drawerHtml("changes", {
+    changes: [{
+      id: "c1", path: "a.ts", status: "proposed", kind: "modified",
+      integration: {
+        state: "conflicted", kind: "overlap", reason: "your edits and the agent's edits overlap",
+        since: ["chgA"], hunks: [{ oursStart: 1, oursLen: 1, theirsStart: 1, theirsLen: 1, conflicting: true }],
+        fingerprint: "fp1",
+      },
+    }],
+  });
+  assert.ok(html.includes('class="badge" title="overlap"'));
+  assert.ok(html.includes("your edits and the agent's edits overlap"));
+  assert.ok(html.includes("Since chgA"));
+  assert.ok(html.includes("1 conflicting hunk"));
+  assert.ok(html.includes("relo.changes.resolveAgent"));
+  assert.ok(html.includes("relo.changes.resolveMine"));
+  assert.ok(html.includes("relo.changes.resolveHead"));
+  const clean = mainApi.drawerHtml("changes", { changes: [{ id: "c2", path: "b.ts", status: "proposed", integration: { state: "clean" } }] });
+  assert.ok(!clean.includes("relo.changes.resolveAgent"));
+  assert.ok(!clean.includes('class="badge" title="overlap"'));
+  const superseded = mainApi.drawerHtml("changes", { changes: [{ id: "c3", path: "c.ts", status: "proposed", supersededBy: "c4" }] });
+  assert.ok(!superseded.includes("c.ts"), "supersededBy hides the old proposal");
+});
+
 test("chips count only changes still waiting for a decision", () => {
   const c = mainApi.chipCounts({ changes: [{ status: "proposed" }, { status: "accepted" }, { status: "rejected" }, { status: "applied" }] });
   assert.equal(c.changes.label, "2");

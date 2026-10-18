@@ -2,8 +2,19 @@ package app
 
 import "github.com/relocode/relo/internal/orchestrator"
 
+// autoEligible uses the stored projection, not the legacy string. A change with no projection yet (for example a
+// row written before P3) keeps the old behavior and is re-projected before it is accepted.
 func autoEligible(ch orchestrator.Change) bool {
-	return ch.Status == "proposed" && ch.Conflict == "" && !ch.Resolving && !ch.Superseded
+	if ch.Status != "proposed" || ch.Resolving || ch.Superseded || ch.SupersededBy != "" {
+		return false
+	}
+	if ch.Integration != nil {
+		switch ch.Integration.State {
+		case "conflicted", "blocked", "unknown":
+			return false
+		}
+	}
+	return ch.Conflict == ""
 }
 
 // Events only mark work dirty. One asynchronous worker drains bursts, including events emitted by its own decisions.
@@ -36,6 +47,7 @@ func (a *App) drainAutoApply() {
 		a.autoMu.Unlock()
 		func() {
 			defer a.autoMu.Lock()
+			a.projectPaths(a.proposedPaths())
 			a.supersedeStale()
 			_, _ = a.acceptAll(true)
 		}()

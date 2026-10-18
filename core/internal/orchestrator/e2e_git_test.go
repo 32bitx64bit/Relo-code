@@ -14,7 +14,7 @@ import (
 )
 
 // The whole request path in a real repository with uncommitted work: snapshot, worktrees, stacked dependents,
-// facts for the Primary and the replan cap, driven by the mock runtime.
+// facts for the Primary, driven by the mock runtime.
 func TestWholeRequestInADirtyRepository(t *testing.T) {
 	dir := gitRepo(t)
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("uncommitted\n"), 0o644); err != nil {

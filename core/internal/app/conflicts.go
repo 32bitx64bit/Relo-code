@@ -7,8 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/relocode/relo/internal/integration"
@@ -21,11 +23,31 @@ const overlapReason = "your edits and the agent's edits overlap"
 // promptDiffBytes caps the agent's version of each conflicted file in the head message.
 const promptDiffBytes = 4000
 
+// hunkContext is how many unchanged lines around a conflicting hunk are shown to the head agent.
+const hunkContext = 3
+
 var blobRe = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
 
-// resolveConflicts checks every waiting change against the workspace file as it is now. Nothing is written. Changes
-// that overlap are recorded by path, and the head agent is asked in chat to re-apply their intent on the current tree.
+// projectionMemo is the stat key for one change's last projection. A hit proves the workspace file Relo read is
+// still the same file, so the projection can be reused without running git merge-file again.
+type projectionMemo struct {
+	path  string
+	mtime int64
+	size  int64
+	blob  string
+}
+
+// resolveConflicts is the explicit "send conflicted changes to the head agent" action. With lazy conflicts on it
+// sends the changes whose stored projection is already conflicted; it is not the detector. With the flag off it
+// keeps the pre-P3 behavior of re-checking every proposal now.
 func (a *App) resolveConflicts() (any, error) {
+	if a.lazy.Load() {
+		return a.sendConflictedToHead()
+	}
+	return a.resolveConflictsLegacy()
+}
+
+func (a *App) resolveConflictsLegacy() (any, error) {
 	a.decisionMu.Lock()
 	defer a.decisionMu.Unlock()
 
@@ -60,18 +82,6 @@ func (a *App) resolveConflicts() (any, error) {
 	}
 	a.Coord.UpdateChanges(resolving, func(c *orchestrator.Change) { c.Resolving = true })
 	a.Coord.UpdateChanges(idle, func(c *orchestrator.Change) { c.Resolving = false })
-	if a.conflictSet == nil {
-		a.conflictSet = map[string]map[string][]string{}
-	}
-	set := map[string][]string{}
-	for _, ch := range conflicted {
-		set[ch.Path] = append(set[ch.Path], ch.ID)
-	}
-	if len(set) == 0 {
-		delete(a.conflictSet, sid)
-	} else {
-		a.conflictSet[sid] = set
-	}
 	if len(conflicted) == 0 {
 		return map[string]any{"conflicted": 0, "prompted": false, "changes": a.Coord.Changes()}, nil
 	}
@@ -80,47 +90,306 @@ func (a *App) resolveConflicts() (any, error) {
 	return map[string]any{"conflicted": len(conflicted), "prompted": true, "changes": a.Coord.Changes()}, nil
 }
 
-// checkChange returns "conflicted", "clean" or "skipped". It sets or clears Change.Conflict and never writes a file.
+// sendConflictedToHead projects every proposal once, then asks the head agent to re-apply only the ones whose
+// projection is conflicted. No merge runs under decisionMu.
+func (a *App) sendConflictedToHead() (any, error) {
+	a.projectPaths(a.proposedPaths())
+	var conflicted []orchestrator.Change
+	var ids []string
+	for _, ch := range a.Coord.Changes() {
+		if ch.Status != "proposed" || !isConflicted(ch) {
+			continue
+		}
+		conflicted = append(conflicted, ch)
+		ids = append(ids, ch.ID)
+	}
+	a.Coord.UpdateChanges(ids, func(c *orchestrator.Change) { c.Resolving = true })
+	if len(conflicted) == 0 {
+		return map[string]any{"conflicted": 0, "prompted": false, "changes": a.Coord.Changes()}, nil
+	}
+	a.sendHead(a.Coord.SessionID(), a.conflictPrompt(conflicted))
+	a.persist()
+	return map[string]any{"conflicted": len(conflicted), "prompted": true, "changes": a.Coord.Changes()}, nil
+}
+
+// isConflicted reports whether a change waits on the user because its projection conflicts.
+func isConflicted(ch orchestrator.Change) bool {
+	if ch.Integration != nil {
+		return ch.Integration.State == "conflicted"
+	}
+	return ch.Conflict != ""
+}
+
+// proposedPaths returns the workspace-relative paths that still wait for a decision.
+func (a *App) proposedPaths() []string {
+	seen := map[string]bool{}
+	var paths []string
+	for _, ch := range a.Coord.Changes() {
+		if ch.Status == "proposed" && ch.Path != "" && !seen[ch.Path] {
+			seen[ch.Path] = true
+			paths = append(paths, ch.Path)
+		}
+	}
+	return paths
+}
+
+// projectPaths re-projects every proposed change whose path is in paths, as one batched update. It is the E1 hook:
+// call it after any accept or undo wrote a path, outside decisionMu.
+func (a *App) projectPaths(paths []string) {
+	if !a.lazy.Load() || len(paths) == 0 {
+		return
+	}
+	want := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		want[p] = true
+	}
+	var updates []orchestrator.IntegrationUpdate
+	for _, ch := range a.Coord.Changes() {
+		if ch.Status != "proposed" || !want[ch.Path] {
+			continue
+		}
+		updates = append(updates, a.projectChange(ch))
+	}
+	a.Coord.UpdateIntegration(updates)
+}
+
+// projectChange computes one change's current projection without writing anything.
+func (a *App) projectChange(ch orchestrator.Change) orchestrator.IntegrationUpdate {
+	lock := a.pathLock(ch.Path)
+	lock.Lock()
+	defer lock.Unlock()
+
+	if a.projectionFresh(ch) {
+		since := a.sinceFor(ch, integration.Analysis{Ours: ch.Integration.Ours})
+		if !reflect.DeepEqual(since, ch.Integration.Since) {
+			updated := *ch.Integration
+			updated.Since = since
+			return orchestrator.IntegrationUpdate{ID: ch.ID, Integration: &updated, Conflict: ch.Conflict}
+		}
+		return orchestrator.IntegrationUpdate{ID: ch.ID, Integration: ch.Integration, Conflict: ch.Conflict}
+	}
+	now := time.Now().UnixMilli()
+	analysis, err := a.analyzeChange(ch)
+	if err != nil {
+		reason := err.Error()
+		state, kind := "unknown", "check_failed"
+		if strings.Contains(reason, "worktree is unavailable") {
+			state, kind = "blocked", "worktree_gone"
+		}
+		integ := &orchestrator.Integration{State: state, Kind: kind, Reason: reason, CheckedAt: now}
+		return orchestrator.IntegrationUpdate{ID: ch.ID, Integration: integ, Conflict: reason}
+	}
+	state := "clean"
+	if analysis.Reason != "" {
+		state = "conflicted"
+	}
+	integ := &orchestrator.Integration{
+		State: state, Kind: analysis.Kind, Reason: analysis.Reason, Ours: analysis.Ours,
+		Hunks: integrationHunks(analysis.Hunks), Since: a.sinceFor(ch, analysis),
+		CheckedAt: now, Fingerprint: analysis.Fingerprint,
+	}
+	a.rememberProjection(ch, analysis.Ours)
+	return orchestrator.IntegrationUpdate{ID: ch.ID, Integration: integ, Conflict: analysis.Reason}
+}
+
+// projectionFresh reports whether the stored projection's workspace file is unchanged since it was computed.
+func (a *App) projectionFresh(ch orchestrator.Change) bool {
+	if ch.Integration == nil || ch.Integration.Ours == "" {
+		return false
+	}
+	info, err := a.workspaceStat(ch.Path)
+	if err != nil {
+		return false
+	}
+	a.projMu.Lock()
+	memo, ok := a.projMemo[ch.ID]
+	a.projMu.Unlock()
+	if ok && memo.path == ch.Path && memo.mtime == info.mtime && memo.size == info.size && memo.blob == ch.Integration.Ours {
+		return true
+	}
+	// E3: even after a stat change, hash the file. The same blob means the projection is still current.
+	full := filepath.Join(a.Cfg.Workspace, filepath.FromSlash(ch.Path))
+	data, rerr := os.ReadFile(full)
+	exists := rerr == nil
+	if rerr != nil && !os.IsNotExist(rerr) {
+		return false
+	}
+	if integration.BlobID(data, exists) != ch.Integration.Ours {
+		return false
+	}
+	a.rememberProjection(ch, ch.Integration.Ours)
+	return true
+}
+
+func (a *App) rememberProjection(ch orchestrator.Change, blob string) {
+	info, err := a.workspaceStat(ch.Path)
+	if err != nil {
+		return
+	}
+	a.projMu.Lock()
+	if a.projMemo == nil {
+		a.projMemo = map[string]projectionMemo{}
+	}
+	a.projMemo[ch.ID] = projectionMemo{path: ch.Path, mtime: info.mtime, size: info.size, blob: blob}
+	a.projMu.Unlock()
+}
+
+type fileStat struct {
+	mtime int64
+	size  int64
+}
+
+func (a *App) workspaceStat(path string) (fileStat, error) {
+	info, err := os.Stat(filepath.Join(a.Cfg.Workspace, filepath.FromSlash(path)))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fileStat{mtime: -1, size: -1}, nil
+		}
+		return fileStat{}, err
+	}
+	return fileStat{mtime: info.ModTime().UnixNano(), size: info.Size()}, nil
+}
+
+// pathLock returns the projection lock for one path. Projection takes this lock, never decisionMu, so an O(N)
+// merge-file loop cannot block a decision.
+func (a *App) pathLock(path string) *sync.Mutex {
+	a.projMu.Lock()
+	defer a.projMu.Unlock()
+	if a.projLocks == nil {
+		a.projLocks = map[string]*sync.Mutex{}
+	}
+	lock := a.projLocks[path]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		a.projLocks[path] = lock
+	}
+	return lock
+}
+
+// sinceFor names the accepted changes, or "user", that moved the file after the change's base. An accept that
+// landed before the cut is already part of BaseRev and is not a cause of the current projection.
+func (a *App) sinceFor(ch orchestrator.Change, analysis integration.Analysis) []string {
+	base, hadBase, baseErr := a.baseOf(ch)
+	baseBlob := ""
+	if baseErr == nil {
+		baseBlob = integration.BlobID(base, hadBase)
+	}
+	var since []string
+	for _, other := range a.Coord.Changes() {
+		if other.ID == ch.ID || other.Path != ch.Path || other.Status != "accepted" {
+			continue
+		}
+		if !a.landedAfterCut(other, baseBlob, baseErr == nil) {
+			continue
+		}
+		since = append(since, other.ID)
+	}
+	if len(since) == 0 && (baseErr != nil || baseBlob != analysis.Ours) {
+		since = []string{"user"}
+	}
+	return since
+}
+
+// landedAfterCut reports whether an accepted change wrote this path after the cut. The journal entry written by
+// the accept holds its post-image: when that image is already the change's base content, the accept was part of
+// the base and must not be named in Since. When the journal is unavailable, keep the attribution.
+func (a *App) landedAfterCut(other orchestrator.Change, baseBlob string, haveBase bool) bool {
+	if !haveBase {
+		return true
+	}
+	rec, _, err := a.Coord.WS.JournalEntryFor(other.ID)
+	if err != nil {
+		return true
+	}
+	for _, f := range rec.Files {
+		if f.Path == other.Path {
+			return f.Post != baseBlob
+		}
+	}
+	return true
+}
+
+// checkChange returns "conflicted", "clean" or "skipped". It sets or clears Change.Conflict and records the full
+// Integration (state, kind, hunks, workspace blob) and never writes a file.
 func (a *App) checkChange(ch orchestrator.Change) (string, error) {
 	if !a.ownWorktree(ch.Worktree) || ch.Path == "" || !filepath.IsLocal(filepath.FromSlash(ch.Path)) {
 		return "skipped", nil
 	}
-	reason, err := a.conflictReason(ch)
+	now := time.Now().UnixMilli()
+	analysis, err := a.analyzeChange(ch)
 	if err != nil {
-		reason = err.Error()
+		reason := err.Error()
+		state, kind := "unknown", "check_failed"
+		if strings.Contains(reason, "worktree is unavailable") {
+			state, kind = "blocked", "worktree_gone"
+		}
+		integ := &orchestrator.Integration{State: state, Kind: kind, Reason: reason, CheckedAt: now}
+		a.Coord.UpdateChange(ch.ID, func(c *orchestrator.Change) { c.Conflict, c.Integration = reason, integ })
+		return "conflicted", nil
 	}
-	a.Coord.UpdateChange(ch.ID, func(c *orchestrator.Change) { c.Conflict = reason })
-	if reason != "" {
+	state := "clean"
+	if analysis.Reason != "" {
+		state = "conflicted"
+	}
+	integ := &orchestrator.Integration{
+		State: state, Kind: analysis.Kind, Reason: analysis.Reason, Ours: analysis.Ours,
+		Hunks: integrationHunks(analysis.Hunks), Since: a.sinceFor(ch, analysis),
+		CheckedAt: now, Fingerprint: analysis.Fingerprint,
+	}
+	a.Coord.UpdateChange(ch.ID, func(c *orchestrator.Change) { c.Conflict, c.Integration = analysis.Reason, integ })
+	if analysis.Reason != "" {
 		return "conflicted", nil
 	}
 	return "clean", nil
 }
 
+// integrationHunks converts the integration package's hunk locations for storage on the change.
+func integrationHunks(hunks []integration.Hunk) []orchestrator.Hunk {
+	if len(hunks) == 0 {
+		return nil
+	}
+	out := make([]orchestrator.Hunk, 0, len(hunks))
+	for _, h := range hunks {
+		out = append(out, orchestrator.Hunk{OursStart: h.OursStart, OursLen: h.OursLen, TheirsStart: h.TheirsStart, TheirsLen: h.TheirsLen, Conflicting: h.Conflicting})
+	}
+	return out
+}
+
 // conflictReason recomputes why a change cannot be accepted as it is, or "" when it merges cleanly.
 func (a *App) conflictReason(ch orchestrator.Change) (string, error) {
+	analysis, err := a.analyzeChange(ch)
+	if err != nil {
+		return "", err
+	}
+	return analysis.Reason, nil
+}
+
+// analyzeChange projects the change against the workspace file as it is now, without writing.
+func (a *App) analyzeChange(ch orchestrator.Change) (integration.Analysis, error) {
 	// Do not recreate a released worktree: its proposed edits are no longer available.
 	if _, err := os.Stat(ch.Worktree); err != nil {
-		return "", fmt.Errorf("the agent's worktree is unavailable: %w", err)
+		return integration.Analysis{}, fmt.Errorf("the agent's worktree is unavailable: %w", err)
 	}
 	tree, err := a.Coord.WS.EnsureTree(ch.AgentID, false)
 	if err != nil {
-		return "", fmt.Errorf("the agent's worktree could not be opened: %w", err)
+		return integration.Analysis{}, fmt.Errorf("the agent's worktree could not be opened: %w", err)
 	}
 	if tree.Path != ch.Worktree {
-		return "", fmt.Errorf("the agent's worktree does not match the change")
+		return integration.Analysis{}, fmt.Errorf("the agent's worktree does not match the change")
 	}
 	base, hadBase, err := a.baseOf(ch)
 	if err != nil {
-		return "", ipc.Fail{C: "integration_failed", M: fmt.Sprintf("%s: %v", ch.Path, err)}
+		return integration.Analysis{}, ipc.Fail{C: "integration_failed", M: fmt.Sprintf("%s: %v", ch.Path, err)}
 	}
-	reason, err := integration.Check(a.Cfg.Workspace, ch.Worktree, ch.Path, base, hadBase)
+	analysis, err := integration.Analyze(a.Cfg.Workspace, ch.Worktree, ch.Path, base, hadBase)
 	if err != nil {
-		return "", ipc.Fail{C: "integration_failed", M: fmt.Sprintf("%s: %v", ch.Path, err)}
+		return integration.Analysis{}, ipc.Fail{C: "integration_failed", M: fmt.Sprintf("%s: %v", ch.Path, err)}
 	}
-	return reason, nil
+	return analysis, nil
 }
 
 // conflictPrompt is the head message. It lists each conflicted change and asks for its intent to be re-applied.
+// When the projection has hunk locations, only the conflicting hunks and their context are shown.
 func (a *App) conflictPrompt(conflicted []orchestrator.Change) string {
 	var b strings.Builder
 	b.WriteString("Resolve conflicts. These proposed changes overlap with edits made in the workspace after the agent started, so none was applied. " +
@@ -130,8 +399,54 @@ func (a *App) conflictPrompt(conflicted []orchestrator.Change) string {
 		if t, ok := a.Coord.Graph.Get(ch.TaskID); ok && t.Title != "" {
 			title = t.Title
 		}
-		fmt.Fprintf(&b, "\n- id: %s\n  title: %s\n  path: %s\n  reason: %s\n  agent version:\n", ch.ID, title, ch.Path, ch.Conflict)
-		b.WriteString(agentCopy(ch))
+		fmt.Fprintf(&b, "\n- id: %s\n  title: %s\n  path: %s\n  reason: %s\n", ch.ID, title, ch.Path, ch.Conflict)
+		b.WriteString(a.agentConflictCopy(ch))
+	}
+	return b.String()
+}
+
+// agentConflictCopy returns only the conflicting hunks of the agent's file with context. A change without hunk
+// locations falls back to the capped whole file.
+func (a *App) agentConflictCopy(ch orchestrator.Change) string {
+	data, err := os.ReadFile(filepath.Join(ch.Worktree, filepath.FromSlash(ch.Path)))
+	if err != nil {
+		return "  agent version:\n  (agent version unavailable)\n"
+	}
+	if bytes.IndexByte(data, 0) >= 0 {
+		return "  agent version:\n  (binary, not shown)\n"
+	}
+	var conflicting []orchestrator.Hunk
+	if ch.Integration != nil {
+		for _, h := range ch.Integration.Hunks {
+			if h.Conflicting && h.TheirsLen > 0 {
+				conflicting = append(conflicting, h)
+			}
+		}
+	}
+	if len(conflicting) == 0 {
+		return "  agent version:\n" + agentCopy(ch)
+	}
+	lines := strings.Split(string(data), "\n")
+	var b strings.Builder
+	b.WriteString("  agent version (only the conflicting hunks, with context):\n")
+	for _, h := range conflicting {
+		start := h.TheirsStart - hunkContext
+		if start < 1 {
+			start = 1
+		}
+		end := h.TheirsStart + h.TheirsLen - 1 + hunkContext
+		if end > len(lines) {
+			end = len(lines)
+		}
+		fmt.Fprintf(&b, "  lines %d-%d:\n```\n", start, end)
+		for i := start; i <= end; i++ {
+			b.WriteString(lines[i-1])
+			b.WriteByte('\n')
+		}
+		b.WriteString("```\n")
+	}
+	if b.Len() > promptDiffBytes {
+		return "  agent version:\n" + agentCopy(ch)
 	}
 	return b.String()
 }
@@ -247,54 +562,36 @@ func (a *App) clearResolvingLoaded() {
 	a.Coord.UpdateChanges(ids, func(c *orchestrator.Change) { c.Resolving = false })
 }
 
-// supersedeStale rejects the recorded conflicted changes for a path once a new proposal for that path exists.
+// supersedeStale replaces a conflicted proposal for a path once a newer proposal for that path exists. The old
+// change is kept with SupersededBy set and its agent blob retained; it is not silently discarded.
 func (a *App) supersedeStale() {
 	a.decisionMu.Lock()
 	defer a.decisionMu.Unlock()
 
-	sid := a.Coord.SessionID()
-	set := a.conflictSet[sid]
-	if len(set) == 0 {
-		return
-	}
 	changes := a.Coord.Changes()
-	for path, ids := range set {
-		if !hasNewProposal(changes, path, ids) {
-			continue
-		}
-		for _, id := range ids {
-			if ch, ok := a.Coord.FindChange(id); ok && ch.Status == "proposed" {
-				if _, err := a.rejectChangeLocked(id); err != nil {
-					a.Log.Warn("supersede conflicted change", map[string]any{"changeId": id, "error": err.Error()})
-					continue
-				}
-				a.Coord.UpdateChange(id, func(c *orchestrator.Change) { c.Superseded, c.Conflict, c.Resolving = true, "", false })
-			}
-		}
-		delete(set, path)
-	}
-	if len(set) == 0 {
-		delete(a.conflictSet, sid)
-	}
-}
-
-func hasNewProposal(changes []orchestrator.Change, path string, old []string) bool {
+	newest := map[string]orchestrator.Change{}
 	for _, ch := range changes {
-		if ch.Path != path || ch.Status != "proposed" {
+		if ch.Status != "proposed" || isConflicted(ch) || ch.SupersededBy != "" {
 			continue
 		}
-		known := false
-		for _, id := range old {
-			if id == ch.ID {
-				known = true
-				break
-			}
-		}
-		if !known {
-			return true
-		}
+		newest[ch.Path] = ch
 	}
-	return false
+	for _, old := range changes {
+		if old.Status != "proposed" || !isConflicted(old) {
+			continue
+		}
+		newer, ok := newest[old.Path]
+		if !ok || newer.ID == old.ID {
+			continue
+		}
+		if _, err := a.rejectChangeLocked(old.ID); err != nil {
+			a.Log.Warn("supersede conflicted change", map[string]any{"changeId": old.ID, "error": err.Error()})
+			continue
+		}
+		a.Coord.UpdateChange(old.ID, func(c *orchestrator.Change) {
+			c.Superseded, c.SupersededBy, c.Conflict, c.Resolving = true, newer.ID, "", false
+		})
+	}
 }
 
 // baseOf returns the change's base: the blob stored by an earlier check, or else the file at the agent's base commit.

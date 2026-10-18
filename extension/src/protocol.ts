@@ -8,7 +8,7 @@ export const Methods = {
   taskList: "task.list", taskGet: "task.get", taskCancel: "task.cancel", taskRetry: "task.retry", taskSetPriority: "task.setPriority",
   contextGet: "context.get", contextGenerations: "context.generations", contextRefresh: "context.refresh", contextRebuild: "context.rebuild", contextPin: "context.pin", contextRemove: "context.remove", contextPromote: "context.promote",
   findingsList: "findings.list", memoryList: "memory.list", memoryUpdate: "memory.update", memoryDelete: "memory.delete",
-  changesList: "changes.list", changesAccept: "changes.accept", changesReject: "changes.reject", changesAcceptAll: "changes.acceptAll", changesRejectAll: "changes.rejectAll", changesDiff: "changes.diff", changesResolveConflicts: "changes.resolveConflicts", verificationList: "verification.list",
+  changesList: "changes.list", changesAccept: "changes.accept", changesReject: "changes.reject", changesAcceptAll: "changes.acceptAll", changesRejectAll: "changes.rejectAll", changesDiff: "changes.diff", changesUndo: "changes.undo", changesResolve: "changes.resolve", changesResolveConflicts: "changes.resolveConflicts", workspaceDirty: "workspace.dirty", verificationList: "verification.list",
   modelsList: "models.list", modelsSet: "models.set", backendStatus: "backend.status", backendRestart: "backend.restart", settingsApply: "settings.apply", providersDiscover: "providers.discover", modeSet: "mode.set",
   orchestratorPause: "orchestrator.pause", orchestratorResume: "orchestrator.resume", orchestratorStopAll: "orchestrator.stopAll",
   permissionRespond: "permission.respond", logsTail: "logs.tail", snapshot: "snapshot", cacheGet: "cache.get",
@@ -143,6 +143,20 @@ export interface ChangeInfo {
   added?: number;
   deleted?: number;
   worktree?: string;
+  conflict?: string;
+  resolving?: boolean;
+  superseded?: boolean;
+  supersededBy?: string;
+  integration?: {
+    state: "clean" | "conflicted" | "blocked" | "unknown";
+    kind?: string;
+    reason?: string;
+    ours?: string;
+    since?: string[];
+    checkedAt?: number;
+    fingerprint?: string;
+    hunks?: { oursStart: number; oursLen: number; theirsStart: number; theirsLen: number; conflicting: boolean }[];
+  };
 }
 
 // One row of the session history list (core: session.list).

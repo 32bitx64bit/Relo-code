@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -170,7 +171,13 @@ func TestStackPutsAnotherAgentsChangesUnderTheNextOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	applied, err := m.Stack("next", patches)
+	results, err := m.Stack("next", patches)
+	applied := 0
+	for _, r := range results {
+		if r.Applied {
+			applied++
+		}
+	}
 	if err != nil || applied != 2 {
 		t.Fatalf("stack applied %d (%v), want 2", applied, err)
 	}
@@ -203,8 +210,177 @@ func TestStackPutsAnotherAgentsChangesUnderTheNextOne(t *testing.T) {
 	third, _ := m.EnsureTree("third", false)
 	write(t, third.Path, "x.txt", "someone else's x\n") // x.txt exists here, so the creation patch cannot apply
 	run(t, third.Path, "git", "add", "-A")
-	applied, err = m.Stack("third", patches)
+	results, err = m.Stack("third", patches)
+	applied = 0
+	for _, r := range results {
+		if r.Applied {
+			applied++
+		}
+	}
 	if applied != 1 || err == nil || !strings.Contains(err.Error(), "1 of 2 patches did not apply") {
 		t.Fatalf("applied %d, err %v; want 1 applied and a note about the other", applied, err)
+	}
+	if len(results) != 2 || !results[0].Applied || results[1].Applied || results[1].Error == "" {
+		t.Fatalf("per-patch result = %+v, want the first applied and the second refused", results)
+	}
+}
+
+// An agent spawned after the workspace changed must be cut from the new tree, not from the base of an earlier agent.
+func TestSecondAgentGetsTheNewBaseAfterTheWorkspaceChanges(t *testing.T) {
+	dir := initRepo(t)
+	write(t, dir, "a.txt", "one\n")
+	run(t, dir, "git", "add", "a.txt")
+	run(t, dir, "git", "commit", "-m", "a")
+	m := New(dir)
+	if _, err := m.Snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	first, err := m.EnsureTree("first", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, dir, "a.txt", "two\n") // the user accepts work while first exists
+	if _, err := m.Snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.EnsureTree("second", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Base == first.Base {
+		t.Fatalf("the second agent kept the first agent's base %s", second.Base)
+	}
+	if got, _ := os.ReadFile(filepath.Join(second.Path, "a.txt")); string(got) != "two\n" {
+		t.Fatalf("a.txt in the second worktree = %q, want the new base", got)
+	}
+}
+
+// A snapshot that cannot be recorded must say so instead of silently handing the agent HEAD.
+func TestSnapshotFlagsHeadFallback(t *testing.T) {
+	dir := initRepo(t)
+	write(t, dir, "wip.txt", "wip\n")
+	m := New(dir)
+	m.snapshotCommitFn = func(s Snapshot) (string, bool) { return s.Head, true }
+	snap, err := m.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.HeadFallback {
+		t.Fatal("a snapshot that fell back to HEAD was not flagged")
+	}
+	clean := New(dir)
+	ok, err := clean.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok.HeadFallback {
+		t.Fatal("a normal snapshot was flagged as a fallback")
+	}
+}
+
+// A snapshot that cannot be re-hashed back to the tree it wrote is retried twice and then fails closed.
+func TestSnapshotValidationRetriesTwiceThenFailsClosed(t *testing.T) {
+	dir := initRepo(t)
+	write(t, dir, "wip.txt", "wip\n")
+	m := New(dir)
+	attempts := 0
+	m.snapshotCommitFn = func(s Snapshot) (string, bool) {
+		attempts++
+		return "1111111111111111111111111111111111111111", false
+	}
+	m.snapshotValidateFn = func(Snapshot) bool { return false }
+	snap, err := m.Snapshot()
+	if err == nil {
+		t.Fatal("an inconsistent snapshot was accepted")
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3 (the first plus two retries)", attempts)
+	}
+	if snap.Commit != "" {
+		t.Fatalf("failed snapshot kept commit %q; it must fail closed", snap.Commit)
+	}
+	if m.Base().Commit != "" {
+		t.Fatalf("a failed snapshot became the base: %+v", m.Base())
+	}
+}
+
+// A mismatch on the first attempt is retried and the second consistent tree is accepted.
+func TestSnapshotValidationRetrySucceeds(t *testing.T) {
+	dir := initRepo(t)
+	write(t, dir, "wip.txt", "wip\n")
+	m := New(dir)
+	attempts := 0
+	m.snapshotCommitFn = func(s Snapshot) (string, bool) {
+		attempts++
+		return "2222222222222222222222222222222222222222", false
+	}
+	valid := 0
+	m.snapshotValidateFn = func(Snapshot) bool {
+		valid++
+		return valid > 1
+	}
+	snap, err := m.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || snap.Commit == "" {
+		t.Fatalf("attempts = %d, commit = %q", attempts, snap.Commit)
+	}
+}
+
+// Past the cap the snapshot records only tracked files and says so, so the caller can warn the user.
+func TestSnapshotFlagsUntrackedTruncation(t *testing.T) {
+	dir := initRepo(t)
+	for i := 0; i <= maxSnapshotUntracked; i++ {
+		write(t, dir, filepath.Join("many", fmt.Sprintf("%04d.txt", i)), "x\n")
+	}
+	m := New(dir)
+	snap, err := m.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.UntrackedTruncated {
+		t.Fatalf("truncation was not flagged: %d untracked", len(snap.Untracked))
+	}
+}
+
+// A queued agent's worktree is re-cut to the fresh base at launch; nothing else holds edits there yet.
+func TestRecutMovesAnUnstartedWorktreeToTheNewBase(t *testing.T) {
+	dir := initRepo(t)
+	write(t, dir, "a.txt", "one\n")
+	run(t, dir, "git", "add", "a.txt")
+	run(t, dir, "git", "commit", "-m", "a")
+	m := New(dir)
+	if _, err := m.Snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	tree, err := m.EnsureTree("queued", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, tree.Path, "a.txt", "scratch\n") // never an agent's work: the agent has not started
+	write(t, dir, "a.txt", "accepted\n")
+	snap, err := m.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recut, err := m.Recut("queued", snap.Commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recut.Base != snap.Commit {
+		t.Fatalf("base = %s, want the fresh snapshot %s", recut.Base, snap.Commit)
+	}
+	if got, _ := os.ReadFile(filepath.Join(recut.Path, "a.txt")); string(got) != "accepted\n" {
+		t.Fatalf("a.txt = %q, want the fresh base", got)
+	}
+	if rec := m.recordedBase("queued"); rec != snap.Commit {
+		t.Fatalf("recorded base = %s, want %s", rec, snap.Commit)
+	}
+	if _, err := m.Recut("missing", snap.Commit); err == nil {
+		t.Fatal("re-cut succeeded for an agent without a worktree")
+	}
+	if _, err := m.Recut("queued", ""); err == nil {
+		t.Fatal("re-cut succeeded without a base")
 	}
 }

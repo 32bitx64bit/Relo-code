@@ -1,5 +1,69 @@
 package orchestrator
 
+import "reflect"
+
+// IntegrationUpdate is one change's new projection and derived wire state. A nil Integration leaves the stored
+// projection unchanged.
+type IntegrationUpdate struct {
+	ID           string
+	Integration  *Integration // nil means leave the current projection in place
+	Conflict     string
+	SupersededBy string
+}
+
+// UpdateIntegration applies a batch of projections under one lock and emits changes.updated once, and only when a
+// visible field changed. Projection loops that find nothing new therefore cannot re-arm the UI or auto-apply.
+func (c *Coord) UpdateIntegration(updates []IntegrationUpdate) bool {
+	if len(updates) == 0 {
+		return false
+	}
+	want := make(map[string]IntegrationUpdate, len(updates))
+	for _, u := range updates {
+		want[u.ID] = u
+	}
+	c.mu.Lock()
+	if c.sess == nil {
+		c.mu.Unlock()
+		return false
+	}
+	changed := false
+	for i := range c.sess.Changes {
+		u, ok := want[c.sess.Changes[i].ID]
+		if !ok {
+			continue
+		}
+		ch := &c.sess.Changes[i]
+		if u.Integration != nil && !reflect.DeepEqual(ch.Integration, u.Integration) {
+			ch.Integration = cloneIntegration(u.Integration)
+			changed = true
+		}
+		if ch.Conflict != u.Conflict {
+			ch.Conflict = u.Conflict
+			changed = true
+		}
+		if u.SupersededBy != "" && ch.SupersededBy != u.SupersededBy {
+			ch.SupersededBy = u.SupersededBy
+			changed = true
+		}
+	}
+	snapshot := append([]Change{}, c.sess.Changes...)
+	c.mu.Unlock()
+	if changed {
+		c.emit("changes.updated", snapshot)
+	}
+	return changed
+}
+
+func cloneIntegration(in *Integration) *Integration {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Hunks = append([]Hunk(nil), in.Hunks...)
+	out.Since = append([]string(nil), in.Since...)
+	return &out
+}
+
 // FindChange returns the change with the given id from the current session.
 func (c *Coord) FindChange(id string) (Change, bool) {
 	c.mu.Lock()
@@ -22,6 +86,24 @@ func (c *Coord) Changes() []Change {
 		return []Change{}
 	}
 	return append([]Change{}, c.sess.Changes...)
+}
+
+// setLineage records the dependencies applied to an agent's base. It is written once at spawn and kept across
+// status changes and recuts.
+func (c *Coord) setLineage(agentID string, deps []Dep) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lineage == nil {
+		c.lineage = map[string][]Dep{}
+	}
+	c.lineage[agentID] = append([]Dep(nil), deps...)
+}
+
+// lineageOf returns the dependencies applied to an agent's base.
+func (c *Coord) lineageOf(agentID string) []Dep {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]Dep(nil), c.lineage[agentID]...)
 }
 
 // UpdateChange edits one change in place under the Coord lock, so a worker recording new changes at the same time

@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -21,6 +23,7 @@ type stackPart struct {
 	title   string
 	files   []Change
 	patches []string
+	hashes  []string
 }
 
 // stackParts collects the unaccepted changes of every task t builds on, oldest first.
@@ -67,6 +70,8 @@ func (c *Coord) stackParts(t taskgraph.Task) []stackPart {
 			}
 			part.files = append(part.files, ch)
 			part.patches = append(part.patches, patch)
+			sum := sha256.Sum256([]byte(patch))
+			part.hashes = append(part.hashes, hex.EncodeToString(sum[:]))
 		}
 		if len(part.patches) > 0 {
 			parts = append(parts, part)
@@ -75,16 +80,30 @@ func (c *Coord) stackParts(t taskgraph.Task) []stackPart {
 	return parts
 }
 
-// stackInto applies the parts to a's worktree and returns what the agent should be told about its workspace.
-func (c *Coord) stackInto(ws *workspace.Manager, a agent.Agent, parts []stackPart) []ctxeng.Item {
+// stackInto applies the parts to a's worktree and returns what the agent should be told about its workspace, plus
+// the dependencies that actually applied. Those become the change's Lineage and Needs.
+func (c *Coord) stackInto(ws *workspace.Manager, a agent.Agent, parts []stackPart) ([]ctxeng.Item, []Dep) {
 	var patches, titles []string
+	var deps []Dep
 	for _, p := range parts {
 		patches = append(patches, p.patches...)
 		titles = append(titles, fmt.Sprintf("%q", p.title))
 	}
-	applied, err := ws.Stack(a.ID, patches)
+	results, err := ws.Stack(a.ID, patches)
 	if err != nil {
 		c.logWarn("stack dependency changes", err)
+	}
+	applied, index := 0, 0
+	for _, p := range parts {
+		for i := range p.patches {
+			if index < len(results) && results[index].Applied {
+				applied++
+				if i < len(p.hashes) && i < len(p.files) {
+					deps = append(deps, Dep{ID: p.files[i].ID, PatchHash: p.hashes[i]})
+				}
+			}
+			index++
+		}
 	}
 	note := "This workspace is the user's working tree with the changes of " + strings.Join(titles, ", ") + " already applied, although the user has not accepted them yet. Test, review or build on that."
 	if err != nil {
@@ -98,5 +117,5 @@ func (c *Coord) stackInto(ws *workspace.Manager, a agent.Agent, parts []stackPar
 		}
 		items = append(items, ctxeng.Item{Class: ctxeng.ClassCode, Source: ctxeng.SourceRepo, Title: "Diff under review", Content: diff, Durability: 1, Relevance: 1})
 	}
-	return items
+	return items, deps
 }

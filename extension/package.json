@@ -195,12 +195,28 @@
         "title": "Open Diff"
       },
       {
+        "command": "relo.changes.resolveAgent",
+        "title": "Relo: Take the Agent's Version"
+      },
+      {
+        "command": "relo.changes.resolveMine",
+        "title": "Relo: Keep Mine"
+      },
+      {
+        "command": "relo.changes.resolveHead",
+        "title": "Relo: Send to Head Agent"
+      },
+      {
         "command": "relo.changes.acceptAll",
         "title": "Relo: Accept All Changes"
       },
       {
         "command": "relo.changes.rejectAll",
         "title": "Relo: Reject All Changes"
+      },
+      {
+        "command": "relo.changes.undo",
+        "title": "Relo: Undo Accepted Change"
       }
     ],
     "menus": {
@@ -282,6 +298,10 @@
         },
         {
           "command": "relo.changes.diff",
+          "when": "false"
+        },
+        {
+          "command": "relo.changes.undo",
           "when": "false"
         }
       ]
@@ -497,6 +517,12 @@
           "scope": "window",
           "description": "Automatically accept clean proposed changes into the selected repository as unstaged edits. Never stages, commits or pushes. Conflicted changes remain proposed for review."
         },
+        "relo.changes.lazyConflicts": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Project every proposed change against the workspace after each accept or undo, so conflicts are visible without clicking Resolve conflicts. Off keeps the string-based behavior."
+        },
         "relo.autoVerify": {
           "type": "boolean",
           "default": true,
@@ -638,7 +664,7 @@
     "watch": "tsc -p . -w",
     "lint": "eslint src --max-warnings=0 && tsc -p . --noEmit",
     "typecheck": "tsc -p . --noEmit",
-    "test": "tsx --test src/protocol.test.ts src/settingsBridge.test.ts src/providers.test.ts src/uiState.test.ts src/crashBreaker.test.ts src/repository.test.ts && node --test ../webview/src/main.test.js ../tests/protocol-contract.test.mjs",
+    "test": "tsx --test src/protocol.test.ts src/settingsBridge.test.ts src/providers.test.ts src/uiState.test.ts src/crashBreaker.test.ts src/repository.test.ts src/dirtyGate.test.ts && node --test ../webview/src/main.test.js ../tests/protocol-contract.test.mjs",
     "package": "cd .. && make package"
   },
   "devDependencies": {

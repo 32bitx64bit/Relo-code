@@ -492,7 +492,7 @@
     const controls = `<div class="drawer-row"><label><input type="checkbox" data-auto-apply${autoApply ? " checked" : ""}/> Auto-apply proposed changes</label></div>
       <div class="drawer-row mini">Unstaged edits only. No commit or push.</div>
       <div class="drawer-row mini"><button type="button" class="link-btn grow" data-cmd="relo.selectRepository" title="${attr(repo ? `Select repository: ${repo.root}` : "Select repository")}">${esc(repo ? repo.root : "Select repository")}</button>${repo ? ` <span>${esc(repo.branch)}</span>` : ""}</div>`;
-    const changes = (s.changes || []).filter((c) => !(c && c.superseded));
+    const changes = (s.changes || []).filter((c) => c && !c.superseded && !c.supersededBy);
     if (!changes.length) return controls + `<div class="drawer-row mini">No changes</div>`;
     const resolving = changes.filter((c) => c.resolving && !isDecided(c)).length;
     const banner = resolving ? `<div class="drawer-row mini" role="status">Resolving ${resolving} conflict${resolving === 1 ? "" : "s"} via head agent</div>` : "";
@@ -507,13 +507,29 @@
       const off = applied ? ` disabled title="Applied directly; cannot revert" aria-label="Applied directly; cannot revert"` : decided ? ` disabled title="Already ${esc(status)}" aria-label="Already ${esc(status)}"` : "";
       const lines = (c.added || c.deleted) ? `<span class="mini">+${c.added || 0} -${c.deleted || 0}</span>` : "";
       const state = decided ? `<span class="mini">${esc(status)}</span>` : "";
+      const integ = c.integration || null;
+      const conflicted = integ ? integ.state === "conflicted" : !!c.conflict;
+      const kind = (integ && integ.kind) || c.conflict || "";
+      const reason = (integ && integ.reason) || c.conflict || "";
+      const hunks = integ && Array.isArray(integ.hunks) ? integ.hunks.filter((h) => h && h.conflicting).length : 0;
+      const since = integ && Array.isArray(integ.since) ? integ.since.filter(Boolean) : [];
+      const cause = since.length ? `Since ${since.join(", ")}` : "";
+      const hunkNote = hunks ? `${hunks} conflicting hunk${hunks === 1 ? "" : "s"}` : "";
+      const detail = [reason, cause, hunkNote].filter(Boolean).join(" · ");
+      const conflictBadge = conflicted && !decided
+        ? `<span class="badge" title="${attr(kind || "conflict")}">${esc(kind || "conflict")}</span>${detail ? `<div class="mini" role="note">${esc(detail)}</div>` : ""}`
+        : "";
+      const resolveActions = conflicted && !decided
+        ? `${rowBtn("command", "relo.changes.resolveAgent", c.id, "arrow-right", "Take the agent's version")}${rowBtn("command", "relo.changes.resolveMine", c.id, "discard", "Keep mine")}${rowBtn("command", "relo.changes.resolveHead", c.id, "comment-discussion", "Send to head agent")}`
+        : "";
       return `<div class="drawer-row${decided ? " dim" : ""}" role="treeitem" aria-level="1" data-key="ch-${attr(c.id)}">
         ${deco}
         <button type="button" class="link-btn grow" data-command="relo.changes.diff" data-id="${attr(c.id)}" title="Open diff">${esc(c.path)}</button>
-        ${lines}${state}${c.conflict && !decided ? `<span class="badge" title="${attr(c.conflict)}">conflict</span><div class="mini" role="note">Conflict: ${esc(c.conflict)}</div>` : ""}${c.resolving && !decided ? `<span class="mini" role="status">resolving</span>` : ""}
+        ${lines}${state}${conflictBadge}${c.resolving && !decided ? `<span class="mini" role="status">resolving</span>` : ""}
         <span class="actions shown">
           ${rowBtn("command", "relo.changes.accept", c.id, "check", "Accept change", off)}
           ${rowBtn("command", "relo.changes.reject", c.id, "close", "Reject change", off)}
+          ${resolveActions}
         </span>
       </div>`;
     }).join("");
