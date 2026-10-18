@@ -132,6 +132,22 @@ func TestPrimaryStaticHasNoModeLeakRule(t *testing.T) {
 	}
 }
 
+func TestPrimaryPromptSplitsWorkWithoutCollisions(t *testing.T) {
+	p := For(agent.Primary)
+	for _, rule := range []string{
+		"one task covers one subsystem and at most about 25 files",
+		"explicit file scope in paths",
+		"add a dependency only when one needs the other's output",
+		"Never let more than one task edit the same shared ledger, changelog, status document or registry file",
+		"ONE integration task after the source tasks finish",
+		"Architect tasks put the whole design in their report summary",
+	} {
+		if !strings.Contains(p, rule) {
+			t.Errorf("Primary prompt missing planning rule %q", rule)
+		}
+	}
+}
+
 func longestCommonPrefix(a, b string) int {
 	n := len(a)
 	if len(b) < n {

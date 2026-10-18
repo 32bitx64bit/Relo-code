@@ -37,7 +37,12 @@ Workers must return JSON:
 Parents consume this report, not the worker transcript.
 
 - `handoff` is what tasks that build on this one need (names, signatures, file paths, decisions). It is the one part of a report that is not compressed: dependent tasks receive it whole, up to 800 characters.
+- An architect's report is the spec its dependent tasks build from, so its `summary` keeps up to 24,000 characters; every other role is held to `relo.report.maxChars` (default 1,200). The Primary and the project memory still see the architect's report at the shorter limit, and only the tasks that depend on it receive the full text.
 - `status: "blocked"` with a `question` is for a decision that is not the agent's to make. The task ends without a retry, the agent shows "Needs a decision", and the Primary reads the question in the report and answers it in a replacement task or asks the user.
+
+## Planning
+
+Planning is not capped: a session may plan any number of tasks, and a task with the same role and title as one already planned is dropped as a repeat unless the earlier one failed or was canceled. The Primary prompt tells the planner to keep a task to one subsystem and about 25 files, to give every task the files it edits in `paths`, to let only one task edit a shared ledger, changelog, status or registry file, and to produce tracked build outputs (dll, pdb, generated assets) from a single integration task after the source tasks finish.
 
 ## Worker start
 

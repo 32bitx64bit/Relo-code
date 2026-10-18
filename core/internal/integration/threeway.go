@@ -54,6 +54,9 @@ type Analysis struct {
 	Reason string `json:"reason,omitempty"`
 	Ours   string `json:"ours,omitempty"` // git blob id of the workspace file, or "-" when absent
 	Hunks  []Hunk `json:"hunks,omitempty"`
+	// Resolved names the deterministic rule that settled a file that would otherwise conflict: "whitespace",
+	// "take-latest" or "union". It is empty when no rule fired.
+	Resolved string `json:"resolved,omitempty"`
 	// Merged is the merged content, set for created, updated and merged actions. It is never written by Analyze.
 	Merged []byte `json:"-"`
 	// Fingerprint identifies the three inputs (workspace, base, agent) the preview was computed from, so an
@@ -115,6 +118,14 @@ func analyze(root, worktree, rel string, baseText []byte, hadBase bool, override
 	}
 	out.Ours = blobID(ours, hasOurs)
 	out.Fingerprint = fingerprint(out.Ours, baseText, hadBase, theirs, hasTheirs)
+	// takeLatest paths are declared generated outputs, so every conflict below resolves to the agent's side.
+	takeLatest := TakesLatest(path)
+	conflict := func(kind, reason string) Analysis {
+		if takeLatest {
+			return latestWins(out, hasOurs, theirs, hasTheirs)
+		}
+		return conflictAnalysis(out, kind, reason)
+	}
 	switch {
 	case !hasTheirs && !hadBase:
 		out.Action = "unchanged"
@@ -125,7 +136,7 @@ func analyze(root, worktree, rel string, baseText []byte, hadBase bool, override
 			return out, nil
 		}
 		if !bytes.Equal(ours, baseText) {
-			return conflictAnalysis(out, KindModifyDelete, "you changed this file after the agent started, and the agent deleted it"), nil
+			return conflict(KindModifyDelete, "you changed this file after the agent started, and the agent deleted it"), nil
 		}
 		out.Action = "deleted"
 		return out, nil
@@ -133,14 +144,23 @@ func analyze(root, worktree, rel string, baseText []byte, hadBase bool, override
 		out.Action = "unchanged"
 		return out, nil
 	case !hadBase: // the agent created it
-		if hasOurs {
-			return conflictAnalysis(out, KindAddAdd, "the file exists in your workspace and the agent created a different one"), nil
+		if !hasOurs {
+			out.Action = "created"
+			out.Merged = theirs
+			return out, nil
 		}
-		out.Action = "created"
-		out.Merged = theirs
-		return out, nil
+		if takeLatest {
+			return latestWins(out, hasOurs, theirs, hasTheirs), nil
+		}
+		// Line endings and trailing blanks are not content: a copy that differs only there keeps the workspace file.
+		if sameIgnoringTrailingSpace(ours, theirs) {
+			out.Action = "unchanged"
+			out.Resolved = "whitespace"
+			return out, nil
+		}
+		return conflictAnalysis(out, KindAddAdd, "the file exists in your workspace and the agent created a different one"), nil
 	case !hasOurs:
-		return conflictAnalysis(out, KindDeleteModify, "you deleted this file after the agent started, and the agent changed it"), nil
+		return conflict(KindDeleteModify, "you deleted this file after the agent started, and the agent changed it"), nil
 	case bytes.Equal(ours, baseText):
 		out.Action = "updated"
 		out.Merged = theirs
@@ -149,7 +169,7 @@ func analyze(root, worktree, rel string, baseText []byte, hadBase bool, override
 	if isBinary(ours) || isBinary(baseText) || isBinary(theirs) {
 		// Kind says binary; the reason keeps the wording stored by earlier releases, so a re-check of an old
 		// conflict does not change the text the user already saw.
-		return conflictAnalysis(out, KindBinary, "your edits and the agent's edits overlap"), nil
+		return conflict(KindBinary, "your edits and the agent's edits overlap"), nil
 	}
 	merged, clean, err := mergeFile(ours, baseText, theirs)
 	if err != nil {
@@ -157,6 +177,17 @@ func analyze(root, worktree, rel string, baseText []byte, hadBase bool, override
 	}
 	shadowCompare(path, ours, baseText, theirs, clean)
 	if !clean {
+		if takeLatest {
+			return latestWins(out, hasOurs, theirs, hasTheirs), nil
+		}
+		if UnionMerges(path) {
+			if union, ok := unionMerge(ours, baseText, theirs); ok {
+				out.Action = "merged"
+				out.Merged = union
+				out.Resolved = "union"
+				return out, nil
+			}
+		}
 		hunks, herr := diffHunks(ours, baseText, theirs, clean)
 		if herr != nil {
 			return out, herr
@@ -361,6 +392,83 @@ func applyAnalysis(root, worktree string, a Analysis) error {
 func conflictAnalysis(out Analysis, kind, reason string) Analysis {
 	out.Kind, out.Reason = kind, reason
 	return out
+}
+
+// latestWins resolves a conflict by taking the agent's side: its file replaces the workspace file, or the
+// workspace file is removed when the agent deleted it.
+func latestWins(out Analysis, hasOurs bool, theirs []byte, hasTheirs bool) Analysis {
+	out.Kind, out.Reason, out.Hunks = "", "", nil
+	out.Resolved = "take-latest"
+	switch {
+	case hasTheirs && hasOurs:
+		out.Action, out.Merged = "updated", theirs
+	case hasTheirs:
+		out.Action, out.Merged = "created", theirs
+	case hasOurs:
+		out.Action = "deleted"
+	default:
+		out.Action = "unchanged"
+	}
+	return out
+}
+
+// sameIgnoringTrailingSpace reports whether two text files differ only in line endings, trailing spaces and tabs,
+// or trailing blank lines. Interior whitespace still counts, since it can change the meaning of Python or YAML.
+func sameIgnoringTrailingSpace(a, b []byte) bool {
+	if isBinary(a) || isBinary(b) {
+		return false
+	}
+	return normalizeTrailing(a) == normalizeTrailing(b)
+}
+
+func normalizeTrailing(data []byte) string {
+	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimRight(line, " \t")
+	}
+	return strings.TrimRight(strings.Join(lines, "\n"), "\n")
+}
+
+// unionMerge keeps the lines both sides added. It applies only when neither side changed or removed a base line,
+// so the base lines are a subsequence of each side. It reports false, and the caller keeps the conflict, when the
+// result fails a check: a conflict marker, or a line of either side missing from it.
+func unionMerge(ours, base, theirs []byte) ([]byte, bool) {
+	if !isSubsequence(textLines(base), textLines(ours)) || !isSubsequence(textLines(base), textLines(theirs)) {
+		return nil, false
+	}
+	merged, clean, err := mergeFile(ours, base, theirs, "--union")
+	if err != nil || !clean {
+		return nil, false
+	}
+	for _, line := range textLines(merged) {
+		if strings.HasPrefix(line, "<<<<<<<") || strings.HasPrefix(line, ">>>>>>>") || line == "=======" {
+			return nil, false
+		}
+	}
+	if !isSubsequence(textLines(ours), textLines(merged)) || !isSubsequence(textLines(theirs), textLines(merged)) {
+		return nil, false
+	}
+	return merged, true
+}
+
+// textLines splits data into lines without their newlines; a final newline does not start an empty line.
+func textLines(data []byte) []string {
+	if len(data) == 0 {
+		return nil
+	}
+	return strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+}
+
+// isSubsequence reports whether every element of sub appears in seq in the same order. Matching greedily from the
+// front is exact for subsequences.
+func isSubsequence(sub, seq []string) bool {
+	i := 0
+	for _, s := range seq {
+		if i < len(sub) && s == sub[i] {
+			i++
+		}
+	}
+	return i == len(sub)
 }
 
 func blobID(data []byte, present bool) string {

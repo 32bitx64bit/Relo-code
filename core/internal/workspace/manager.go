@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/relocode/relo/internal/pathglob"
 )
 
 type Snapshot struct {
@@ -50,6 +52,8 @@ type Manager struct {
 	snapshotCommitFn     func(Snapshot) (string, bool) // test seam: forces the HEAD fallback path
 	snapshotValidateFn   func(Snapshot) bool           // test seam: forces a failed snapshot validation
 	journalMu            sync.Mutex                    // serialises journal entries and undo
+	ignoreMu             sync.RWMutex                  // guards ignore; apart from mu, which callers hold while running git
+	ignore               []string                      // the user's ignorePaths, set by SetIgnore
 }
 
 func New(root string) *Manager {
@@ -79,13 +83,18 @@ func (m *Manager) Snapshot() (Snapshot, error) {
 		}
 		path := entry[3:]
 		if strings.HasPrefix(entry, "??") {
-			s.Untracked = append(s.Untracked, path)
+			if !isReloPath(path) {
+				s.Untracked = append(s.Untracked, path)
+			}
 			continue
 		}
-		s.Dirty = append(s.Dirty, path)
+		if !isReloPath(path) {
+			s.Dirty = append(s.Dirty, path)
+		}
+		// A rename or copy is followed by its source path in the next record; each side is skipped on its own.
 		if strings.Contains(entry[:2], "R") || strings.Contains(entry[:2], "C") {
 			i++
-			if i < len(entries) && entries[i] != "" {
+			if i < len(entries) && entries[i] != "" && !isReloPath(entries[i]) {
 				s.Dirty = append(s.Dirty, entries[i])
 			}
 		}
@@ -203,6 +212,12 @@ func (m *Manager) snapshotIndex(s Snapshot) (index string, env []string, cleanup
 	}
 	env = append(os.Environ(), "GIT_INDEX_FILE="+index,
 		"GIT_AUTHOR_NAME=Relo", "GIT_AUTHOR_EMAIL=relo@localhost", "GIT_COMMITTER_NAME=Relo", "GIT_COMMITTER_EMAIL=relo@localhost")
+	// .relo can be tracked (the database is committed in some repos). Its writes while the snapshot is taken make
+	// git add fail, which would cut agents from HEAD, so it is dropped from the private index only.
+	if _, err := gitEnv(m.root, env, "rm", "-r", "--cached", "--ignore-unmatch", "-q", "--", ".relo"); err != nil {
+		cleanup()
+		return "", nil, func() {}, err
+	}
 	add := "-A"
 	if len(s.Untracked) > maxSnapshotUntracked {
 		add = "-u"
@@ -390,13 +405,45 @@ func (m *Manager) Tree(agentID string) (Tree, bool) {
 	return t, ok
 }
 
+// reloGlob is Relo's own folder. It is never the user's work, even when a repository tracks it.
+const reloGlob = ".relo/**"
+
+// SetIgnore sets the paths (relo.changes.ignorePaths) that never become proposed changes.
+func (m *Manager) SetIgnore(globs []string) {
+	m.ignoreMu.Lock()
+	defer m.ignoreMu.Unlock()
+	m.ignore = append([]string(nil), globs...)
+}
+
+// Ignored reports whether rel is never a proposed change: Relo's own folder always, and the user's ignore paths.
+func (m *Manager) Ignored(rel string) bool { return m.ignored(rel) }
+
+// ignored reports whether rel is hidden from change listings: Relo's own folder always, and the user's ignore paths.
+func (m *Manager) ignored(rel string) bool {
+	if isReloPath(rel) {
+		return true
+	}
+	m.ignoreMu.RLock()
+	defer m.ignoreMu.RUnlock()
+	return pathglob.Any(m.ignore, rel)
+}
+
+func isReloPath(rel string) bool {
+	return pathglob.Match(reloGlob, rel)
+}
+
 func (m *Manager) Changed(agentID string) ([]string, error) {
 	t, ok := m.Tree(agentID)
 	if !ok {
 		return nil, nil
 	}
 	if t.Path == m.root {
-		out := append(append([]string(nil), m.Base().Dirty...), m.Base().Untracked...)
+		var out []string
+		for _, rel := range append(append([]string(nil), m.Base().Dirty...), m.Base().Untracked...) {
+			if !m.ignored(rel) {
+				out = append(out, rel)
+			}
+		}
 		return out, nil
 	}
 	if _, err := git(t.Path, "add", "-A"); err != nil {
@@ -408,7 +455,7 @@ func (m *Manager) Changed(agentID string) ([]string, error) {
 	}
 	var files []string
 	for _, l := range strings.Split(out, "\x00") {
-		if l != "" {
+		if l != "" && !m.ignored(l) {
 			files = append(files, l)
 		}
 	}
@@ -588,7 +635,7 @@ func (m *Manager) ChangedFiles(agentID string) ([]FileChange, error) {
 	parts := strings.Split(names, "\x00")
 	for i := 0; i+1 < len(parts); i += 2 {
 		status, path := parts[i], parts[i+1]
-		if status == "" || path == "" {
+		if status == "" || path == "" || m.ignored(path) {
 			continue
 		}
 		kind := "modified"

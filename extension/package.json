@@ -553,6 +553,41 @@
           "scope": "window",
           "description": "Refuse to accept a stacked change alone, accept it with its parents as a group, block dependents when a parent is rejected or superseded, and let auto-apply release a dependent only after its parents are accepted."
         },
+        "relo.changes.ignorePaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            ".relo/**",
+            "**/obj/**",
+            "**/bin/Debug/**",
+            "**/bin/Release/**"
+          ],
+          "scope": "window",
+          "description": "Workspace-relative glob patterns for build output and generated files that Relo never shows as changes or conflicts. A pattern without / matches a file name anywhere (*.log); a pattern with / is anchored at the workspace root; ** matches any number of folders. .relo/** is always ignored."
+        },
+        "relo.changes.unionPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "*.md",
+            "*.txt"
+          ],
+          "scope": "window",
+          "description": "Files where, when two sides both only add lines, Relo keeps both sides' lines automatically instead of reporting a conflict (ledgers, changelogs)."
+        },
+        "relo.changes.takeLatestPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "window",
+          "description": "Files, typically rebuilt binaries such as **/Assemblies/*.dll, where the newest agent version always wins when two agents produce one."
+        },
         "relo.scheduler.pathLeases": {
           "type": "boolean",
           "default": false,

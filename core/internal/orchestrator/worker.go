@@ -206,35 +206,77 @@ func (c *Coord) noticeDirectMode() {
 // the snapshot fell back to HEAD, or it left out untracked files above the cap.
 func (c *Coord) noticeSnapshot(headFallback, truncated bool) {
 	if headFallback {
-		c.snapshotNoticeOnce("fallback", "Relo could not record your working tree, so this agent was cut from HEAD and does not see your uncommitted edits.")
+		c.snapshotNotice("fallback", "Relo could not record your working tree, so this agent was cut from HEAD and does not see your uncommitted edits, including work you already accepted. Expect duplicate or conflicting changes until this is fixed.")
 	}
 	if truncated {
-		c.snapshotNoticeOnce("truncated", "Relo found more than 2000 untracked files and recorded only tracked files. This agent does not see the extra new files.")
+		c.snapshotNotice("truncated", "Relo found more than 2000 untracked files and recorded only tracked files. This agent does not see the extra new files.")
 	}
 }
 
 // noticeSnapshotFailure reports the fail-closed path: no agent runs on a base that could not be verified.
 func (c *Coord) noticeSnapshotFailure(err error) {
-	c.snapshotNoticeOnce("failed", "Relo could not record a consistent snapshot of your working tree after 3 attempts, so no agent was started against it. Nothing was changed. "+err.Error())
+	c.snapshotNotice("failed", "Relo could not record a consistent snapshot of your working tree after 3 attempts, so no agent was started against it. Nothing was changed. "+err.Error())
 }
 
-func (c *Coord) snapshotNoticeOnce(kind, text string) {
+// snapshotNoticeEvery is the least time between two fallback or failed notices of one session. Each agent cut
+// while the problem lasts repeats it, so a single notice early on is easy to miss.
+const snapshotNoticeEvery = time.Minute
+
+// snapshotNoticeClock is time.Now. Tests replace it to move the notice clock.
+var snapshotNoticeClock = time.Now
+
+// snapshotNoticeKey names one notice of one coordinator's session.
+type snapshotNoticeKey struct {
+	coord *Coord
+	key   string
+}
+
+// snapshotNoticeLast is when each fallback or failed notice was last posted. It lives outside Coord so the notice
+// state stays with its code.
+var (
+	snapshotNoticeMu   sync.Mutex
+	snapshotNoticeLast = map[snapshotNoticeKey]time.Time{}
+)
+
+// snapshotNotice posts a snapshot notice for the current session. A truncation notice is posted once per session.
+// A fallback or failure is posted again when it recurs, at most once per snapshotNoticeEvery.
+func (c *Coord) snapshotNotice(kind, text string) {
 	c.mu.Lock()
 	if c.sess == nil {
 		c.mu.Unlock()
 		return
 	}
 	key := kind + ":" + c.sess.ID
-	if c.snapshotNoticed == nil {
-		c.snapshotNoticed = map[string]bool{}
-	}
-	if c.snapshotNoticed[key] {
+	if kind == "truncated" {
+		if c.snapshotNoticed == nil {
+			c.snapshotNoticed = map[string]bool{}
+		}
+		if c.snapshotNoticed[key] {
+			c.mu.Unlock()
+			return
+		}
+		c.snapshotNoticed[key] = true
 		c.mu.Unlock()
+		c.chat("system", text, "")
 		return
 	}
-	c.snapshotNoticed[key] = true
 	c.mu.Unlock()
+	if !claimSnapshotNotice(snapshotNoticeKey{coord: c, key: key}) {
+		return
+	}
 	c.chat("system", text, "")
+}
+
+// claimSnapshotNotice reports whether a notice may be posted now, and records the post if so.
+func claimSnapshotNotice(k snapshotNoticeKey) bool {
+	snapshotNoticeMu.Lock()
+	defer snapshotNoticeMu.Unlock()
+	now := snapshotNoticeClock()
+	if last, ok := snapshotNoticeLast[k]; ok && now.Sub(last) < snapshotNoticeEvery {
+		return false
+	}
+	snapshotNoticeLast[k] = now
+	return true
 }
 
 func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent) error {
@@ -457,34 +499,59 @@ func (c *Coord) verifyAndRepair(ctx context.Context, a agent.Agent, parts prompt
 	}
 }
 
-func (c *Coord) clampReport(rep RawReport) RawReport {
-	maxSummary := c.settings().ReportMaxChars
-	if maxSummary <= 0 {
-		maxSummary = 1200
+// designReportMaxChars is the summary room an architect's report gets. Its design is the spec the dependent workers
+// build from; at the Primary's short limit they lost most of it and re-derived it. Other roles keep the configured limit.
+const designReportMaxChars = 24000
+
+// summaryLimit is how many runes of summary a report written by role keeps.
+func (c *Coord) summaryLimit(role agent.Role) int {
+	limit := c.settings().ReportMaxChars
+	if limit <= 0 {
+		limit = 1200
 	}
+	if role == agent.Architect {
+		limit = max(limit, designReportMaxChars)
+	}
+	return limit
+}
+
+// clipText keeps at most limit runes of s. A cut ends in a "...[clipped N]" marker counting what was removed, so
+// the reader knows the text is not whole.
+func clipText(s string, limit int) (string, bool) {
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s, false
+	}
+	removed := len(runes) - limit
+	marker := fmt.Sprintf("...[clipped %d]", removed)
+	for {
+		keep := max(0, limit-len([]rune(marker)))
+		next := fmt.Sprintf("...[clipped %d]", len(runes)-keep)
+		if len([]rune(next)) == len([]rune(marker)) {
+			marker = next
+			break
+		}
+		marker = next
+	}
+	keep := max(0, limit-len([]rune(marker)))
+	if len([]rune(marker)) > limit {
+		return string([]rune(marker)[:limit]), true
+	}
+	return string(runes[:keep]) + marker, true
+}
+
+// clampReport clamps a report with the limits of a role that has none of its own.
+func (c *Coord) clampReport(rep RawReport) RawReport {
+	return c.clampReportFor("", rep)
+}
+
+// clampReportFor clamps rep as written by role. Only the summary limit depends on the role.
+func (c *Coord) clampReportFor(role agent.Role, rep RawReport) RawReport {
 	clipped := false
 	clip := func(s string, limit int) string {
-		runes := []rune(s)
-		if len(runes) <= limit {
-			return s
-		}
-		clipped = true
-		removed := len(runes) - limit
-		marker := fmt.Sprintf("...[clipped %d]", removed)
-		for {
-			keep := max(0, limit-len([]rune(marker)))
-			next := fmt.Sprintf("...[clipped %d]", len(runes)-keep)
-			if len([]rune(next)) == len([]rune(marker)) {
-				marker = next
-				break
-			}
-			marker = next
-		}
-		keep := max(0, limit-len([]rune(marker)))
-		if len([]rune(marker)) > limit {
-			return string([]rune(marker)[:limit])
-		}
-		return string(runes[:keep]) + marker
+		out, cut := clipText(s, limit)
+		clipped = clipped || cut
+		return out
 	}
 	clampList := func(items []string) []string {
 		out := make([]string, 0, min(8, len(items)))
@@ -503,7 +570,7 @@ func (c *Coord) clampReport(rep RawReport) RawReport {
 		}
 		return out
 	}
-	rep.Summary = clip(rep.Summary, maxSummary)
+	rep.Summary = clip(rep.Summary, c.summaryLimit(role))
 	rep.Cause = clip(rep.Cause, 240)
 	rep.Handoff = clip(rep.Handoff, prompt.ReportHandoffMaxLength)
 	rep.Question = clip(rep.Question, prompt.ReportQuestionMaxLength)
@@ -728,7 +795,10 @@ func withHandoff(content, handoff string) string {
 }
 
 func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, outcome verifyOutcome) {
-	rep = c.clampReport(rep)
+	// The Primary and memory get the short summary at the configured limit, whatever the role's own limit is. The
+	// full summary (for an architect, the design) is kept for the dependent tasks that build on it.
+	short, _ := clipText(rep.Summary, c.summaryLimit(""))
+	rep = c.clampReportFor(a.Role, rep)
 	settings := c.settings()
 	st := agent.Completed
 	if strings.EqualFold(rep.Status, "failed") {
@@ -748,6 +818,7 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 			text += "\n" + summary
 		}
 		rep.Question, rep.Summary = question, text
+		short, _ = clipText(text, c.summaryLimit(""))
 	}
 	checksFailed := outcome.ran && !outcome.passed
 	if checksFailed {
@@ -804,11 +875,11 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		c.emit("finding.created", f)
 	}
 	if settings.Memory && !blocked {
-		c.Memory.Upsert(memory.Entry{Kind: "finding", Title: firstLine(rep.Summary), Body: ctxeng.CompressReport(rep.Summary, files, verifyLines(rep), rep.Risks, rep.Cause), Files: files, Verified: st == agent.Completed && !checksFailed && a.Role != agent.Probe, Score: 0.6})
+		c.Memory.Upsert(memory.Entry{Kind: "finding", Title: firstLine(short), Body: ctxeng.CompressReport(short, files, verifyLines(rep), rep.Risks, rep.Cause), Files: files, Verified: st == agent.Completed && !checksFailed && a.Role != agent.Probe, Score: 0.6})
 		c.emit("memory.updated", map[string]any{"agentId": a.ID})
 	}
 	if parent, ok := c.Agents.Primary(); ok {
-		sum := ctxeng.CompressReport(rep.Summary, files, verifyLines(rep), rep.Risks, rep.Cause)
+		sum := ctxeng.CompressReport(short, files, verifyLines(rep), rep.Risks, rep.Cause)
 		c.Engine.Ingest(parent.ID, []ctxeng.Item{{
 			Class: ctxeng.ClassReport, Source: ctxeng.SourceParent, Title: a.Title, Content: sum,
 			Files: files, Durability: 0.95, Verified: st == agent.Completed && !checksFailed, AgentID: a.ID, TaskID: t.ID,

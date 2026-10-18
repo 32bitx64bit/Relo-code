@@ -245,6 +245,9 @@ export interface InitializeSettings {
   providers: unknown[];
   providerKeys: Record<string, string>;
   modelEfforts: Record<string, string>;
+  ignorePaths: string[];
+  unionPaths: string[];
+  takeLatestPaths: string[];
   [setting: string]: unknown;
 }
 

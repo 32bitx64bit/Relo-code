@@ -30,6 +30,19 @@ test("changes settings and repository command match the extension manifest", () 
   assert.ok(manifest.contributes.commands.some((c: { command: string }) => c.command === "relo.selectRepository"));
 });
 
+test("path-list settings are declared as string arrays with the core's defaults", () => {
+  const manifest = JSON.parse(readFileSync("package.json", "utf8"));
+  const actual: SettingsSchema = manifest.contributes.configuration.properties;
+  assert.deepEqual(actual["relo.changes.ignorePaths"].default, [".relo/**", "**/obj/**", "**/bin/Debug/**", "**/bin/Release/**"]);
+  assert.deepEqual(actual["relo.changes.unionPaths"].default, ["*.md", "*.txt"]);
+  assert.deepEqual(actual["relo.changes.takeLatestPaths"].default, []);
+  for (const key of ["relo.changes.ignorePaths", "relo.changes.unionPaths", "relo.changes.takeLatestPaths"]) {
+    assert.equal(actual[key].type, "array", key);
+    assert.equal(checkSetting(key, ["**/obj/**"], actual).ok, true, key);
+    assert.equal(checkSetting(key, "*.md", actual).ok, false, key);
+  }
+});
+
 test("settings: non-relo key rejected", () => {
   assert.equal(checkSetting("other.key", "x", schema).ok, false);
   assert.equal(checkSetting("relo.__proto__", "x", schema).ok, false);

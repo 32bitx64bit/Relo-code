@@ -254,7 +254,6 @@ type Coord struct {
 	directNotified  string            // session ID that already received the direct-mode notice; guarded by mu
 	snapshotNoticed map[string]bool   // session ID -> the snapshot notice was already shown; guarded by mu
 	baseline        map[string]bool   // "baseline dir\x00command" -> command already fails without the agent's change; guarded by mu
-	tasksPlanned    int               // tasks Primary has added this session; guarded by mu
 }
 
 func New(log *logging.Logger) *Coord {

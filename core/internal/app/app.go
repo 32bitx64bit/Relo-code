@@ -13,10 +13,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/relocode/relo/internal/agent"
 	ctxeng "github.com/relocode/relo/internal/context"
 	"github.com/relocode/relo/internal/id"
+	"github.com/relocode/relo/internal/integration"
 	"github.com/relocode/relo/internal/ipc"
 	"github.com/relocode/relo/internal/logging"
 	"github.com/relocode/relo/internal/memory"
@@ -587,6 +589,23 @@ func (a *App) applySettings(p map[string]any) {
 	if n := int(num(p, "reportMaxChars", 0)); n > 0 {
 		s.ReportMaxChars = n
 	}
+	if list, ok := pathList(p, "ignorePaths"); ok {
+		if ws := a.Coord.WS; ws != nil {
+			ws.SetIgnore(list)
+		}
+	}
+	union, hasUnion := pathList(p, "unionPaths")
+	takeLatest, hasTakeLatest := pathList(p, "takeLatestPaths")
+	if hasUnion || hasTakeLatest {
+		pol := integration.CurrentPolicy()
+		if hasUnion {
+			pol.Union = union
+		}
+		if hasTakeLatest {
+			pol.TakeLatest = takeLatest
+		}
+		integration.SetPolicy(pol)
+	}
 	if efficiency, ok := p["efficiency"].(map[string]any); ok {
 		a.Efficiency = efficiency
 		prefs := parseEfficiencyPrefs(efficiency)
@@ -1060,6 +1079,45 @@ func str(m map[string]any, k, def string) string {
 		return v
 	}
 	return def
+}
+
+// Limits for path-glob settings from the extension (relo.changes.*Paths). Entries past them are dropped.
+const (
+	maxPathEntries = 100
+	maxPathChars   = 256
+)
+
+// pathList returns the usable strings of the array at m[k]: trimmed, non-empty, at most maxPathChars characters,
+// and at most maxPathEntries of them. ok is false when the key is absent or not an array, so the caller keeps its
+// current value; an empty array is ok and means none.
+func pathList(m map[string]any, k string) (list []string, ok bool) {
+	var raw []any
+	switch v := m[k].(type) {
+	case []any:
+		raw = v
+	case []string:
+		for _, s := range v {
+			raw = append(raw, s)
+		}
+	default:
+		return nil, false
+	}
+	list = []string{}
+	for _, item := range raw {
+		if len(list) == maxPathEntries {
+			break
+		}
+		s, isString := item.(string)
+		if !isString {
+			continue
+		}
+		s = strings.TrimSpace(s)
+		if s == "" || utf8.RuneCountInString(s) > maxPathChars {
+			continue
+		}
+		list = append(list, s)
+	}
+	return list, true
 }
 
 func num(m map[string]any, k string, def float64) float64 {

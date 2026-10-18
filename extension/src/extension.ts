@@ -37,7 +37,7 @@ let coreLifecycle: Promise<void> = Promise.resolve();
 let postedRepository = "";
 
 // Settings that core consumes; a change to any of them re-applies to the running core.
-const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context", "relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics", "relo.scheduler.pathLeases"];
+const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context", "relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics", "relo.changes.ignorePaths", "relo.changes.unionPaths", "relo.changes.takeLatestPaths", "relo.scheduler.pathLeases"];
 
 export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   output = vscode.window.createOutputChannel("Relo");
@@ -416,7 +416,7 @@ function workspacePath(): string {
 }
 
 function settingTarget(subkey: string): vscode.ConfigurationTarget {
-  return (subkey === "repository" || subkey === "changes.autoApply" || subkey === "changes.lazyConflicts") && vscode.workspace.workspaceFolders?.length
+  return (subkey === "repository" || subkey === "changes.autoApply" || subkey === "changes.lazyConflicts" || subkey === "changes.ignorePaths" || subkey === "changes.unionPaths" || subkey === "changes.takeLatestPaths") && vscode.workspace.workspaceFolders?.length
     ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
 }
 
@@ -712,6 +712,9 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
     autoApply: c.get<boolean>("changes.autoApply", false),
     lazyConflicts: c.get<boolean>("changes.lazyConflicts", false),
     dependentSemantics: c.get<boolean>("changes.dependentSemantics", false),
+    ignorePaths: c.get<string[]>("changes.ignorePaths", [".relo/**", "**/obj/**", "**/bin/Debug/**", "**/bin/Release/**"]),
+    unionPaths: c.get<string[]>("changes.unionPaths", ["*.md", "*.txt"]),
+    takeLatestPaths: c.get<string[]>("changes.takeLatestPaths", []),
     pathLeases: c.get<boolean>("scheduler.pathLeases", false),
     routingMode: c.get<string>("routing.mode", "simple"),
     contextLimit: c.get<number>("models.contextLimit", 0),

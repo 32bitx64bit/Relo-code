@@ -120,7 +120,7 @@ func (c *Coord) CreateSession(workspace, objective string, mode Mode) *Session {
 	s := &Session{ID: id.New("sess"), Workspace: workspace, Objective: objective, Mode: mode, Status: "active", Created: time.Now().UTC(), Updated: time.Now().UTC(), Usage: map[string]any{}}
 	c.sess, c.reviewed = s, map[string]bool{}
 	c.Graph, c.Agents, c.Engine = taskgraph.New(), c.newRegistry(), ctxeng.New()
-	c.baseline, c.tasksPlanned = nil, 0
+	c.baseline = nil
 	c.mu.Unlock()
 	c.emit("session.created", s)
 	return cloneSession(s)
@@ -156,7 +156,7 @@ func (c *Coord) OpenSession(ctx context.Context, s *Session) {
 	c.lineage = map[string][]Dep{}
 	c.lineageProblems = map[string]lineageProblem{}
 	c.Graph, c.Agents, c.Engine = taskgraph.New(), c.newRegistry(), ctxeng.New()
-	c.baseline, c.tasksPlanned = nil, 0
+	c.baseline = nil
 	opened := cloneSession(c.sess)
 	c.mu.Unlock()
 	c.emit("session.opened", opened)
@@ -733,12 +733,9 @@ func (c *Coord) constraintsNote() string {
 	return "\n## Your standing constraints (every sub agent is given these; send the full list in constraints to change it)\n- " + strings.Join(s.Constraints, "\n- ") + "\n"
 }
 
-// maxPlannedTasks bounds how much work one session can fan out into. A model that keeps re-planning would otherwise
-// spend tokens without limit.
-const maxPlannedTasks = 40
-
-// admitTasks drops tasks that repeat work already planned (same title and role, not failed) and stops adding once
-// the session has planned maxPlannedTasks. What was dropped is said in chat, once.
+// admitTasks drops tasks that repeat work already planned (same title and role, not failed or canceled). There is
+// no cap on how many tasks a session can plan: long requests need many tasks, and a runaway planner is caught by
+// the duplicate check. Dropped duplicates are logged.
 func (c *Coord) admitTasks(specs []TurnTask) []TurnTask {
 	if len(specs) == 0 {
 		return specs
@@ -750,27 +747,18 @@ func (c *Coord) admitTasks(specs []TurnTask) []TurnTask {
 		}
 	}
 	var kept []TurnTask
-	dupes, capped := 0, 0
-	c.mu.Lock()
+	dupes := 0
 	for _, spec := range specs {
 		key := taskKey(spec.Title, string(parseRole(spec.Role)))
-		switch {
-		case seen[key]:
+		if seen[key] {
 			dupes++
-		case c.tasksPlanned >= maxPlannedTasks:
-			capped++
-		default:
-			seen[key] = true
-			c.tasksPlanned++
-			kept = append(kept, spec)
+			continue
 		}
+		seen[key] = true
+		kept = append(kept, spec)
 	}
-	c.mu.Unlock()
 	if dupes > 0 {
 		c.logWarn("planner repeated tasks", fmt.Errorf("dropped %d duplicate task(s)", dupes))
-	}
-	if capped > 0 {
-		c.chat("system", fmt.Sprintf("Relo stopped planning more work: this session already has %d tasks. Start a new session or narrow the request.", maxPlannedTasks), "")
 	}
 	// Dependencies on a dropped duplicate point at the original task of the same name.
 	return kept
@@ -841,7 +829,8 @@ func (c *Coord) workDone() string {
 	}
 	lines := []string{"Relo's planner did not write a summary, so these are the finished tasks' own reports:"}
 	for _, t := range done {
-		lines = append(lines, "- "+t.Title+": "+strings.TrimSpace(t.Report.(agent.Report).Summary))
+		summary, _ := clipText(strings.TrimSpace(t.Report.(agent.Report).Summary), c.summaryLimit(""))
+		lines = append(lines, "- "+t.Title+": "+summary)
 	}
 	return strings.Join(lines, "\n")
 }

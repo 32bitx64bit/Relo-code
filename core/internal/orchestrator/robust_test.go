@@ -34,7 +34,7 @@ func TestSnapshotListsAreNeverNull(t *testing.T) {
 	}
 }
 
-func TestAdmitTasksDropsRepeatsAndCapsPlanning(t *testing.T) {
+func TestAdmitTasksDropsRepeatsWithoutCappingPlanning(t *testing.T) {
 	c := New(logging.New(nil, logging.Error))
 	c.CreateSession(t.TempDir(), "", ModeBuild)
 	c.Graph.Add(taskgraph.Task{ID: "t1", Title: "Add login", Role: "worker", Status: taskgraph.Done})
@@ -48,21 +48,32 @@ func TestAdmitTasksDropsRepeatsAndCapsPlanning(t *testing.T) {
 	if len(got) != 2 || got[0].ID != "b" || got[1].ID != "c" {
 		t.Fatalf("admitted = %+v", got)
 	}
+	// Well past the old 40-task limit, distinct tasks are all admitted and no notice is posted.
 	var many []TurnTask
-	for i := 0; i < maxPlannedTasks+5; i++ {
+	for i := 0; i < 50; i++ {
 		many = append(many, TurnTask{ID: fmt.Sprint(i), Title: fmt.Sprint("task ", i), Role: "worker"})
 	}
-	if got := c.admitTasks(many); len(got) != maxPlannedTasks-2 {
-		t.Fatalf("cap admitted %d, want %d", len(got), maxPlannedTasks-2)
+	if got := c.admitTasks(many); len(got) != 50 {
+		t.Fatalf("admitted %d distinct tasks, want 50", len(got))
 	}
-	system := 0
 	for _, m := range c.Current().Messages {
-		if m.Role == "system" && strings.Contains(m.Text, "stopped planning") {
-			system++
+		if strings.Contains(m.Text, "stopped planning") {
+			t.Fatalf("planning was stopped: %q", m.Text)
 		}
 	}
-	if system != 1 {
-		t.Fatalf("cap notice shown %d times, want once", system)
+}
+
+func TestAdmitTasksReplansFailedOrCanceledWork(t *testing.T) {
+	c := New(logging.New(nil, logging.Error))
+	c.CreateSession(t.TempDir(), "", ModeBuild)
+	c.Graph.Add(taskgraph.Task{ID: "f", Title: "Fix parser", Role: "worker", Status: taskgraph.Failed})
+	c.Graph.Add(taskgraph.Task{ID: "x", Title: "Fix lexer", Role: "worker", Status: taskgraph.Canceled})
+	got := c.admitTasks([]TurnTask{
+		{ID: "p", Title: "Fix parser", Role: "worker"},
+		{ID: "l", Title: "Fix lexer", Role: "worker"},
+	})
+	if len(got) != 2 {
+		t.Fatalf("admitted = %+v, want failed and canceled tasks planned again", got)
 	}
 }
 

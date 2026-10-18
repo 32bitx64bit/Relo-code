@@ -49,8 +49,6 @@ func (a *App) resolveConflicts() (any, error) {
 
 func (a *App) resolveConflictsLegacy() (any, error) {
 	a.decisionMu.Lock()
-	defer a.decisionMu.Unlock()
-
 	sid := a.Coord.SessionID()
 	var conflicted []orchestrator.Change
 	flagged := map[string]bool{}
@@ -60,6 +58,7 @@ func (a *App) resolveConflictsLegacy() (any, error) {
 		}
 		outcome, err := a.checkChange(ch)
 		if err != nil {
+			a.decisionMu.Unlock()
 			return nil, err
 		}
 		if outcome == "conflicted" {
@@ -69,6 +68,7 @@ func (a *App) resolveConflictsLegacy() (any, error) {
 			}
 		}
 	}
+	rest, rejected, jobs := a.autoRejectLocked(conflicted)
 	var resolving, idle []string
 	for _, ch := range a.Coord.Changes() {
 		if ch.Status != "proposed" {
@@ -82,12 +82,9 @@ func (a *App) resolveConflictsLegacy() (any, error) {
 	}
 	a.Coord.UpdateChanges(resolving, func(c *orchestrator.Change) { c.Resolving = true })
 	a.Coord.UpdateChanges(idle, func(c *orchestrator.Change) { c.Resolving = false })
-	if len(conflicted) == 0 {
-		return map[string]any{"conflicted": 0, "prompted": false, "changes": a.Coord.Changes()}, nil
-	}
-	a.sendHead(sid, a.conflictPrompt(conflicted))
-	a.persist()
-	return map[string]any{"conflicted": len(conflicted), "prompted": true, "changes": a.Coord.Changes()}, nil
+	a.decisionMu.Unlock()
+	a.finishRejects(jobs)
+	return a.promptHead(sid, rest, rejected, resolving)
 }
 
 // sendConflictedToHead projects every proposal once, then asks the head agent to re-apply only the ones whose
@@ -101,15 +98,88 @@ func (a *App) sendConflictedToHead() (any, error) {
 			continue
 		}
 		conflicted = append(conflicted, ch)
+	}
+	a.decisionMu.Lock()
+	rest, rejected, jobs := a.autoRejectLocked(conflicted)
+	a.decisionMu.Unlock()
+	a.finishRejects(jobs)
+	for _, ch := range rest {
 		ids = append(ids, ch.ID)
 	}
 	a.Coord.UpdateChanges(ids, func(c *orchestrator.Change) { c.Resolving = true })
-	if len(conflicted) == 0 {
-		return map[string]any{"conflicted": 0, "prompted": false, "changes": a.Coord.Changes()}, nil
+	return a.promptHead(a.Coord.SessionID(), rest, rejected, ids)
+}
+
+// autoRejectLocked rejects the conflicted changes Relo must never hand to the head: a path the workspace ignores,
+// and a protected path. Their agent copies are retained by the reject path. It returns the conflicted changes that
+// remain for the head, how many were rejected, and the cleanup jobs. Callers hold decisionMu and pass the jobs to
+// finishRejects after releasing it.
+func (a *App) autoRejectLocked(conflicted []orchestrator.Change) (rest []orchestrator.Change, rejected int, jobs []rejectJob) {
+	var decisions []rejectDecision
+	for _, ch := range conflicted {
+		cur, ok := a.Coord.FindChange(ch.ID)
+		if !ok || cur.Status != "proposed" {
+			continue
+		}
+		reason := ""
+		switch {
+		case a.Coord.WS.Ignored(cur.Path):
+			reason = "the path is ignored by Relo, so the change is not applied"
+		case cur.Integration != nil && cur.Integration.Kind == integration.KindProtected:
+			reason = "protected path: Relo never applies changes to it"
+		default:
+			rest = append(rest, cur)
+			continue
+		}
+		decisions = append(decisions, rejectDecision{
+			changeID: cur.ID, agentID: cur.AgentID, worktree: cur.Worktree, path: cur.Path, reason: reason,
+		})
 	}
-	a.sendHead(a.Coord.SessionID(), a.conflictPrompt(conflicted))
+	if len(decisions) > 0 {
+		jobs = a.rejectDecisionsLocked(decisions)
+	}
+	return rest, len(decisions), jobs
+}
+
+// finishRejects runs the deferred reject work of autoRejectLocked. The caller has released decisionMu.
+func (a *App) finishRejects(jobs []rejectJob) {
+	if len(jobs) == 0 {
+		return
+	}
+	a.cleanupMu.Lock()
+	a.runRejects(jobs)
+}
+
+// promptHead sends the head message for rest when the working tree can be recorded. Otherwise it clears the
+// Resolving flags of ids and posts a note, because replacement work cut from an old base would conflict again.
+func (a *App) promptHead(sid string, rest []orchestrator.Change, rejected int, ids []string) (any, error) {
+	if len(rest) == 0 {
+		a.persist()
+		return map[string]any{"conflicted": 0, "autoRejected": rejected, "prompted": false, "changes": a.Coord.Changes()}, nil
+	}
+	if reason := a.snapshotBlock(); reason != "" {
+		a.Coord.UpdateChanges(ids, func(c *orchestrator.Change) { c.Resolving = false })
+		a.Coord.Note("Relo cannot record your working tree right now, so the conflicted changes were not sent to the head agent. " +
+			"Replacement work would be cut from an old base and conflict again. " + reason)
+		a.persist()
+		return map[string]any{"conflicted": 0, "autoRejected": rejected, "prompted": false, "blocked": reason, "changes": a.Coord.Changes()}, nil
+	}
+	a.sendHead(sid, a.conflictPrompt(rest))
 	a.persist()
-	return map[string]any{"conflicted": len(conflicted), "prompted": true, "changes": a.Coord.Changes()}, nil
+	return map[string]any{"conflicted": len(rest), "autoRejected": rejected, "prompted": true, "changes": a.Coord.Changes()}, nil
+}
+
+// snapshotBlock returns why the working tree cannot be recorded, or "" when the snapshot is healthy. A HEAD fallback
+// or an error means an agent cut now would miss the user's uncommitted work.
+func (a *App) snapshotBlock() string {
+	snap, err := a.Coord.WS.Snapshot()
+	if err != nil {
+		return "Snapshot failed: " + err.Error()
+	}
+	if snap.HeadFallback {
+		return "The snapshot fell back to HEAD and would not include your uncommitted edits."
+	}
+	return ""
 }
 
 // isConflicted reports whether a change waits on the user because its projection conflicts.
@@ -569,12 +639,15 @@ func (a *App) analyzeChangeAgainst(ch orchestrator.Change, planned *plannedOurs)
 	return analysis, nil
 }
 
-// conflictPrompt is the head message. It lists each conflicted change and asks for its intent to be re-applied.
-// When the projection has hunk locations, only the conflicting hunks and their context are shown.
+// conflictPrompt is the head message. It asks for each conflicted change to be re-applied as one small task on the
+// file as it is now, not a re-plan of the original task. Both versions' conflicting hunks are shown when the
+// projection has hunk locations.
 func (a *App) conflictPrompt(conflicted []orchestrator.Change) string {
 	var b strings.Builder
 	b.WriteString("Resolve conflicts. These proposed changes overlap with edits made in the workspace after the agent started, so none was applied. " +
-		"Re-apply each change's intent on the current tree, keep the user's edits, and delegate the work. The changes below will be replaced by the new ones.\n" +
+		"Do not re-plan the original task. For each change below, plan exactly ONE small task: role worker, difficulty easy or medium, paths set to that single file, and no deps. " +
+		"The task re-applies the agent's intent on top of the file as it is now: keep every line of the current file that the agent did not intend to change, and touch only the lines needed. " +
+		"The task description must include the conflicting hunks of both versions shown below.\n" +
 		"After you have delegated the replacement work, list the id of each change below that you resolved in the turn's resolvedChanges array. " +
 		"Each listed change is discarded: its agent copy is kept for recovery and nothing in the workspace is written. Only the ids below qualify.\n")
 	for _, ch := range conflicted {
@@ -584,6 +657,50 @@ func (a *App) conflictPrompt(conflicted []orchestrator.Change) string {
 		}
 		fmt.Fprintf(&b, "\n- id: %s\n  title: %s\n  path: %s\n  reason: %s\n", ch.ID, title, ch.Path, ch.Conflict)
 		b.WriteString(a.agentConflictCopy(ch))
+		b.WriteString(a.currentConflictCopy(ch))
+	}
+	return b.String()
+}
+
+// currentConflictCopy returns the conflicting hunks of the workspace file, with context, in the same form as
+// agentConflictCopy. It falls back to the capped whole file when there are no hunk locations or the hunks are too big.
+func (a *App) currentConflictCopy(ch orchestrator.Change) string {
+	data, err := os.ReadFile(filepath.Join(a.Cfg.Workspace, filepath.FromSlash(ch.Path)))
+	if err != nil {
+		return "  current version:\n  (current version unavailable)\n"
+	}
+	if bytes.IndexByte(data, 0) >= 0 {
+		return "  current version:\n  (binary, not shown)\n"
+	}
+	var conflicting []orchestrator.Hunk
+	if ch.Integration != nil {
+		for _, h := range ch.Integration.Hunks {
+			if h.Conflicting {
+				conflicting = append(conflicting, h)
+			}
+		}
+	}
+	if len(conflicting) == 0 {
+		return "  current version:\n" + fenced(data)
+	}
+	lines := strings.Split(string(data), "\n")
+	var b strings.Builder
+	b.WriteString("  current version (only the conflicting hunks, with context):\n")
+	for _, h := range conflicting {
+		start := max(h.OursStart-hunkContext, 1)
+		end := min(h.OursStart+h.OursLen-1+hunkContext, len(lines))
+		if start > end {
+			continue
+		}
+		fmt.Fprintf(&b, "  lines %d-%d:\n```\n", start, end)
+		for i := start; i <= end; i++ {
+			b.WriteString(lines[i-1])
+			b.WriteByte('\n')
+		}
+		b.WriteString("```\n")
+	}
+	if b.Len() > promptDiffBytes {
+		return "  current version:\n" + fenced(data)
 	}
 	return b.String()
 }
@@ -643,6 +760,11 @@ func agentCopy(ch orchestrator.Change) string {
 	if bytes.IndexByte(data, 0) >= 0 {
 		return "  (binary, not shown)\n"
 	}
+	return fenced(data)
+}
+
+// fenced returns data in a code fence, capped at promptDiffBytes.
+func fenced(data []byte) string {
 	suffix := ""
 	if len(data) > promptDiffBytes {
 		data, suffix = data[:promptDiffBytes], "\n[truncated]"
@@ -746,25 +868,32 @@ func (a *App) clearResolvingLoaded() {
 }
 
 // supersedeStale replaces a conflicted proposal for a path once a newer proposal for that path exists. The old
-// change is kept with SupersededBy set and its agent blob retained; it is not silently discarded.
+// change is kept with SupersededBy set and its agent blob retained; it is not silently discarded. On a takeLatest
+// path every older proposal is superseded by the newest clean one, conflicted or not.
 func (a *App) supersedeStale() {
 	a.decisionMu.Lock()
 
 	changes := a.Coord.Changes()
 	newest := map[string]orchestrator.Change{}
-	for _, ch := range changes {
+	newestAt := map[string]int{}
+	for i, ch := range changes {
 		if ch.Status != "proposed" || isConflicted(ch) || ch.SupersededBy != "" {
 			continue
 		}
 		newest[ch.Path] = ch
+		newestAt[ch.Path] = i
 	}
 	var decisions []rejectDecision
-	for _, old := range changes {
-		if old.Status != "proposed" || !isConflicted(old) {
+	for i, old := range changes {
+		if old.Status != "proposed" {
+			continue
+		}
+		takeLatest := integration.TakesLatest(old.Path)
+		if !isConflicted(old) && !takeLatest {
 			continue
 		}
 		newer, ok := newest[old.Path]
-		if !ok || newer.ID == old.ID {
+		if !ok || newer.ID == old.ID || (takeLatest && newestAt[old.Path] <= i) {
 			continue
 		}
 		if old.AgentID == "" || old.Path == "" {
