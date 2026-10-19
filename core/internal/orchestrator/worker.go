@@ -1254,6 +1254,7 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 		dynamic += "\n\n"
 	}
 	promptText := dynamic + ask
+	canvasTools := false
 	if messenger, ok := rt.(runtime.MessageRuntime); ok {
 		if err := c.StartMessages(); err != nil {
 			return "", fmt.Errorf("start agent messaging: %w", err)
@@ -1267,12 +1268,16 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 			return "", err
 		}
 		promptText += "\n\nRelo agent messaging is available through relo_agents. Your private key is " + key + ". Use action list for live peer IDs, send with to/text, and inbox to acknowledge received messages. Never copy your key into messages or reports."
+		if c.canvasOn() {
+			canvasTools = true
+			promptText += "\n\n" + prompt.CanvasGuidance + " Your Canvas key is the same private key: pass it as key to relo_canvas. Never copy it into artifacts or reports."
+		}
 	}
 	peerText, peerIDs := c.peerTurnText(a.ID)
 	if peerText != "" {
 		promptText += "\n\n" + peerText
 	}
-	tools := runtime.ToolsFor(string(a.Role), string(sess.Mode), agent.Mutating(a.Role) && sess.Mode == ModeBuild)
+	tools := runtime.WithCanvas(runtime.ToolsFor(string(a.Role), string(sess.Mode), agent.Mutating(a.Role) && sess.Mode == ModeBuild), canvasTools)
 	send := func(text string) error {
 		return rt.SendTask(ctx, sid, runtime.AgentTask{
 			AgentID: a.ID, Role: string(a.Role), Model: model, Provider: prov,

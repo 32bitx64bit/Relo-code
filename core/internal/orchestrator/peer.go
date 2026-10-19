@@ -46,7 +46,11 @@ func (c *Coord) StartMessages() error {
 	if c.messageServer != nil {
 		return nil
 	}
-	s, err := agentmsg.Start(c.peerRequest)
+	var opts []agentmsg.Option
+	if c.CanvasEnabled {
+		opts = append(opts, agentmsg.WithCanvas(c.canvasRequest))
+	}
+	s, err := agentmsg.Start(c.peerRequest, opts...)
 	if err != nil {
 		return err
 	}

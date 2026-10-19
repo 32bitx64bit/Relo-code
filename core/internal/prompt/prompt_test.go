@@ -189,3 +189,19 @@ func TestWorkersAreToldToRunOnlyTheTestsTheyChanged(t *testing.T) {
 	}
 }
 
+func TestCanvasGuidanceCoversSemanticPlanningRules(t *testing.T) {
+	for _, rule := range []string{
+		"Code-editor-first",
+		"Design, prototype, mockup, layout or visual-explore requests normally use Canvas",
+		"Explicit output requirements ALWAYS override Canvas",
+		"A redesign of the existing app works on the real files",
+		"list or open the existing artifact and update it from its revision",
+		"iterate at most 3 times",
+		"A captured image is not automatically visually verified",
+		"create and update are build-mode only",
+	} {
+		if !strings.Contains(CanvasGuidance, rule) {
+			t.Errorf("canvas guidance missing rule %q", rule)
+		}
+	}
+}

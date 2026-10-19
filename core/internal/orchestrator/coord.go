@@ -257,6 +257,12 @@ type Coord struct {
 	messageMu       sync.Mutex
 	messageServer   *agentmsg.Server
 	peerKeys        map[string]peerIdentity // per-runtime capabilities; protected by mu, never persisted
+	// CanvasEnabled is set from the extension's initialize payload (`canvas: true`). When false, no relo_canvas tool
+	// is registered and no canvas.requested event is emitted, so an older extension cannot hang a request.
+	CanvasEnabled   bool
+	canvasPending   map[string]*canvasCall // request ID -> in-flight canvas call; guarded by canvasMu
+	canvasMu        sync.Mutex
+	canvasRate      map[string][]time.Time // agent ID -> recent canvas request times; guarded by canvasMu
 	escalations     map[string]string
 	failures        map[string]string // task ID -> why its last attempt failed, for the attempt that replaces it; guarded by mu
 	directSem       chan struct{}     // guarded by mu; one mutating agent at a time in direct mode
@@ -283,6 +289,8 @@ func New(log *logging.Logger) *Coord {
 		escalations:     map[string]string{},
 		failures:        map[string]string{},
 		peerKeys:        map[string]peerIdentity{},
+		canvasPending:   map[string]*canvasCall{},
+		canvasRate:      map[string][]time.Time{},
 		lineageProblems: map[string]lineageProblem{},
 		Emit:            func(string, any) {},
 	}

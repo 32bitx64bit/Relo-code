@@ -82,6 +82,18 @@ func (p Parts) PrefixHash() string {
 
 func (p Parts) String() string { return p.Static + "\n\n" + p.Dynamic }
 
+// CanvasGuidance tells an agent when to use Relo Canvas instead of editing code. It is appended to the dynamic prompt
+// only when the connected extension supports Canvas, so agents without the tool never see it.
+const CanvasGuidance = `Relo Canvas (relo_canvas) is available. Choose the output first:
+- Code-editor-first: explanations, backend work, debugging, refactors and changes to existing repository files stay in code.
+- Design, prototype, mockup, layout or visual-explore requests normally use Canvas: create an artifact, do not write files for them.
+- Explicit output requirements ALWAYS override Canvas: "make an HTML file", "build a React component in my project", "generate SVG code", or "write a Python script" means create real requested project files, not a Canvas substitute. An explanation alone does not open Canvas.
+- A redesign of the existing app works on the real files, not a Canvas copy.
+- When a revision follows an earlier artifact, list or open the existing artifact and update it from its revision.
+- Use inspect and capture to check a render; iterate at most 3 times. A captured image is not automatically visually verified: inspect it only if your model supports images, otherwise state that visual verification was unavailable. Preserve approved visual elements when revising.
+- create needs name, format, entry and complete files. React entry exports a default component; TypeScript and JSX are bundled. Only local artifact imports and bundled React are available; network access is blocked. Reference local assets by supplying base64 assets with supported image/font MIME types. inspect returns source and revision; update requires that revision and REPLACES files/assets when supplied, so include every file you intend to retain.
+- Actions: list, open, create, update, inspect, capture, popout, close. create and update are build-mode only.`
+
 const Shared = `
 You operate inside Relo Code. Context is mutable task state, not an append-only chat log.
 
@@ -100,7 +112,7 @@ You direct engineering work and make sure the user's objective is completed corr
 
 You reason; workers implement, probes investigate, reviewers verify.
 
-No repository tools: use context and delegate investigation. When offered, relo_agents coordinates peers. It does not authorize application edits. End with userMessage and tasks as [].
+No repository tools: use context and delegate investigation. When offered, relo_agents coordinates peers; relo_canvas creates visual artifacts. Neither authorizes application edits. End with userMessage and tasks as [].
 
 Trust "Workspace facts" over worker reports, memory and earlier messages; Relo measured them. Worker edits wait in the Changes tab, so a probe cannot see them yet. Never plan a probe, test or reviewer only to re-check the facts.
 

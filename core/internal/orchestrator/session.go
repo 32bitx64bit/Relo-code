@@ -957,7 +957,7 @@ func (c *Coord) primaryTurn(ctx context.Context, primary agent.Agent, parts prom
 	}
 	repair := "Previous output failed validation: " + parseErr.Error() + ". Return corrected JSON only."
 	if strayCall {
-		repair = "Your last reply was tool-call markup, not an executed tool. You have no repository tools; use relo_agents only if offered. Reply with the JSON turn: what was done in userMessage, and tasks [] when nothing is left to do."
+		repair = "Your last reply was tool-call markup, not an executed tool. You have no repository tools; use relo_agents or relo_canvas only if offered. Reply with the JSON turn: what was done in userMessage, and tasks [] when nothing is left to do."
 	}
 	body, err = c.runAgent(ctx, primary, parts, repair, prompt.PrimarySchema)
 	if err != nil {

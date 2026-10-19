@@ -164,6 +164,9 @@ var noPersistEvents = map[string]bool{
 	"chat.delta":     true,
 	"agent.updated":  true,
 	"agent.activity": true,
+	// Canvas requests carry artifact sources and screenshots, and replies carry capture data. Neither is logged.
+	"canvas.requested": true,
+	"canvas.reply":     true,
 }
 
 func New(cfg Config, log *logging.Logger) (*App, error) {
@@ -454,6 +457,18 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 	case "orchestrator.stopAll":
 		a.Coord.StopAll(ctx)
 		return map[string]any{"ok": true}, nil
+	case "canvas.reply":
+		// The extension answers each canvas.requested with its requestId. The reply has no session of its own:
+		// the core matches it to the pending call and rejects any call whose session has changed.
+		requestID := str(p, "requestId", "")
+		var errText string
+		if raw, ok := p["error"].(string); ok {
+			errText = raw
+		}
+		if err := a.Coord.CanvasReply(requestID, p["result"], errText); err != nil {
+			return nil, ipc.Fail{C: "canvas_reply_rejected", M: err.Error()}
+		}
+		return map[string]any{"ok": true}, nil
 	case "permission.respond":
 		response := str(p, "response", "reject")
 		if response != "once" && response != "always" && response != "reject" {
@@ -480,6 +495,8 @@ func (a *App) initialize(ctx context.Context, p map[string]any) (any, error) {
 		a.Cfg.Workspace = v
 	}
 	a.applySettings(p)
+	// The extension sends canvas:true only when it can answer canvas.requested. Anything else keeps Canvas off.
+	a.Coord.SetCanvasEnabled(canvasFlag(p))
 	st, err := a.startRuntime(ctx)
 	if err != nil {
 		a.Log.Warn("runtime", map[string]any{"error": err.Error()})
@@ -1083,6 +1100,18 @@ func parseEfficiencyPrefs(m map[string]any) style.Prefs {
 		}
 	}
 	return p
+}
+
+// canvasFlag reads the extension's Canvas capability from the initialize payload. Only an explicit true enables it.
+func canvasFlag(p map[string]any) bool {
+	if v, ok := p["canvas"].(bool); ok {
+		return v
+	}
+	if caps, ok := p["capabilities"].(map[string]any); ok {
+		v, _ := caps["canvas"].(bool)
+		return v
+	}
+	return false
 }
 
 func str(m map[string]any, k, def string) string {
