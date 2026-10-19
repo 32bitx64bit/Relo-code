@@ -10,6 +10,7 @@ import { applyCollapse, cleanCollapsed, type Collapsed } from "./uiState";
 import { CrashBreaker } from "./crashBreaker";
 import { PROVIDER_ID_RE, sanitizeDiscovered, sanitizeProviderList, secretKey, validateBaseURL, validateProvider, MAX_PROVIDERS, type ProviderConfig } from "./providers";
 import { dirtyPathsFor } from "./dirtyGate";
+import { CanvasManager } from "./canvas/manager";
 
 let client: CoreClient;
 let state: ReloState = emptyState();
@@ -35,6 +36,7 @@ let postedModels = ""; // signature of the model catalog the webview was last se
 const crashes = new CrashBreaker();
 let coreLifecycle: Promise<void> = Promise.resolve();
 let postedRepository = "";
+let canvas: CanvasManager;
 
 // Settings that core consumes; a change to any of them re-applies to the running core.
 const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context", "relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics", "relo.changes.ignorePaths", "relo.changes.unionPaths", "relo.changes.takeLatestPaths", "relo.scheduler.pathLeases"];
@@ -45,6 +47,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   secrets = ctx.secrets;
   uiMemento = ctx.globalState;
   client = new CoreClient(log);
+  canvas = new CanvasManager(workspacePath);
   chat = new ChatView(ctx, client, () => state, (m) => onWebviewMessage(ctx, m));
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
   status.command = "relo.open";
@@ -52,7 +55,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   status.show();
 
   ctx.subscriptions.push(
-    status, output,
+    status, output, canvas,
     { dispose: () => chat.dispose() },
     vscode.window.registerWebviewViewProvider(ChatView.viewType, chat, { webviewOptions: { retainContextWhenHidden: true } }),
     vscode.workspace.registerTextDocumentContentProvider(DIFF_SCHEME, diffProvider),
@@ -72,6 +75,15 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   );
 
   client.on("event", (method: string, params: unknown) => {
+    if (method === "canvas.requested") {
+      const requestId = (params as { requestId?: unknown } | undefined)?.requestId;
+      if (typeof requestId !== "string" || requestId.length > 200) return;
+      void canvas.handle(params, state.session?.id).then(
+        (result) => client.request("canvas.reply", { requestId, result }),
+        (error: unknown) => client.request("canvas.reply", { requestId, error: errorText(error) }),
+      ).catch((error: unknown) => log(`canvas.reply failed: ${errorText(error)}`));
+      return;
+    }
     state = reduce(state, method, params);
     chat.post();
     dashboard?.webview.postMessage({ type: "state", state });
@@ -109,6 +121,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 }
 
 export async function deactivate(): Promise<void> {
+  canvas?.dispose();
   await client?.dispose();
 }
 
@@ -126,6 +139,10 @@ function registerCommands(ctx: vscode.ExtensionContext): void {
     }));
   };
   cmd("relo.open", () => vscode.commands.executeCommand("relo.chat.focus"));
+  cmd("relo.canvas.open", () => canvas.pickAndOpen());
+  cmd("relo.canvas.popout", () => canvas.execute({ action: "popout" }));
+  cmd("relo.canvas.capture", () => canvas.saveCapture());
+  cmd("relo.canvas.inspect", () => canvas.execute({ action: "inspect" }));
   cmd("relo.newSession", newSession);
   cmd("relo.sessionHistory", async () => {
     chat.reveal();
@@ -586,6 +603,9 @@ function restartRepositoryCore(ctx: vscode.ExtensionContext): Promise<void> {
   coreLifecycle = coreLifecycle.catch(() => {}).then(async () => {
     if (applyTimer) clearTimeout(applyTimer);
     await client.dispose();
+    canvas.dispose();
+    canvas = new CanvasManager(workspacePath);
+    ctx.subscriptions.push(canvas);
     state = emptyState();
     chat.post();
     crashes.reset();
@@ -709,6 +729,7 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
   const providers = currentProviders();
   return {
     workspace,
+    canvas: true,
     autoApply: c.get<boolean>("changes.autoApply", false),
     lazyConflicts: c.get<boolean>("changes.lazyConflicts", false),
     dependentSemantics: c.get<boolean>("changes.dependentSemantics", false),

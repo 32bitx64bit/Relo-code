@@ -7,4 +7,7 @@ eslint.config.mjs
 .gitignore
 .vscodeignore
 node_modules/**
+out/canvas/vscodeSmoke.js
+# Old compiled top-level Canvas prototypes are not part of the file-backed Canvas implementation.
+out/canvas*.js
 ../**

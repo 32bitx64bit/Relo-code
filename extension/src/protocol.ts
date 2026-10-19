@@ -11,7 +11,7 @@ export const Methods = {
   changesList: "changes.list", changesAccept: "changes.accept", changesReject: "changes.reject", changesAcceptAll: "changes.acceptAll", changesRejectAll: "changes.rejectAll", changesDiff: "changes.diff", changesUndo: "changes.undo", changesRebase: "changes.rebase", changesResolve: "changes.resolve", changesResolveConflicts: "changes.resolveConflicts", workspaceDirty: "workspace.dirty", verificationList: "verification.list",
   modelsList: "models.list", modelsSet: "models.set", backendStatus: "backend.status", backendRestart: "backend.restart", settingsApply: "settings.apply", providersDiscover: "providers.discover", modeSet: "mode.set",
   orchestratorPause: "orchestrator.pause", orchestratorResume: "orchestrator.resume", orchestratorStopAll: "orchestrator.stopAll",
-  permissionRespond: "permission.respond", logsTail: "logs.tail", snapshot: "snapshot", cacheGet: "cache.get",
+  permissionRespond: "permission.respond", canvasReply: "canvas.reply", logsTail: "logs.tail", snapshot: "snapshot", cacheGet: "cache.get",
 } as const;
 
 export type Method = (typeof Methods)[keyof typeof Methods];
@@ -435,7 +435,7 @@ export const Events = [
   "context.created", "context.refreshed", "context.compressed", "context.replaced", "context.item.promoted", "context.item.dropped",
   "task.created", "task.updated", "task.completed", "task.failed", "finding.created", "finding.verified", "memory.updated",
   "usage.updated", "changes.updated", "verification.started", "verification.completed", "backend.status", "permission.asked",
-  "chat.message", "chat.delta", "chat.discard", "cache.updated", "log",
+  "chat.message", "chat.delta", "chat.discard", "cache.updated", "canvas.requested", "log",
 ] as const;
 
 export type EventName = (typeof Events)[number];

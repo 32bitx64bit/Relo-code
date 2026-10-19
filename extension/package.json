@@ -13,10 +13,23 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onCustomEditor:relo.canvas"
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "customEditors": [
+      {
+        "viewType": "relo.canvas",
+        "displayName": "Relo Canvas",
+        "selector": [
+          {
+            "filenamePattern": "*.relo-canvas"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -36,6 +49,22 @@
       ]
     },
     "commands": [
+      {
+        "command": "relo.canvas.open",
+        "title": "Relo: Open Canvas"
+      },
+      {
+        "command": "relo.canvas.popout",
+        "title": "Relo: Pop Out Canvas"
+      },
+      {
+        "command": "relo.canvas.capture",
+        "title": "Relo: Capture Canvas"
+      },
+      {
+        "command": "relo.canvas.inspect",
+        "title": "Relo: Inspect Canvas"
+      },
       {
         "command": "relo.selectRepository",
         "title": "Relo: Select Repository"
@@ -731,11 +760,11 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p .",
+    "compile": "tsc -p . && node ../scripts/build-extension.mjs",
     "watch": "tsc -p . -w",
     "lint": "eslint src --max-warnings=0 && tsc -p . --noEmit",
     "typecheck": "tsc -p . --noEmit",
-    "test": "tsx --test src/protocol.test.ts src/settingsBridge.test.ts src/providers.test.ts src/uiState.test.ts src/crashBreaker.test.ts src/repository.test.ts src/dirtyGate.test.ts && node --test ../webview/src/main.test.js ../tests/protocol-contract.test.mjs",
+    "test": "tsx --test src/*.test.ts src/canvas/*.test.ts && node --test ../webview/src/main.test.js ../tests/protocol-contract.test.mjs",
     "package": "cd .. && make package"
   },
   "devDependencies": {
@@ -747,5 +776,12 @@
     "eslint": "^9.17.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "esbuild-wasm": "^0.28.2",
+    "parse5": "^7.3.0",
+    "playwright-core": "^1.64.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
   }
 }
