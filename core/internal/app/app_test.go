@@ -12,6 +12,7 @@ import (
 	"github.com/relocode/relo/internal/logging"
 	"github.com/relocode/relo/internal/metrics"
 	"github.com/relocode/relo/internal/orchestrator"
+	"github.com/relocode/relo/internal/runtime"
 )
 
 func TestInitializeHandleReturns(t *testing.T) {
@@ -34,6 +35,59 @@ func TestInitializeHandleReturns(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("initialize handle hung")
+	}
+}
+
+func TestPromptRetryUsesLatestUserInstructionsNotModelObjective(t *testing.T) {
+	dir := t.TempDir()
+	core, err := New(Config{Workspace: dir, DBPath: filepath.Join(dir, "relo.db"), Runtime: "mock"}, logging.New(&bytes.Buffer{}, logging.Error))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	core.Coord.SetRuntime(runtime.NewMock())
+	s := core.Coord.CreateSession(dir, "Model's lossy paraphrase", orchestrator.ModeBuild)
+	const instruction = "Fix authentication, but never rewrite existing migrations."
+	s.Messages = []orchestrator.Chat{
+		{Role: "user", Text: "original task"},
+		{Role: "assistant", Text: "Prior result"},
+		{Role: "user", Text: instruction},
+		{Role: "user", Text: "stopped guidance", Dropped: true},
+		{Role: "user", Text: "still queued guidance", Queued: true},
+	}
+	core.Coord.Restore(s)
+	submitted := make(chan string, 1)
+	finished := make(chan struct{}, 1)
+	core.Coord.SetEmitter(func(name string, payload any) {
+		if name == "chat.message" {
+			if m, ok := payload.(orchestrator.Chat); ok && m.Role == "user" {
+				submitted <- m.Text
+			}
+		}
+		if name == "session.updated" {
+			if s, ok := payload.(*orchestrator.Session); ok && !s.Running {
+				select {
+				case finished <- struct{}{}:
+				default:
+				}
+			}
+		}
+	})
+	if _, err := core.Handle("prompt.retry", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case text := <-submitted:
+		if text != instruction {
+			t.Fatalf("retry text = %q, want verbatim latest user text %q", text, instruction)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("retry did not submit a request")
+	}
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry did not finish")
 	}
 }
 

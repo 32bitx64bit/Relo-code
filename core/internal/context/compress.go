@@ -6,6 +6,11 @@ import (
 )
 
 func CompressItem(it Item) Item {
+	// Requirements are not summaries: truncating their tail can remove an acceptance criterion or prohibition.
+	if it.Source == SourceUser || it.Kind == KindConstraint {
+		EnsureTokens(&it)
+		return it
+	}
 	body := compressText(it)
 	out := it
 	out.Content = body

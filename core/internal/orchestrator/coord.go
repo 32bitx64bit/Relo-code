@@ -37,6 +37,8 @@ type Chat struct {
 	At      string `json:"createdAt"`
 	// Queued marks a user message that waits for the running head agent's next step. It clears when delivered.
 	Queued bool `json:"queued,omitempty"`
+	// Dropped keeps stopped, undelivered guidance out of future model context without deleting it from chat.
+	Dropped bool `json:"dropped,omitempty"`
 }
 
 // Change is one file an agent changed. Status is proposed (waiting in the agent's worktree), accepted (merged into
@@ -189,17 +191,18 @@ type Session struct {
 	Workspace string `json:"workspace"`
 	Objective string `json:"objective"`
 	// Constraints are the Primary's reading of what the request and context require of every sub agent.
-	Constraints []string              `json:"constraints,omitempty"`
-	Mode        Mode                  `json:"mode"`
-	Status      string                `json:"status"`
-	Created     time.Time             `json:"createdAt"`
-	Updated     time.Time             `json:"updatedAt"`
-	Messages    []Chat                `json:"messages,omitempty"`
-	Changes     []Change              `json:"changes,omitempty"`
-	Verify      []verification.Result `json:"verification,omitempty"`
-	Usage       map[string]any        `json:"usage,omitempty"`
-	Paused      bool                  `json:"paused"`
-	Running     bool                  `json:"running"` // a Submit is in flight; the UI's single source for "busy"
+	Constraints  []string              `json:"constraints,omitempty"`
+	Decisions    []string              `json:"decisions,omitempty"` // current interpreted plan, persisted independently of generations
+	Mode         Mode                  `json:"mode"`
+	Status       string                `json:"status"`
+	Created      time.Time             `json:"createdAt"`
+	Updated      time.Time             `json:"updatedAt"`
+	Messages     []Chat                `json:"messages,omitempty"`
+	Changes      []Change              `json:"changes,omitempty"`
+	Verify       []verification.Result `json:"verification,omitempty"`
+	Usage        map[string]any        `json:"usage,omitempty"`
+	Paused       bool                  `json:"paused"`
+	Running      bool                  `json:"running"` // a Submit is in flight; the UI's single source for "busy"
 }
 
 type PendingPerm struct {

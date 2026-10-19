@@ -75,6 +75,7 @@ func cloneSession(s *Session) *Session {
 	}
 	out := *s
 	out.Constraints = append([]string(nil), s.Constraints...)
+	out.Decisions = append([]string(nil), s.Decisions...)
 	out.Messages = append([]Chat(nil), s.Messages...)
 	out.Changes = append([]Change(nil), s.Changes...)
 	out.Verify = append([]verification.Result(nil), s.Verify...)
@@ -393,7 +394,25 @@ func (c *Coord) Submit(ctx context.Context, text string, refs []string) error {
 	cancel()
 	c.mu.Lock()
 	var finished *Session
+	var saved []Chat
+	var savedNote Chat
 	if c.runID == runID {
+		// Capture messages admitted just before shutdown, including after the last follow-up check.
+		// Ingest under the lifecycle lock so the next Submit cannot build before they are saved.
+		var ids []string
+		var lines, refs []string
+		for _, note := range c.inbox[sid] {
+			lines = append(lines, note.text)
+			refs = append(refs, note.refs...)
+			ids = append(ids, note.id)
+		}
+		delete(c.inbox, sid)
+		saved = c.clearQueuedLocked(ids, false)
+		if len(saved) > 0 {
+			c.ingestGuidanceWithSession(primary.ID, strings.Join(lines, "\n\n"), refs, c.sess)
+			c.addChatLocked(Chat{Role: "system", Text: fmt.Sprintf("Saved %s for the next request: the run ended before the head agent could read them.", plural(len(saved), "queued message"))})
+			savedNote = c.sess.Messages[len(c.sess.Messages)-1]
+		}
 		c.runCancel, c.sessionCtx = nil, nil
 		for id, p := range c.pending {
 			select {
@@ -408,6 +427,12 @@ func (c *Coord) Submit(ctx context.Context, text string, refs []string) error {
 		}
 	}
 	c.mu.Unlock()
+	for _, m := range saved {
+		c.emit("chat.message", m)
+	}
+	if savedNote.ID != "" {
+		c.emit("chat.message", savedNote)
+	}
 	if finished != nil {
 		c.emit("session.updated", finished)
 	}
@@ -571,10 +596,19 @@ func (c *Coord) seedPrimary(text string, refs []string) {
 	if s == nil {
 		return
 	}
-	items := []ctxeng.Item{{Class: ctxeng.ClassTask, Source: ctxeng.SourceUser, Title: "Objective", Content: s.Objective, Durability: 1, Relevance: 1, Pinned: true}, {Class: ctxeng.ClassTask, Source: ctxeng.SourceUser, Title: "Latest user message", Content: text, Durability: 0.9, Relevance: 1}}
+	p, _ := c.Agents.Primary()
+	// Objective, latest user message and mode are singletons: each turn replaces them rather than appending.
+	c.Engine.SetTaskState(p.ID, "Objective", []ctxeng.Item{{Source: ctxeng.SourceSummary, Content: s.Objective, Durability: 1, Relevance: 1, Pinned: true}})
+	var mode []ctxeng.Item
 	if s.Mode != "" {
-		items = append(items, ctxeng.Item{Class: ctxeng.ClassTask, Source: ctxeng.SourceUser, Kind: ctxeng.KindConstraint, Title: "Mode", Content: "Active mode: " + string(s.Mode) + ". Plan/review modes must not mutate the repo.", Pinned: true, Durability: 1})
+		mode = []ctxeng.Item{{Source: ctxeng.SourceUser, Kind: ctxeng.KindConstraint, Content: "Active mode: " + string(s.Mode) + ". Plan/review modes must not mutate the repo.", Pinned: true, Durability: 1}}
 	}
+	c.Engine.SetTaskState(p.ID, "Mode", mode)
+	if len(s.Decisions) > 0 {
+		c.applyDecisions(p.ID, s.Decisions)
+	}
+	c.syncPrimaryConversation(p.ID, text, s.Messages)
+	var items []ctxeng.Item
 	for _, ref := range refs {
 		items = append(items, ctxeng.Item{Class: ctxeng.ClassCode, Source: ctxeng.SourceRepo, Content: ref, Durability: 0.6})
 	}
@@ -583,8 +617,67 @@ func (c *Coord) seedPrimary(text string, refs []string) {
 			items = append(items, ctxeng.Item{Class: ctxeng.ClassMemory, Source: ctxeng.SourceVerified, Title: staleMemory + e.Title, Content: e.Body, Files: e.Files, Verified: e.Verified, Durability: 0.8})
 		}
 	}
-	p, _ := c.Agents.Primary()
 	c.Engine.Ingest(p.ID, items)
+}
+
+// Only user-authored instructions and the preceding reply cross chat turns, not the full execution transcript.
+func (c *Coord) syncPrimaryConversation(primaryID, text string, messages []Chat) {
+	c.Engine.SetTaskState(primaryID, "Latest user message", []ctxeng.Item{{Source: ctxeng.SourceUser, Content: text, Durability: 0.9, Relevance: 1}})
+	first, earlier, reply := primaryHistory(messages)
+	var original []ctxeng.Item
+	if first != "" && first != text {
+		original = []ctxeng.Item{{Source: ctxeng.SourceUser, Content: first, Pinned: true, Durability: 1, Relevance: 1}}
+	}
+	c.Engine.SetTaskState(primaryID, "Original user request", original)
+	var prior []ctxeng.Item
+	if len(earlier) > 0 {
+		prior = []ctxeng.Item{{Source: ctxeng.SourceUser, Content: strings.Join(earlier, "\n\n"), Durability: 0.9, Relevance: 0.9}}
+	}
+	c.Engine.SetTaskState(primaryID, "Earlier user instructions", prior)
+	var last []ctxeng.Item
+	if reply != "" {
+		last = []ctxeng.Item{{Source: ctxeng.SourceSummary, Content: reply, Durability: 0.9}}
+	}
+	c.Engine.SetTaskState(primaryID, "Previous assistant reply", last)
+}
+
+// primaryHistory reads the transcript for the Primary's canonical user-side context. first is the earliest delivered
+// user message, earlier are the delivered user messages between it and the latest one (oldest first), and reply is the
+// assistant message immediately before the latest user message. Messages still queued are not delivered and are left out.
+// The latest user message is the one being answered, so it is excluded from earlier and does not count as its own reply.
+func primaryHistory(messages []Chat) (first string, earlier []string, reply string) {
+	latest := -1
+	for i, m := range messages {
+		if m.Role == "user" && !m.Queued && !m.Dropped {
+			latest = i
+		}
+	}
+	firstIdx := -1
+	for i, m := range messages {
+		if m.Role == "user" && !m.Queued && !m.Dropped {
+			firstIdx = i
+			first = m.Text
+			break
+		}
+	}
+	if firstIdx < 0 {
+		return "", nil, ""
+	}
+	for i := firstIdx + 1; i < latest; i++ {
+		if m := messages[i]; m.Role == "user" && !m.Queued && !m.Dropped && strings.TrimSpace(m.Text) != "" {
+			earlier = append(earlier, m.Text)
+		}
+	}
+	for i := latest - 1; i >= 0; i-- {
+		if m := messages[i]; m.Role == "assistant" && strings.TrimSpace(m.Text) != "" {
+			reply = m.Text
+			break
+		}
+		if messages[i].Role == "user" {
+			break
+		}
+	}
+	return first, earlier, reply
 }
 
 func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text string) error {
@@ -597,9 +690,10 @@ func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text strin
 	if queued, refs, ok := c.takeQueued(c.SessionID()); ok {
 		c.ingestGuidance(primary.ID, queued, refs)
 		if text != "" {
-			queued += "\n\n" + text
+			text += "\n\n" + queued
+		} else {
+			text = queued
 		}
-		text = queued
 	}
 	resolvedPrimary := style.Resolve(settings.Efficiency, primary.Role, primary.Difficulty, primary.Attempt, settings.Budget)
 	primaryBudget := settings.Budget
@@ -624,13 +718,6 @@ func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text strin
 	}
 	if turn.UserMessage != "" {
 		c.chat("assistant", turn.UserMessage, primary.ID)
-	}
-	if turn.Objective != "" {
-		c.mu.Lock()
-		if c.sess != nil {
-			c.sess.Objective = turn.Objective
-		}
-		c.mu.Unlock()
 	}
 	c.applyTurn(primary, turn)
 	if len(turn.Tasks) > 0 {
@@ -680,12 +767,22 @@ func (c *Coord) applyTurn(primary agent.Agent, turn Turn) {
 	}
 	c.setConstraints(turn.Constraints)
 	idmap := map[string]string{}
-	turn.Tasks = c.admitTasks(turn.Tasks)
+	var existing, inTurn map[string]string
+	turn.Tasks, existing, inTurn = c.admitTaskAliases(turn.Tasks)
+	// A dropped duplicate's spec ID resolves to the task it repeats: an existing graph task, or the surviving spec of this turn.
+	for dropped, realID := range existing {
+		idmap[dropped] = realID
+	}
 	for _, spec := range turn.Tasks {
 		role := parseRole(spec.Role)
 		t := c.Graph.Add(taskgraph.Task{Title: spec.Title, Description: spec.Description, Acceptance: spec.Acceptance, Creator: primary.ID, Priority: spec.Priority, Role: string(role), Workspace: s.Workspace, Difficulty: spec.Difficulty, MaxAttempts: settings.MaxRetries, Model: c.modelForDifficulty(role, spec.Difficulty), Paths: spec.Paths})
 		idmap[spec.ID] = t.ID
 		c.emit("task.created", t)
+	}
+	for dropped, survivor := range inTurn {
+		if realID := idmap[survivor]; realID != "" {
+			idmap[dropped] = realID
+		}
 	}
 	for _, spec := range turn.Tasks {
 		real := idmap[spec.ID]
@@ -701,9 +798,47 @@ func (c *Coord) applyTurn(primary agent.Agent, turn Turn) {
 			c.logWarn("set task dependencies", err)
 		}
 	}
-	for _, d := range turn.Decisions {
-		c.Engine.Ingest(primary.ID, []ctxeng.Item{{Class: ctxeng.ClassTask, Source: ctxeng.SourceVerified, Title: "Decision", Content: d, Verified: true, Durability: 0.9}})
+	c.applyObjective(primary.ID, turn.Objective)
+	c.applyDecisions(primary.ID, turn.Decisions)
+}
+
+// applyObjective replaces the session objective and the Primary's Objective context with the Primary's latest value.
+// An empty value is "unchanged". It runs on every turn path, so the Primary never reasons from a superseded objective.
+func (c *Coord) applyObjective(agentID, objective string) {
+	objective = strings.TrimSpace(objective)
+	if objective == "" {
+		return
 	}
+	c.mu.Lock()
+	if c.sess != nil {
+		c.sess.Objective = objective
+	}
+	c.mu.Unlock()
+	c.Engine.SetTaskState(agentID, "Objective", []ctxeng.Item{{Source: ctxeng.SourceSummary, Content: objective, Durability: 1, Relevance: 1, Pinned: true}})
+}
+
+// applyDecisions replaces the Decision group with the Primary's full current list. A decision is the Primary's
+// interpretation of the request, not evidence, so it is summarized and unverified. An empty list is "unchanged".
+func (c *Coord) applyDecisions(agentID string, decisions []string) {
+	var items []ctxeng.Item
+	for _, d := range decisions {
+		if d = strings.TrimSpace(d); d != "" {
+			items = append(items, ctxeng.Item{Source: ctxeng.SourceSummary, Content: d, Durability: 0.9})
+		}
+	}
+	if len(items) == 0 {
+		return
+	}
+	current := make([]string, 0, len(items))
+	for _, item := range items {
+		current = append(current, item.Content)
+	}
+	c.mu.Lock()
+	if c.sess != nil {
+		c.sess.Decisions = current
+	}
+	c.mu.Unlock()
+	c.Engine.SetTaskState(agentID, "Decision", items)
 }
 
 // setConstraints replaces the session's constraints with the Primary's latest list. An empty list is "unchanged": a
@@ -737,31 +872,47 @@ func (c *Coord) constraintsNote() string {
 // no cap on how many tasks a session can plan: long requests need many tasks, and a runaway planner is caught by
 // the duplicate check. Dropped duplicates are logged.
 func (c *Coord) admitTasks(specs []TurnTask) []TurnTask {
+	kept, _, _ := c.admitTaskAliases(specs)
+	return kept
+}
+
+// admitTaskAliases is admitTasks plus the mapping for dropped duplicates. existing maps a dropped spec ID to the
+// persisted task it repeats; inTurn maps a dropped spec ID to the kept spec ID of the same turn that it repeats.
+func (c *Coord) admitTaskAliases(specs []TurnTask) (kept []TurnTask, existing, inTurn map[string]string) {
 	if len(specs) == 0 {
-		return specs
+		return specs, nil, nil
 	}
-	seen := map[string]bool{}
+	seen := map[string]string{} // taskKey -> persisted task ID
 	for _, t := range c.Graph.List() {
 		if t.Status != taskgraph.Failed && t.Status != taskgraph.Canceled {
-			seen[taskKey(t.Title, t.Role)] = true
+			key := taskKey(t.Title, t.Role)
+			if _, ok := seen[key]; !ok {
+				seen[key] = t.ID
+			}
 		}
 	}
-	var kept []TurnTask
+	turnKept := map[string]string{} // taskKey -> kept spec ID of this turn
+	existing, inTurn = map[string]string{}, map[string]string{}
 	dupes := 0
 	for _, spec := range specs {
 		key := taskKey(spec.Title, string(parseRole(spec.Role)))
-		if seen[key] {
+		if id, ok := seen[key]; ok {
+			existing[spec.ID] = id
 			dupes++
 			continue
 		}
-		seen[key] = true
+		if id, ok := turnKept[key]; ok {
+			inTurn[spec.ID] = id
+			dupes++
+			continue
+		}
+		turnKept[key] = spec.ID
 		kept = append(kept, spec)
 	}
 	if dupes > 0 {
 		c.logWarn("planner repeated tasks", fmt.Errorf("dropped %d duplicate task(s)", dupes))
 	}
-	// Dependencies on a dropped duplicate point at the original task of the same name.
-	return kept
+	return kept, existing, inTurn
 }
 
 func taskKey(title, role string) string {

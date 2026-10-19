@@ -127,6 +127,87 @@ func (e *Engine) Ingest(agentID string, items []Item) {
 	}
 }
 
+// SetTaskState makes items the whole of a canonical task-state group (Objective, Latest user message, Mode, Decision):
+// every ClassTask item with the given title is removed, then items are added. Matching is by title, not by ID, because a
+// pool restored from earlier generations can hold several items under one title and each must go. An item whose content
+// the group already holds keeps its ID, so an unchanged value does not reorder the stable block or break the prefix
+// cache. Pool items not in the group are untouched. Historical generations keep their items; later builds drop the
+// ones no longer in the pool (see liveItems).
+func (e *Engine) SetTaskState(agentID, title string, items []Item) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	st := e.ensure(agentID)
+	now := e.now()
+	type want struct {
+		item Item
+		used bool
+	}
+	wanted := make([]want, 0, len(items))
+	for _, it := range items {
+		it.Class = ClassTask
+		it.Title = title
+		wanted = append(wanted, want{item: it})
+	}
+	// Reuse the first pool item that already holds each wanted content; every other group member goes.
+	kept := make([]Item, 0, len(st.Pool))
+	for _, have := range st.Pool {
+		if have.Class != ClassTask || have.Title != title {
+			kept = append(kept, have)
+			continue
+		}
+		for i := range wanted {
+			if !wanted[i].used && sameTaskContent(wanted[i].item, have) {
+				wanted[i].used = true
+				kept = append(kept, have)
+				break
+			}
+		}
+	}
+	st.Pool = kept
+	for i := range wanted {
+		if wanted[i].used {
+			continue
+		}
+		it := wanted[i].item
+		if it.ID == "" {
+			it.ID = id.New("ctx")
+		}
+		if it.AgentID == "" {
+			it.AgentID = agentID
+		}
+		if it.TaskID == "" {
+			it.TaskID = st.TaskID
+		}
+		if it.Created.IsZero() {
+			it.Created = now
+		}
+		EnsureTokens(&it)
+		st.Pool = append(st.Pool, it)
+	}
+}
+
+// sameTaskContent reports whether a wanted group item carries the same value as a pool item.
+func sameTaskContent(want, have Item) bool {
+	return want.Source == have.Source && want.Kind == have.Kind && want.Content == have.Content && want.Pinned == have.Pinned
+}
+
+// liveItems keeps the prior generation's items that the pool still holds, by ID. Compressed selections keep the source
+// ID, so a compressed equivalent of a live item survives; an item removed from the pool (replaced task state, Drop,
+// scope, or gc) does not come back through carry or hysteresis. Items without an ID cannot be checked and are kept.
+func liveItems(items []Item, pool []Item) []Item {
+	live := make(map[string]bool, len(pool))
+	for _, it := range pool {
+		live[it.ID] = true
+	}
+	out := make([]Item, 0, len(items))
+	for _, it := range items {
+		if it.ID == "" || live[it.ID] {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
 func (e *Engine) Build(req BuildRequest) (*Generation, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -393,9 +474,19 @@ func (e *Engine) RestoreGeneration(g Generation) {
 			return
 		}
 	}
+	newest := len(st.Generations) == 0 || g.Number > st.Generations[len(st.Generations)-1].Number
 	cp := g
 	st.Generations = append(st.Generations, &cp)
 	sort.SliceStable(st.Generations, func(i, j int) bool { return st.Generations[i].Number < st.Generations[j].Number })
+	if newest {
+		kept := st.Pool[:0]
+		for _, it := range st.Pool {
+			if !canonicalTaskState(it) {
+				kept = append(kept, it)
+			}
+		}
+		st.Pool = kept
+	}
 	seen := make(map[string]bool, len(st.Pool))
 	for _, it := range st.Pool {
 		if it.ID != "" {
@@ -403,6 +494,9 @@ func (e *Engine) RestoreGeneration(g Generation) {
 		}
 	}
 	for _, it := range g.Items {
+		if !newest && canonicalTaskState(it) {
+			continue // historical objectives and decisions must not become live again after a reload
+		}
 		if it.ID != "" {
 			if seen[it.ID] {
 				continue
@@ -411,8 +505,21 @@ func (e *Engine) RestoreGeneration(g Generation) {
 		}
 		st.Pool = append(st.Pool, it)
 	}
-	st.Phase, st.Budget, st.Strategy = g.Phase, g.Budget, g.Strategy
+	if newest {
+		st.Phase, st.Budget, st.Strategy = g.Phase, g.Budget, g.Strategy
+	}
 	st.Metrics.Generations = len(st.Generations)
+}
+
+func canonicalTaskState(it Item) bool {
+	if it.Class != ClassTask {
+		return false
+	}
+	switch it.Title {
+	case "Objective", "Latest user message", "Mode", "Decision", "Original user request", "Earlier user instructions", "Previous assistant reply", "User guidance sent while Relo was working", "Peer coordination messages":
+		return true
+	}
+	return false
 }
 
 func (e *Engine) Metrics(agentID string) Metrics {
@@ -533,11 +640,13 @@ func (e *Engine) buildLocked(req BuildRequest, boundary bool) (*Generation, erro
 	var deferred []string
 	if len(st.Generations) > 0 {
 		prior := st.Generations[len(st.Generations)-1]
+		// Items the pool no longer holds (replaced task state, dropped) must not be carried forward; their compressed
+		// equivalents keep the source ID and stay live.
+		previous := liveItems(prior.Items, st.Pool)
 		if !boundary {
-			sel.Included = appendNewInOrder(prior.Items, sel.Included)
+			sel.Included = appendNewInOrder(previous, sel.Included)
 			deferred = carryDeferred(prior, sel.Included)
 		} else {
-			previous := prior.Items
 			if scope != nil {
 				previous, _ = applyScopeToItems(previous, scope, dependencies)
 			}
@@ -619,7 +728,7 @@ func applyScopeToItems(items []Item, scope *Scope, dependencyTaskIDs []string) (
 			dropped = append(dropped, Dropped{Item: it, Reason: "scope_memory"})
 			continue
 		}
-		if scope.DependencyReportsOnly && (it.Class == ClassReport || it.Source == SourceParent) && !dependencies[it.TaskID] {
+		if scope.DependencyReportsOnly && it.Kind != KindConstraint && (it.Class == ClassReport || it.Source == SourceParent) && !dependencies[it.TaskID] {
 			dropped = append(dropped, Dropped{Item: it, Reason: "scope_dependency"})
 			continue
 		}

@@ -120,6 +120,33 @@ func TestPinnedSurvivesCompression(t *testing.T) {
 	}
 }
 
+func TestRequirementsRemainVerbatimUnderBudgetPressure(t *testing.T) {
+	for _, requirement := range []Item{
+		{Class: ClassTask, Source: SourceUser, Title: "Latest user message"},
+		{Class: ClassTask, Source: SourceParent, Kind: KindConstraint, Title: "Constraints", Pinned: true},
+	} {
+		t.Run(string(requirement.Source), func(t *testing.T) {
+			e := New()
+			e.Bind("a", "t", "worker", 100)
+			requirement.ID = "requirement"
+			requirement.Content = strings.Repeat("Detailed instruction. ", 100) + "Do not change the public API."
+			e.Ingest("a", []Item{requirement})
+			for i := 0; i < 3; i++ {
+				g, err := e.Refresh("a", "budget pressure")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(g.Items) != 1 || g.Items[0].Content != requirement.Content || g.Items[0].Source != requirement.Source {
+					t.Fatalf("requirement was rewritten under pressure: %+v", g.Items)
+				}
+				if g.OverflowTokens <= 0 {
+					t.Fatal("mandatory overflow must be reported rather than hiding lost instructions")
+				}
+			}
+		})
+	}
+}
+
 func TestUnverifiedHypothesisNotVerifiedMemory(t *testing.T) {
 	e := New()
 	f := e.PromoteFinding(Finding{

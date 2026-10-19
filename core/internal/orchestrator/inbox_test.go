@@ -31,6 +31,7 @@ type guidanceRuntime struct {
 	headSeen  []string
 	headCalls chan string
 	holdFirst chan struct{} // when set, the first head call waits for it (or for cancellation)
+	failFirst error         // when set, the first head call fails after its gate opens
 }
 
 func (r *guidanceRuntime) SendTask(ctx context.Context, sid rt.SessionID, task rt.AgentTask) error {
@@ -53,6 +54,9 @@ func (r *guidanceRuntime) SendTask(ctx context.Context, sid rt.SessionID, task r
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	if i == 0 && r.failFirst != nil {
+		return r.failFirst
 	}
 	r.gatedRuntime.mu.Lock()
 	ch := r.events[sid]
@@ -216,6 +220,124 @@ func TestQueuedGuidanceStartsFollowUpTurnWhenTurnEnds(t *testing.T) {
 	}
 	if n := len(k.named("chat.message")); n < 3 {
 		t.Fatalf("chat.message events = %d, want queued message plus delivery", n)
+	}
+}
+
+func TestFailedRunPreservesUndeliveredGuidance(t *testing.T) {
+	c, r, k := newGuidanceCoord(t, headWrap)
+	r.holdFirst = make(chan struct{})
+	r.failFirst = errors.New("provider unavailable")
+	done := make(chan error, 1)
+	go func() { done <- c.Submit(context.Background(), "first", nil) }()
+	<-r.headCalls
+	const guidance = "keep the public API unchanged"
+	if err := c.Submit(context.Background(), guidance, []string{"api.go"}); err != nil {
+		t.Fatal(err)
+	}
+	close(r.holdFirst)
+	if err := <-done; err == nil {
+		t.Fatal("expected the first run to fail")
+	}
+	if c.queuedPending(c.SessionID()) {
+		t.Fatal("failed run left guidance waiting in an inactive inbox")
+	}
+	var updated, notified bool
+	for _, ev := range k.named("chat.message") {
+		m := ev.(Chat)
+		if m.Text == guidance && !m.Queued {
+			updated = true
+		}
+		if m.Role == "system" && strings.Contains(m.Text, "queued message") && strings.Contains(m.Text, "next request") {
+			notified = true
+		}
+	}
+	if !updated || !notified {
+		t.Fatalf("undelivered guidance: cleared=%v, explained=%v", updated, notified)
+	}
+	if err := c.Submit(context.Background(), "retry", nil); err != nil {
+		t.Fatal(err)
+	}
+	r.hmu.Lock()
+	prompt := r.headSeen[len(r.headSeen)-1]
+	r.hmu.Unlock()
+	if !strings.Contains(prompt, guidance) || !strings.Contains(prompt, "api.go") {
+		t.Fatalf("next request lost undelivered guidance or references: %s", prompt)
+	}
+}
+
+func TestGuidanceArrivingDuringRunShutdownIsPreserved(t *testing.T) {
+	c, r, k := newGuidanceCoord(t, headWrap)
+	const guidance = "also preserve the existing command names"
+	var queued bool
+	c.SetEmitter(func(name string, payload any) {
+		k.emit(name, payload)
+		if a, ok := payload.(agent.Agent); name == "agent.updated" && ok && a.Role == agent.Primary && a.Status == agent.Completed && !queued {
+			queued = true
+			if err := c.Submit(context.Background(), guidance, nil); err != nil {
+				t.Errorf("late Submit: %v", err)
+			}
+		}
+	})
+	if err := c.Submit(context.Background(), "first", nil); err != nil {
+		t.Fatal(err)
+	}
+	if !queued || c.queuedPending(c.SessionID()) || c.Current().Running {
+		t.Fatalf("shutdown state: guidance queued=%v, pending=%v, running=%v", queued, c.queuedPending(c.SessionID()), c.Current().Running)
+	}
+	if err := c.Submit(context.Background(), "continue", nil); err != nil {
+		t.Fatal(err)
+	}
+	r.hmu.Lock()
+	prompt := r.headSeen[len(r.headSeen)-1]
+	r.hmu.Unlock()
+	if !strings.Contains(prompt, guidance) {
+		t.Fatalf("shutdown race lost the user's guidance: %s", prompt)
+	}
+}
+
+func TestQueuedGuidanceFollowsOriginalMessageInChronologicalOrder(t *testing.T) {
+	c, r, _ := newGuidanceCoord(t, headWrap)
+	p := c.ensurePrimary()
+	c.seedPrimary("use spaces", nil)
+	c.mu.Lock()
+	c.enqueueLocked("actually use tabs", nil)
+	c.mu.Unlock()
+	if err := c.loopPrimary(context.Background(), p, "use spaces"); err != nil {
+		t.Fatal(err)
+	}
+	r.hmu.Lock()
+	prompt := r.headSeen[0]
+	r.hmu.Unlock()
+	if !strings.Contains(prompt, "User message:\nuse spaces\n\nactually use tabs") {
+		t.Fatalf("newer guidance did not follow the original message: %s", prompt)
+	}
+}
+
+func TestStoppedGuidanceDoesNotBecomeFutureInstructions(t *testing.T) {
+	c, r, _ := newGuidanceCoord(t, headWrap)
+	r.holdFirst = make(chan struct{})
+	done := make(chan error, 1)
+	go func() { done <- c.Submit(context.Background(), "first", nil) }()
+	<-r.headCalls
+	const dropped = "remove all tests after finishing"
+	if err := c.Submit(context.Background(), dropped, nil); err != nil {
+		t.Fatal(err)
+	}
+	c.StopAll(context.Background())
+	<-done
+	if err := c.Submit(context.Background(), "continue without the stopped guidance", nil); err != nil {
+		t.Fatal(err)
+	}
+	r.hmu.Lock()
+	prompt := r.headSeen[len(r.headSeen)-1]
+	r.hmu.Unlock()
+	if strings.Contains(prompt, dropped) {
+		t.Fatalf("stopped guidance was resurrected as a requirement: %s", prompt)
+	}
+	for _, m := range c.Current().Messages {
+		if m.Text == dropped && !m.Dropped {
+			t.Fatal("stopped guidance lost its delivery state")
+		}
 	}
 }
 

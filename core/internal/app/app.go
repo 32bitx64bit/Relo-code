@@ -271,9 +271,19 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 		a.Coord.StopAll(ctx)
 		return map[string]any{"ok": true}, nil
 	case "prompt.retry":
-		if s := a.Coord.Current(); s != nil && s.Objective != "" {
+		if s := a.Coord.Current(); s != nil {
+			text := s.Objective
+			for i := len(s.Messages) - 1; i >= 0; i-- {
+				if s.Messages[i].Role == "user" && !s.Messages[i].Queued && !s.Messages[i].Dropped {
+					text = s.Messages[i].Text
+					break
+				}
+			}
+			if text == "" {
+				return map[string]any{"ok": true}, nil
+			}
 			go a.safely("retry", func() {
-				if err := a.Coord.Submit(context.Background(), s.Objective, nil); err != nil {
+				if err := a.Coord.Submit(context.Background(), text, nil); err != nil {
 					a.Log.Error("retry submit failed", map[string]any{"sessionId": s.ID, "error": err.Error()})
 				}
 				a.persist()

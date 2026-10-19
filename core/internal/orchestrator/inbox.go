@@ -41,7 +41,7 @@ func (c *Coord) takeQueued(sid string) (string, []string, bool) {
 		refs = append(refs, n.refs...)
 		ids = append(ids, n.id)
 	}
-	updated := c.clearQueuedLocked(ids)
+	updated := c.clearQueuedLocked(ids, false)
 	c.mu.Unlock()
 	for _, m := range updated {
 		c.emit("chat.message", m)
@@ -57,7 +57,7 @@ func (c *Coord) queuedPending(sid string) bool {
 }
 
 // clearQueuedLocked clears the queued mark on the given messages and returns them. Caller holds mu.
-func (c *Coord) clearQueuedLocked(ids []string) []Chat {
+func (c *Coord) clearQueuedLocked(ids []string, dropped bool) []Chat {
 	if c.sess == nil || len(ids) == 0 {
 		return nil
 	}
@@ -70,6 +70,7 @@ func (c *Coord) clearQueuedLocked(ids []string) []Chat {
 		m := &c.sess.Messages[i]
 		if m.Queued && wanted[m.ID] {
 			m.Queued = false
+			m.Dropped = dropped
 			updated = append(updated, *m)
 		}
 	}
@@ -91,7 +92,7 @@ func (c *Coord) dropQueued() int {
 			ids = append(ids, note.id)
 		}
 	}
-	updated := c.clearQueuedLocked(ids)
+	updated := c.clearQueuedLocked(ids, true)
 	c.mu.Unlock()
 	for _, m := range updated {
 		c.emit("chat.message", m)
@@ -106,6 +107,9 @@ func clearQueuedMarks(s *Session) {
 		return
 	}
 	for i := range s.Messages {
+		if s.Messages[i].Queued {
+			s.Messages[i].Dropped = true
+		}
 		s.Messages[i].Queued = false
 	}
 }
@@ -120,7 +124,16 @@ func (c *Coord) wakeHead() {
 
 // ingestGuidance puts delivered user guidance into the head's context, so a later context refresh keeps it.
 func (c *Coord) ingestGuidance(primaryID, text string, refs []string) {
-	items := []ctxeng.Item{{Class: ctxeng.ClassTask, Source: ctxeng.SourceUser, Title: "User guidance sent while Relo was working", Content: text, Durability: 0.9, Relevance: 1}}
+	c.ingestGuidanceWithSession(primaryID, text, refs, c.Current())
+}
+
+func (c *Coord) ingestGuidanceWithSession(primaryID, text string, refs []string, s *Session) {
+	if s != nil {
+		c.syncPrimaryConversation(primaryID, text, s.Messages)
+	}
+	// Retire the append-only title used by older generations; the transcript now supplies these instructions.
+	c.Engine.SetTaskState(primaryID, "User guidance sent while Relo was working", nil)
+	var items []ctxeng.Item
 	for _, ref := range refs {
 		items = append(items, ctxeng.Item{Class: ctxeng.ClassCode, Source: ctxeng.SourceRepo, Content: ref, Durability: 0.6})
 	}
@@ -131,7 +144,7 @@ func (c *Coord) ingestGuidance(primaryID, text string, refs []string) {
 // are not cancelled and keep running: only the head steps.
 func (c *Coord) stepQueued(ctx context.Context) {
 	text, refs, ok := c.takeQueued(c.SessionID())
-	if !ok {
+	if text == "" {
 		return
 	}
 	p, ok := c.Agents.Primary()

@@ -108,8 +108,9 @@ func TestSchemaCapsAndRolePromptSizes(t *testing.T) {
 	for _, role := range roles {
 		prompt := For(role)
 		t.Logf("role=%s chars=%d", role, len(prompt))
-		if total := len(Shared) + len(prompt); total > 5600 {
-			t.Errorf("shared + %s prompt too large: %d chars", role, total)
+		// For already includes Shared; count what is actually sent rather than charging Shared twice.
+		if total := len(prompt); total > 5600 {
+			t.Errorf("%s prompt too large: %d chars", role, total)
 		}
 	}
 }
@@ -148,6 +149,20 @@ func TestPrimaryPromptSplitsWorkWithoutCollisions(t *testing.T) {
 	}
 }
 
+func TestPrimaryPromptDefinesCurrentInstructionPrecedence(t *testing.T) {
+	for _, rule := range []string{
+		"latest user message overrides earlier instructions",
+		"not competing active objectives",
+		"using Previous assistant reply",
+		"decisions list replaces all earlier decisions",
+		"interpretations, not verified facts",
+	} {
+		if !strings.Contains(Primary, rule) {
+			t.Errorf("Primary prompt missing state rule %q", rule)
+		}
+	}
+}
+
 func longestCommonPrefix(a, b string) int {
 	n := len(a)
 	if len(b) < n {
@@ -173,3 +188,4 @@ func TestWorkersAreToldToRunOnlyTheTestsTheyChanged(t *testing.T) {
 		}
 	}
 }
+
