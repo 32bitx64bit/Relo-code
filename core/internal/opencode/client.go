@@ -39,17 +39,19 @@ type Client struct {
 	Username string
 	Password string
 
-	mu        sync.Mutex
-	subs      map[string][]*subscription
-	cancel    context.CancelFunc
-	models    map[string]string
-	efforts   map[string]string // per-session effort (variant) last posted with the model
-	instr     map[string]string
-	locations map[string]string
-	agents    map[string]string
-	timers    map[string]*time.Timer
-	turnDone  map[string]bool // terminal event already emitted for the session's current turn
-	lastEvent string
+	mu               sync.Mutex
+	subs             map[string][]*subscription
+	cancel           context.CancelFunc
+	models           map[string]string
+	efforts          map[string]string // per-session effort (variant) last posted with the model
+	instr            map[string]string
+	locations        map[string]string
+	agents           map[string]string
+	timers           map[string]*time.Timer
+	turnDone         map[string]bool // terminal event already emitted for the session's current turn
+	messageMu        sync.Mutex
+	messageLocations map[string]string
+	lastEvent        string
 
 	oversizeLogged bool
 }
@@ -364,6 +366,15 @@ func (c *Client) setTools(ctx context.Context, session string, tools map[string]
 			deny("shell")
 		}
 	}
+	// A tool enabled under a "*" deny needs its own allow rule after the deny; OpenCode resolves the last matching rule.
+	// Without a wildcard deny, enabled tools are allowed by default and no extra rule is sent.
+	if denied["*"] {
+		for _, name := range names {
+			if tools[name] && name != "*" {
+				rules = append(rules, map[string]string{"action": name, "resource": "*", "effect": "allow"})
+			}
+		}
+	}
 	return c.patch(ctx, "/api/session/"+url.PathEscape(session), map[string]any{"permissions": rules})
 }
 
@@ -399,6 +410,96 @@ func (c *Client) Cancel(ctx context.Context, session runtime.SessionID) error {
 // step boundary of a turn in progress; the turn carries on from the summary. Progress arrives as compaction events.
 func (c *Client) Compact(ctx context.Context, session runtime.SessionID) error {
 	return c.post(ctx, "/api/session/"+url.PathEscape(string(session))+"/compact", map[string]any{"delivery": "steer"}, nil)
+}
+
+var _ runtime.MessageRuntime = (*Client)(nil)
+
+// ConfigureMessages registers Relo's coordination MCP endpoint as the "relo" server for one directory (OpenCode v2
+// experimental API). The bearer secret is sent only in the MCP headers; it is never logged here.
+func (c *Client) ConfigureMessages(ctx context.Context, directory string, tools runtime.MessageTools) error {
+	c.messageMu.Lock()
+	defer c.messageMu.Unlock()
+	fingerprint := hash(tools.URL + "\x00" + tools.Secret)
+	if c.messageLocations[directory] == fingerprint {
+		return nil // replacing the same MCP server while peers call it can interrupt their calls
+	}
+	query := url.Values{"location[directory]": {directory}}
+	body := map[string]any{"config": map[string]any{
+		"type":     "remote",
+		"url":      tools.URL,
+		"headers":  map[string]string{"Authorization": "Bearer " + tools.Secret},
+		"oauth":    false,
+		"codemode": false,
+	}}
+	_, err := c.request(ctx, http.MethodPut, "/api/experimental/mcp/relo?"+query.Encode(), body, nil, false)
+	if err != nil {
+		return err
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		var status struct {
+			Data []struct {
+				Name   string `json:"name"`
+				Status struct {
+					Status string `json:"status"`
+				} `json:"status"`
+			} `json:"data"`
+		}
+		if _, err = c.request(readyCtx, http.MethodGet, "/api/mcp?"+query.Encode(), nil, &status, false); err != nil {
+			return err
+		}
+		connected := false
+		for _, server := range status.Data {
+			if server.Name == "relo" {
+				switch server.Status.Status {
+				case "connected":
+					connected = true
+				case "failed", "disabled", "needs_auth":
+					return fmt.Errorf("Relo agent messaging MCP is %s", server.Status.Status)
+				}
+			}
+		}
+		if connected {
+			break
+		}
+		select {
+		case <-readyCtx.Done():
+			return fmt.Errorf("Relo agent messaging MCP did not connect: %w", readyCtx.Err())
+		case <-tick.C:
+		}
+	}
+	// OpenCode v2.0.29 refreshes its model-facing tool catalog on a separate 100 ms debounce after MCP connects.
+	// There is no catalog-readiness API. Allow that refresh to settle once per directory before the first prompt.
+	settled := time.NewTimer(250 * time.Millisecond)
+	defer settled.Stop()
+	select {
+	case <-readyCtx.Done():
+		return fmt.Errorf("Relo agent messaging catalog did not settle: %w", readyCtx.Err())
+	case <-settled.C:
+	}
+	if err == nil {
+		if c.messageLocations == nil {
+			c.messageLocations = map[string]string{}
+		}
+		c.messageLocations[directory] = fingerprint
+	}
+	return err
+}
+
+// DeliverMessage injects one peer message into a session as a steering synthetic part. It deliberately does not
+// touch the turn state, timers, model, or system prompt; delivery alone must never start or end a turn.
+func (c *Client) DeliverMessage(ctx context.Context, session runtime.SessionID, id, text string) error {
+	body := map[string]any{
+		"text":        text,
+		"description": "Relo peer coordination",
+		"delivery":    "steer",
+		"resume":      false,
+		"metadata":    map[string]string{"reloPeerMessage": id},
+	}
+	return c.post(ctx, "/api/session/"+url.PathEscape(string(session))+"/synthetic", body, nil)
 }
 
 func (c *Client) CloseSession(ctx context.Context, session runtime.SessionID) error {

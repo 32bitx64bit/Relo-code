@@ -138,6 +138,20 @@ type Compactor interface {
 	Compact(ctx context.Context, session SessionID) error
 }
 
+// MessageTools describes the Relo-owned MCP endpoint a runtime should register so agents can reach the coordination hub.
+type MessageTools struct {
+	URL    string
+	Secret string
+}
+
+// MessageRuntime is optional. Runtimes that can host peer messaging implement it; callers must type-assert.
+// ConfigureMessages registers the MCP endpoint for a directory. DeliverMessage injects one peer message into a
+// session without starting or resetting a turn.
+type MessageRuntime interface {
+	ConfigureMessages(ctx context.Context, directory string, tools MessageTools) error
+	DeliverMessage(ctx context.Context, session SessionID, id, text string) error
+}
+
 // RolePrimary must match agent.Primary. Duplicated as a string because this package
 // cannot import internal/agent without a cycle risk.
 const RolePrimary = "primary"
@@ -153,6 +167,8 @@ func ToolsFor(role, mode string, mutating bool) map[string]bool {
 			"*":    false,
 			"read": false, "grep": false, "glob": false, "list": false, "ls": false,
 			"write": false, "edit": false, "bash": false, "shell": false, "webfetch": false, "websearch": false,
+			// Enabled after the wildcard; setTools emits it as an explicit allow so it survives the "*" deny.
+			ReloAgentsTool: true,
 		}
 	}
 	tools := DefaultTools(mode, mutating)
@@ -162,6 +178,25 @@ func ToolsFor(role, mode string, mutating bool) map[string]bool {
 	default:
 		tools["webfetch"], tools["websearch"] = false, false
 	}
+	tools[ReloAgentsTool] = true
+	return tools
+}
+
+// ReloAgentsTool is the MCP tool, served by Relo's coordination hub under the "relo" server, that lets an agent
+// list and message its peers. OpenCode exposes it as "<server>_<tool>".
+const ReloAgentsTool = "relo_agents"
+
+// ReloCanvasTool is the optional MCP tool that drives Relo Canvas artifacts through the extension. It is enabled
+// only when the connected extension advertises Canvas support.
+const ReloCanvasTool = "relo_canvas"
+
+// WithCanvas adds the relo_canvas allow rule to a tool policy. Without it the policy is returned unchanged, so an
+// extension that does not support Canvas never sees the tool.
+func WithCanvas(tools map[string]bool, enabled bool) map[string]bool {
+	if !enabled {
+		return tools
+	}
+	tools[ReloCanvasTool] = true
 	return tools
 }
 

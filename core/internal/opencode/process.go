@@ -202,7 +202,17 @@ type Adapter struct {
 	Client *Client
 }
 
-var _ runtime.Compactor = (*Adapter)(nil)
+var (
+	_ runtime.Compactor      = (*Adapter)(nil)
+	_ runtime.MessageRuntime = (*Adapter)(nil)
+)
+
+func (a *Adapter) ConfigureMessages(ctx context.Context, directory string, tools runtime.MessageTools) error {
+	return a.Client.ConfigureMessages(ctx, directory, tools)
+}
+func (a *Adapter) DeliverMessage(ctx context.Context, session runtime.SessionID, id, text string) error {
+	return a.Client.DeliverMessage(ctx, session, id, text)
+}
 
 func (a *Adapter) StartSession(ctx context.Context, cfg runtime.SessionConfig) (runtime.SessionID, error) {
 	return a.Client.StartSession(ctx, cfg)

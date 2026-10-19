@@ -144,14 +144,17 @@ func (c *Coord) ingestGuidanceWithSession(primaryID, text string, refs []string,
 // are not cancelled and keep running: only the head steps.
 func (c *Coord) stepQueued(ctx context.Context) {
 	text, refs, ok := c.takeQueued(c.SessionID())
-	if text == "" {
-		return
-	}
 	p, ok := c.Agents.Primary()
 	if !ok {
 		return
 	}
-	c.ingestGuidance(p.ID, text, refs)
+	if text == "" && !c.peerPending(p.ID) {
+		return
+	}
+	if text != "" {
+		c.ingestGuidance(p.ID, text, refs)
+	}
+	c.syncPeerContext(c.SessionID(), p.ID)
 	settings := c.settings()
 	gen, err := c.Engine.Refresh(p.ID, "user guidance arrived")
 	if err != nil {

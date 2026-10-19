@@ -76,6 +76,7 @@ func cloneSession(s *Session) *Session {
 	out := *s
 	out.Constraints = append([]string(nil), s.Constraints...)
 	out.Decisions = append([]string(nil), s.Decisions...)
+	out.PeerMessages = append([]PeerMessage(nil), s.PeerMessages...)
 	out.Messages = append([]Chat(nil), s.Messages...)
 	out.Changes = append([]Change(nil), s.Changes...)
 	out.Verify = append([]verification.Result(nil), s.Verify...)
@@ -118,6 +119,7 @@ func (c *Coord) CreateSession(workspace, objective string, mode Mode) *Session {
 	}
 	// The replaced session's waiting messages can never be delivered now.
 	c.inbox = map[string][]queuedNote{}
+	c.peerKeys = map[string]peerIdentity{}
 	s := &Session{ID: id.New("sess"), Workspace: workspace, Objective: objective, Mode: mode, Status: "active", Created: time.Now().UTC(), Updated: time.Now().UTC(), Usage: map[string]any{}}
 	c.sess, c.reviewed = s, map[string]bool{}
 	c.Graph, c.Agents, c.Engine = taskgraph.New(), c.newRegistry(), ctxeng.New()
@@ -144,7 +146,9 @@ func (c *Coord) OpenSession(ctx context.Context, s *Session) {
 	c.mu.Lock()
 	c.runCancel, c.sessionCtx = nil, nil
 	c.sess, c.reviewed = cloneSession(s), map[string]bool{}
+	c.peerKeys = map[string]peerIdentity{}
 	clearQueuedMarks(c.sess)
+	clearPeerDelivery(c.sess)
 	if c.sess != nil {
 		c.sess.Running = false
 		if c.sess.Usage == nil {
@@ -167,9 +171,11 @@ func (c *Coord) OpenSession(ctx context.Context, s *Session) {
 func (c *Coord) Restore(s *Session) {
 	c.mu.Lock()
 	c.sess = cloneSession(s)
+	c.peerKeys = map[string]peerIdentity{}
 	c.lineage = map[string][]Dep{}
 	c.lineageProblems = map[string]lineageProblem{}
 	clearQueuedMarks(c.sess)
+	clearPeerDelivery(c.sess)
 	if c.sess != nil {
 		c.sess.Running = false
 		for i := range c.sess.Changes {
@@ -273,6 +279,7 @@ func (c *Coord) StopAll(ctx context.Context) {
 		c.Agents.Update(a.ID, func(x *agent.Agent) { x.Status = agent.Cancelled; x.Activity = "Stopped" })
 		c.emit("agent.failed", c.freshAgent(a))
 	}
+	c.settlePeerMessages(c.SessionID())
 	close(errs)
 	for err := range errs {
 		c.logGone("cancel runtime session", err)
@@ -372,6 +379,16 @@ func (c *Coord) Submit(ctx context.Context, text string, refs []string) error {
 	c.emit("session.updated", started)
 	c.refreshSnapshot()
 	primary := c.ensurePrimary()
+	c.mu.Lock()
+	if c.sess != nil {
+		for i := range c.sess.PeerMessages {
+			m := &c.sess.PeerMessages[i]
+			if m.To == primary.ID && (m.State == "queued" || m.State == "injected") {
+				m.State, m.Reason = "undelivered", "previous run ended before acknowledgement"
+			}
+		}
+	}
+	c.mu.Unlock()
 	c.Agents.Update(primary.ID, func(x *agent.Agent) {
 		x.Status, x.Phase, x.Activity = agent.Running, "context", "Building context"
 	})
@@ -382,7 +399,7 @@ func (c *Coord) Submit(ctx context.Context, text string, refs []string) error {
 			return err
 		}
 		// Guidance that arrived too late for a turn starts a follow-up turn, so nothing the user typed is lost.
-		for runCtx.Err() == nil && c.queuedPending(sid) {
+		for runCtx.Err() == nil && (c.queuedPending(sid) || c.peerPending(primary.ID)) {
 			if err := c.loopPrimary(runCtx, primary, ""); err != nil {
 				return err
 			}
@@ -391,6 +408,7 @@ func (c *Coord) Submit(ctx context.Context, text string, refs []string) error {
 	})
 	c.reportFailure(primary, "Primary failed", err)
 	c.settlePrimary(primary.ID, runCtx, err)
+	c.settlePeerMessages(sid)
 	cancel()
 	c.mu.Lock()
 	var finished *Session
@@ -442,6 +460,7 @@ func (c *Coord) Submit(ctx context.Context, text string, refs []string) error {
 // settlePrimary ends the Primary's run. Without it the agent would stay "running" after a successful turn, which
 // blocks Busy (and so deferred restarts) and leaves the Stop button lit forever.
 func (c *Coord) settlePrimary(id string, ctx context.Context, err error) {
+	defer c.finishPeerTurn(c.SessionID(), id)
 	cur, ok := c.Agents.Get(id)
 	if !ok || agent.Terminal(cur.Status) {
 		return // StopAll or fail() already ended it
@@ -597,6 +616,7 @@ func (c *Coord) seedPrimary(text string, refs []string) {
 		return
 	}
 	p, _ := c.Agents.Primary()
+	c.syncPeerContext(s.ID, p.ID)
 	// Objective, latest user message and mode are singletons: each turn replaces them rather than appending.
 	c.Engine.SetTaskState(p.ID, "Objective", []ctxeng.Item{{Source: ctxeng.SourceSummary, Content: s.Objective, Durability: 1, Relevance: 1, Pinned: true}})
 	var mode []ctxeng.Item
@@ -937,7 +957,7 @@ func (c *Coord) primaryTurn(ctx context.Context, primary agent.Agent, parts prom
 	}
 	repair := "Previous output failed validation: " + parseErr.Error() + ". Return corrected JSON only."
 	if strayCall {
-		repair = "Your last reply was a tool call. You have no tools and nothing was run. Reply with the JSON turn only: what was done in userMessage, and tasks [] when nothing is left to do."
+		repair = "Your last reply was tool-call markup, not an executed tool. You have no repository tools; use relo_agents only if offered. Reply with the JSON turn: what was done in userMessage, and tasks [] when nothing is left to do."
 	}
 	body, err = c.runAgent(ctx, primary, parts, repair, prompt.PrimarySchema)
 	if err != nil {

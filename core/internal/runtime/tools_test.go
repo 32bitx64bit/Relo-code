@@ -1,6 +1,9 @@
 package runtime
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestToolsForMatrix(t *testing.T) {
 	allFalse := func(m map[string]bool) bool {
@@ -16,7 +19,14 @@ func TestToolsForMatrix(t *testing.T) {
 	for _, mode := range []string{"build", "plan", "review"} {
 		for _, mutating := range []bool{true, false} {
 			got := ToolsFor(RolePrimary, mode, mutating)
-			if !allFalse(got) {
+			// relo_agents is the one tool Primary may use: it reaches the coordination hub, not the workspace.
+			withoutRelo := map[string]bool{}
+			for k, v := range got {
+				if k != ReloAgentsTool {
+					withoutRelo[k] = v
+				}
+			}
+			if !allFalse(withoutRelo) {
 				t.Fatalf("primary mode=%s mutating=%v has enabled tools: %v", mode, mutating, got)
 			}
 			if got["read"] || got["bash"] || got["write"] {
@@ -64,6 +74,36 @@ func TestToolsForMatrix(t *testing.T) {
 	}
 }
 
+// Every role may use relo_agents to reach its peers; the MCP hub is the only tool it adds.
+func TestReloAgentsEnabledForEveryRole(t *testing.T) {
+	for _, role := range []string{RolePrimary, "worker", "probe", "test", "reviewer", "debug", "architect", "integration"} {
+		for _, mode := range []string{"build", "plan", "review"} {
+			got := ToolsFor(role, mode, true)
+			if v, ok := got[ReloAgentsTool]; !ok || !v {
+				t.Errorf("%s/%s: %s = %v (present %v), want true", role, mode, ReloAgentsTool, v, ok)
+			}
+		}
+	}
+	if ReloAgentsTool != "relo_agents" {
+		t.Fatalf("ReloAgentsTool = %q", ReloAgentsTool)
+	}
+}
+
+// Enabling relo_agents must not switch on or off any other MCP or unrelated tool.
+func TestReloAgentsLeavesOtherMCPToolsUnlisted(t *testing.T) {
+	for _, role := range []string{RolePrimary, "worker", "debug"} {
+		got := ToolsFor(role, "build", true)
+		for name := range got {
+			if strings.HasPrefix(name, "relo_") && name != ReloAgentsTool {
+				t.Errorf("%s: unexpected relo tool %q", role, name)
+			}
+			if strings.Contains(name, "_") && name != ReloAgentsTool {
+				t.Errorf("%s: unexpected MCP-style tool %q listed", role, name)
+			}
+		}
+	}
+}
+
 // Each tool OpenCode offers is described to the model in every call, so unused ones are pure cost.
 func TestAgentsDoNotCarryToolsReloNeverUses(t *testing.T) {
 	for _, role := range []string{"worker", "probe", "test", "reviewer", "debug", "architect", "integration"} {
@@ -83,5 +123,36 @@ func TestAgentsDoNotCarryToolsReloNeverUses(t *testing.T) {
 		if !got["read"] || !got["grep"] || !got["glob"] {
 			t.Errorf("%s lost a reading tool: %v", role, got)
 		}
+	}
+}
+
+// relo_canvas is an explicit allow only when enabled. Primary keeps every repository tool denied either way.
+func TestCanvasToolAllowedForPrimaryWhileRepositoryDenied(t *testing.T) {
+	on := WithCanvas(ToolsFor(RolePrimary, "build", false), true)
+	if !on[ReloCanvasTool] {
+		t.Fatalf("Primary lacks %s when canvas is enabled: %v", ReloCanvasTool, on)
+	}
+	for _, name := range []string{"read", "grep", "glob", "list", "write", "edit", "bash", "shell", "webfetch", "websearch"} {
+		if v, ok := on[name]; !ok || v {
+			t.Errorf("Primary repository tool %q = %v (present %v), want explicit deny", name, v, ok)
+		}
+	}
+	off := WithCanvas(ToolsFor(RolePrimary, "build", false), false)
+	if _, ok := off[ReloCanvasTool]; ok {
+		t.Fatalf("canvas listed while disabled: %v", off)
+	}
+}
+
+func TestCanvasToolEnabledForWorkersAndNeverGrantsRepoTools(t *testing.T) {
+	got := WithCanvas(ToolsFor("worker", "build", true), true)
+	if !got[ReloCanvasTool] {
+		t.Fatalf("worker lacks canvas: %v", got)
+	}
+	if got["write"] != true || got["edit"] != true {
+		t.Fatalf("canvas wiring changed worker repo tools: %v", got)
+	}
+	planned := WithCanvas(ToolsFor("worker", "plan", false), true)
+	if planned["write"] || planned["edit"] {
+		t.Fatalf("plan mode repo writes enabled by canvas: %v", planned)
 	}
 }

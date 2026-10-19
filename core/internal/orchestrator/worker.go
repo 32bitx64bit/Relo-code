@@ -280,6 +280,7 @@ func claimSnapshotNotice(k snapshotNoticeKey) bool {
 }
 
 func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent) error {
+	defer c.finishPeerTurn(c.SessionID(), a.ID)
 	defer c.closeAgentSession(a.ID)
 	defer func() {
 		if a.EscalatedFrom != "" {
@@ -1202,6 +1203,7 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 	if sess == nil {
 		return "", fmt.Errorf("no session")
 	}
+	c.syncPeerContext(sess.ID, a.ID)
 	prov, model := routing.Split(a.Model)
 	gen := c.Engine.CurrentNumber(a.ID)
 	key := a.ID
@@ -1232,6 +1234,7 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 	sid, evs := session.id, session.events
 	previousDynamic := session.lastDynamic
 	c.runtimeMu.Unlock()
+	defer c.revokePeer(a.ID)
 	c.Agents.Update(a.ID, func(x *agent.Agent) {
 		x.RuntimeID = string(sid)
 		x.Status = agent.Running
@@ -1251,6 +1254,24 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 		dynamic += "\n\n"
 	}
 	promptText := dynamic + ask
+	if messenger, ok := rt.(runtime.MessageRuntime); ok {
+		if err := c.StartMessages(); err != nil {
+			return "", fmt.Errorf("start agent messaging: %w", err)
+		}
+		config, _ := c.messageTools()
+		if err := messenger.ConfigureMessages(ctx, a.Workspace, config); err != nil {
+			return "", fmt.Errorf("configure agent messaging: %w", err)
+		}
+		key, err := c.bindPeer(a, sid)
+		if err != nil {
+			return "", err
+		}
+		promptText += "\n\nRelo agent messaging is available through relo_agents. Your private key is " + key + ". Use action list for live peer IDs, send with to/text, and inbox to acknowledge received messages. Never copy your key into messages or reports."
+	}
+	peerText, peerIDs := c.peerTurnText(a.ID)
+	if peerText != "" {
+		promptText += "\n\n" + peerText
+	}
 	tools := runtime.ToolsFor(string(a.Role), string(sess.Mode), agent.Mutating(a.Role) && sess.Mode == ModeBuild)
 	send := func(text string) error {
 		return rt.SendTask(ctx, sid, runtime.AgentTask{
@@ -1261,6 +1282,9 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 	}
 	if err := send(promptText); err != nil {
 		return "", err
+	}
+	for _, messageID := range peerIDs {
+		c.peerState(sess.ID, messageID, "delivered", "included in recipient prompt; model acknowledgement not yet received")
 	}
 	c.runtimeMu.Lock()
 	if current := c.runtimeSessions[key]; current == session {

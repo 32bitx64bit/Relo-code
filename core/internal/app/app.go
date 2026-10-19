@@ -1030,6 +1030,7 @@ func (a *App) Close() {
 		a.stopPersistTimer()
 		a.persist()
 		a.Coord.StopAll(context.Background())
+		a.Coord.CloseMessages()
 		a.procMu.Lock()
 		a.swapProcLocked(nil)
 		a.procMu.Unlock()

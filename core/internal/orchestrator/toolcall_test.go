@@ -54,8 +54,8 @@ func TestPrimaryToolCallIsAskedAgainNotShown(t *testing.T) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.tasks) != 2 || !strings.Contains(r.tasks[1].Prompt, "You have no tools") {
-		t.Fatalf("the second ask did not say that there are no tools: %+v", r.tasks)
+	if len(r.tasks) != 2 || !strings.Contains(r.tasks[1].Prompt, "no repository tools") || !strings.Contains(r.tasks[1].Prompt, "relo_agents") {
+		t.Fatalf("the second ask did not distinguish messaging from repository tools: %+v", r.tasks)
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/relocode/relo/internal/agentmsg"
+
 	"github.com/relocode/relo/internal/agent"
 	ctxeng "github.com/relocode/relo/internal/context"
 	"github.com/relocode/relo/internal/logging"
@@ -193,6 +195,7 @@ type Session struct {
 	// Constraints are the Primary's reading of what the request and context require of every sub agent.
 	Constraints  []string              `json:"constraints,omitempty"`
 	Decisions    []string              `json:"decisions,omitempty"` // current interpreted plan, persisted independently of generations
+	PeerMessages []PeerMessage         `json:"peerMessages,omitempty"`
 	Mode         Mode                  `json:"mode"`
 	Status       string                `json:"status"`
 	Created      time.Time             `json:"createdAt"`
@@ -251,6 +254,9 @@ type Coord struct {
 	reviewed        map[string]bool
 	runtimeMu       sync.Mutex
 	runtimeSessions map[string]*runtimeSession
+	messageMu       sync.Mutex
+	messageServer   *agentmsg.Server
+	peerKeys        map[string]peerIdentity // per-runtime capabilities; protected by mu, never persisted
 	escalations     map[string]string
 	failures        map[string]string // task ID -> why its last attempt failed, for the attempt that replaces it; guarded by mu
 	directSem       chan struct{}     // guarded by mu; one mutating agent at a time in direct mode
@@ -276,6 +282,7 @@ func New(log *logging.Logger) *Coord {
 		runtimeSessions: map[string]*runtimeSession{},
 		escalations:     map[string]string{},
 		failures:        map[string]string{},
+		peerKeys:        map[string]peerIdentity{},
 		lineageProblems: map[string]lineageProblem{},
 		Emit:            func(string, any) {},
 	}
