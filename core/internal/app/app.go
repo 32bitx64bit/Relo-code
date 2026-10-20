@@ -164,9 +164,24 @@ var noPersistEvents = map[string]bool{
 	"chat.delta":     true,
 	"agent.updated":  true,
 	"agent.activity": true,
-	// Canvas requests carry artifact sources and screenshots, and replies carry capture data. Neither is logged.
+	// Canvas requests carry artifact sources and screenshots, and replies carry capture data. Neither payload
+	// is logged. The canvas audit sink stores a metadata-only row under the same event names instead.
 	"canvas.requested": true,
 	"canvas.reply":     true,
+}
+
+// logCanvasAudit writes one metadata-only canvas row to the event log. The raw canvas.requested and
+// canvas.reply payloads carry artifact source and are never persisted; this row keeps only the facts
+// needed to prove which role called canvas and why a call was refused. The event log is read back for
+// the operator log view only, never replayed into an agent's context.
+func (a *App) logCanvasAudit(rec orchestrator.CanvasAudit) {
+	sess := a.Coord.SessionID()
+	if sess == "" {
+		return
+	}
+	if err := a.Store.LogEvent(sess, rec.Event, rec.Payload()); err != nil {
+		a.Log.Error("persist canvas audit failed", map[string]any{"event": rec.Event, "sessionId": sess, "error": err.Error()})
+	}
 }
 
 func New(cfg Config, log *logging.Logger) (*App, error) {
@@ -182,6 +197,8 @@ func New(cfg Config, log *logging.Logger) (*App, error) {
 	}
 	a := &App{Cfg: cfg, Log: log, Store: store, Coord: orchestrator.New(log)}
 	a.Coord.ResolveChanges = a.resolveHeadChanges
+	// Canvas calls are audited in the event log with metadata only: the raw payloads stay out of the log.
+	a.Coord.SetCanvasAudit(a.logCanvasAudit)
 	ws := workspace.New(cfg.Workspace)
 	a.Coord.SetWorkspaceManager(ws)
 	a.Coord.Verify = verification.Runner{Root: cfg.Workspace}

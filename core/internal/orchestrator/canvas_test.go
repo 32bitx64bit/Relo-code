@@ -303,6 +303,99 @@ func TestCanvasDisabledCoordRegistersNoTool(t *testing.T) {
 	}
 }
 
+// Authoring is refused for every role that is not a builder, and the error names the refused role.
+func TestCanvasAuthoringDeniedForEveryRestrictedRole(t *testing.T) {
+	for _, role := range []agent.Role{agent.Primary, agent.Head, agent.Probe, agent.Reviewer, agent.Role("designer"), agent.Role("")} {
+		c, ev, _, key := newCanvasRoleCoord(t, ModeBuild, role)
+		for _, action := range []string{"create", "update"} {
+			_, err := c.canvasRequest(context.Background(), canvasRoleRequest(key, action))
+			want := "canvas " + action + " is not available to the " + string(role) + " role"
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("role %q %s: err = %v, want %q", role, action, err, want)
+			}
+		}
+		if n := len(ev.list()); n != 0 {
+			t.Fatalf("role %q: denied writes emitted %d canvas events", role, n)
+		}
+	}
+}
+
+// Every builder role may create an artifact: the request reaches the extension and the answer comes back.
+func TestCanvasAuthoringAllowedForEveryBuilderRole(t *testing.T) {
+	for _, role := range []agent.Role{agent.Worker, agent.Architect, agent.Debug, agent.Test, agent.Integration} {
+		c, ev, _, key := newCanvasRoleCoord(t, ModeBuild, role)
+		done := make(chan error, 1)
+		go func() {
+			_, err := c.canvasRequest(context.Background(), canvasRoleRequest(key, "create"))
+			done <- err
+		}()
+		reqID := awaitEvent(t, ev)
+		if err := c.CanvasReply(reqID, map[string]any{"artifact": map[string]any{"id": "art_1"}}, ""); err != nil {
+			t.Fatalf("builder %q: CanvasReply: %v", role, err)
+		}
+		if err := <-done; err != nil {
+			t.Fatalf("builder %q create: %v", role, err)
+		}
+	}
+}
+
+// A reply is refused when the owner changed to a restricted role while the request was pending.
+func TestCanvasReplyRejectsRoleChangeToRestrictedRoles(t *testing.T) {
+	for _, role := range []agent.Role{agent.Primary, agent.Head, agent.Probe, agent.Reviewer} {
+		c, ev, sender, key := newCanvasRoleCoord(t, ModeBuild, agent.Worker)
+		done := make(chan error, 1)
+		go func() {
+			_, err := c.canvasRequest(context.Background(), canvasRoleRequest(key, "create"))
+			done <- err
+		}()
+		reqID := awaitEvent(t, ev)
+		c.Agents.Update(sender.ID, func(x *agent.Agent) { x.Role = role })
+		if err := c.CanvasReply(reqID, map[string]any{"artifact": map[string]any{"id": "art_1"}}, ""); err == nil {
+			t.Fatalf("reply after change to %q was accepted", role)
+		}
+		select {
+		case err := <-done:
+			if err == nil || !strings.Contains(err.Error(), "changed role") {
+				t.Fatalf("change to %q: err = %v", role, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("change to %q: the agent was not told that the reply was refused", role)
+		}
+	}
+}
+
+// The re-entry check runs the action policy too: a pending create whose owner may not create is refused even when
+// the role itself did not change. The waiting agent receives the refusal as an error, never as a result.
+func TestCanvasReplyReentryRejectsDisallowedAction(t *testing.T) {
+	c, _, _, key := newCanvasRoleCoord(t, ModeBuild, agent.Primary)
+	c.mu.Lock()
+	identity := c.peerKeys[key]
+	c.mu.Unlock()
+	call := &canvasCall{
+		id:       "canvas_forged",
+		session:  identity.session,
+		agent:    identity.agent,
+		role:     agent.Primary,
+		action:   "create",
+		identity: identity,
+		reply:    make(chan canvasReply, 1),
+	}
+	c.canvasMu.Lock()
+	c.canvasPending[call.id] = call
+	c.canvasMu.Unlock()
+	if err := c.CanvasReply(call.id, map[string]any{"artifact": map[string]any{"id": "art_1"}}, ""); err == nil || !strings.Contains(err.Error(), "may no longer create") {
+		t.Fatalf("reply for a disallowed action: err = %v", err)
+	}
+	select {
+	case r := <-call.reply:
+		if r.err == "" || r.result != nil {
+			t.Fatalf("waiting agent got %+v, want a refusal only", r)
+		}
+	default:
+		t.Fatal("the waiting agent was not told that the reply was refused")
+	}
+}
+
 func mustJSON(t *testing.T, v any) string {
 	t.Helper()
 	b, err := json.Marshal(v)

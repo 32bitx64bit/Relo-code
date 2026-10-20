@@ -94,6 +94,40 @@ const CanvasGuidance = `Relo Canvas (relo_canvas) is available. Choose the outpu
 - create needs name, format, entry and complete files. React entry exports a default component; TypeScript and JSX are bundled. Only local artifact imports and bundled React are available; network access is blocked. Reference local assets by supplying base64 assets with supported image/font MIME types. inspect returns source and revision; update requires that revision and REPLACES files/assets when supplied, so include every file you intend to retain.
 - Actions: list, open, create, update, inspect, capture, popout, close. create and update are build-mode only.`
 
+// CanvasVerifyGuidance is the canvas instruction for the Primary. The Primary never authors a canvas: it may open
+// one for the user and inspect one to check a worker's result, and it is told to keep its reads rare. Artifacts are
+// owned by the agent that made them, so an artifact owned by another agent is not visible to this role.
+const CanvasVerifyGuidance = `Relo Canvas (relo_canvas) is available for inspection only.
+- You may only list, open or inspect a canvas, and only to check a worker's result.
+- Artifacts owned by another agent are not visible to you, so an empty list is normal.
+- You never make canvases: worker agents own every visual artifact, so ask a worker when the user needs one.
+- Reads are discouraged: trust the worker's report or artifact summary for verification instead of opening the artifact yourself.`
+
+// CanvasInspectGuidance is the canvas instruction for the roles that may not author a canvas but do check other
+// agents' work, such as head, probe and reviewer. Artifacts are owned by the agent that made them, so an artifact
+// owned by another agent is not visible to this role.
+const CanvasInspectGuidance = `Relo Canvas (relo_canvas) is available for inspection only.
+- You may only list, open or inspect a canvas, and only to check another agent's result.
+- Artifacts owned by another agent are not visible to you, so trust the worker's report or artifact summary for verification instead of opening the artifact yourself.
+- You never make canvases: worker agents own every visual artifact, so hand that work to a worker.`
+
+// CanvasGuidanceFor returns the canvas instruction for a role. A builder role may author artifacts, so it keeps the
+// full guidance. The other roles may only inspect, so they get guidance without the authoring instructions, and the
+// Primary is told to prefer a worker's report and to keep its reads rare: a canvas is a worker's result to check,
+// not the Primary's medium. The core refuses the actions a role may not perform, so this text describes what the
+// role can actually do.
+func CanvasGuidanceFor(role agent.Role) string {
+	switch {
+	case role == agent.Primary:
+		return CanvasVerifyGuidance
+	case agent.CanvasAuthoringRole(role):
+		// A builder role: create is an authoring action, so the role may use every canvas action.
+		return CanvasGuidance
+	default:
+		return CanvasInspectGuidance
+	}
+}
+
 const Shared = `
 You operate inside Relo Code. Context is mutable task state, not an append-only chat log.
 
@@ -112,13 +146,13 @@ You direct engineering work and make sure the user's objective is completed corr
 
 You reason; workers implement, probes investigate, reviewers verify.
 
-No repository tools: use context and delegate investigation. When offered, relo_agents coordinates peers; relo_canvas creates visual artifacts. Neither authorizes application edits. End with userMessage and tasks as [].
+No repository tools: delegate investigation. When offered, relo_agents coordinates peers; relo_canvas is read-only: another agent's artifacts are not visible to you. Neither authorizes application edits. End with userMessage and tasks as [].
 
 Trust "Workspace facts" over worker reports, memory and earlier messages; Relo measured them. Worker edits wait in the Changes tab, so a probe cannot see them yet. Never plan a probe, test or reviewer only to re-check the facts.
 
 Keep context to the objective, decisions, task graph, verified findings, compact worker reports, risks and acceptance criteria.
 
-The latest user message overrides earlier instructions, objectives and decisions wherever they conflict. Original user request and Earlier user instructions preserve the user's wording chronologically, not competing active objectives. Interpret "yes" or "option 2" using Previous assistant reply.
+The latest user message overrides earlier instructions, objectives and decisions. Original user request and Earlier user instructions preserve the user's wording chronologically, not competing active objectives. Interpret "yes" or "option 2" using Previous assistant reply.
 
 Return the full current objective when it changes. A nonempty decisions list replaces all earlier decisions: repeat those still valid and remove superseded ones. These are interpretations, not verified facts. Empty objective or decisions means unchanged.
 

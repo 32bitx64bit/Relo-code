@@ -3,6 +3,7 @@ package opencode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/relocode/relo/internal/agent"
 	"github.com/relocode/relo/internal/agentmsg"
 	"github.com/relocode/relo/internal/provider"
 	"github.com/relocode/relo/internal/runtime"
@@ -31,6 +33,8 @@ const (
 	coordinationTxt = "COORDINATION-MARKER-7f3a"
 	steerMarker     = "STEER-MARKER-9c1d"
 	turnWait        = 30 * time.Second
+	// canvasScreenshotPNG is a 1x1 PNG the MCP endpoint lifts out of a capture result into an image content block.
+	canvasScreenshotPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWQAAAABJRU5ErkJggg=="
 )
 
 type agentRequest struct {
@@ -426,17 +430,44 @@ func TestPeerMessageSteersActiveWorkerWithoutRestart(t *testing.T) {
 	}
 }
 
-func TestPrimaryCallsCanvasWithNativeToolNameAndReceivesScreenshot(t *testing.T) {
+// TestPrimaryCanvasCaptureIsRefusedAtTheCoreRoleGate drives a Primary relo_canvas capture through the real opencode
+// MCP client to Relo's endpoint. The MCP canvas handler reproduces the core role gate that the orchestrator applies
+// before it talks to the extension (core/internal/orchestrator/canvas.go:100-102, agent.CanvasActionAllowed): capture
+// is not a read-only action, so a Primary's request is refused at the gate and the role-blind extension stub is never
+// reached. The stub would have returned a screenshot, so the model sees the refusal as a tool error instead.
+func TestPrimaryCanvasCaptureIsRefusedAtTheCoreRoleGate(t *testing.T) {
 	model := newFakeChat("CANVAS-PROMPT", func(n int, w http.ResponseWriter) {
 		if n == 1 {
 			streamChunks(w, toolCallDelta("call_canvas", runtime.ReloCanvasTool, `{"key":"canvas-key","action":"capture","id":"inventory"}`), "tool_calls")
 			return
 		}
-		streamChunks(w, map[string]any{"role": "assistant", "content": `{"status":"completed","summary":"canvas captured"}`}, "stop")
+		streamChunks(w, map[string]any{"role": "assistant", "content": `{"status":"completed","summary":"canvas refused"}`}, "stop")
 	})
 	ctx, rt, work := startMessagingE2E(t, model)
-	hub, err := agentmsg.Start(func(context.Context, agentmsg.Request) (any, error) { return nil, nil }, agentmsg.WithCanvas(func(_ context.Context, request agentmsg.CanvasRequest) (any, error) {
-		return map[string]any{"artifact": map[string]any{"id": request.ID}, "capture": map[string]any{"mime": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWQAAAABJRU5ErkJggg==", "visualInspectionAvailable": false}}, nil
+
+	refusal := fmt.Sprintf("canvas capture is not available to the %s role; canvas authoring is reserved for builder agents", agent.Primary)
+	gateSeen := make(chan agentmsg.CanvasRequest, 1)
+	extensionReached := make(chan agentmsg.CanvasRequest, 1)
+	// The role-blind extension stub: it answers any request with a screenshot, so it must never be asked to answer a
+	// Primary's capture.
+	extensionCanvas := func(_ context.Context, request agentmsg.CanvasRequest) (any, error) {
+		select {
+		case extensionReached <- request:
+		default:
+		}
+		return map[string]any{"artifact": map[string]any{"id": request.ID}, "capture": map[string]any{"mime": "image/png", "data": canvasScreenshotPNG, "visualInspectionAvailable": false}}, nil
+	}
+	hub, err := agentmsg.Start(func(context.Context, agentmsg.Request) (any, error) { return nil, nil }, agentmsg.WithCanvas(func(ctx context.Context, request agentmsg.CanvasRequest) (any, error) {
+		select {
+		case gateSeen <- request:
+		default:
+		}
+		// The core role gate. It is the same predicate the orchestrator evaluates before it emits canvas.requested,
+		// so a refused action never reaches the extension.
+		if !agent.CanvasActionAllowed(agent.Primary, request.Action) {
+			return nil, errors.New(refusal)
+		}
+		return extensionCanvas(ctx, request)
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -455,15 +486,92 @@ func TestPrimaryCallsCanvasWithNativeToolNameAndReceivesScreenshot(t *testing.T)
 		t.Fatal(err)
 	}
 	log := watchEvents(events, model)
-	if err := rt.SendTask(ctx, sid, runtime.AgentTask{Role: runtime.RolePrimary, Model: "claude-fake", Provider: "fake", Prompt: "CANVAS-PROMPT", Tools: runtime.WithCanvas(runtime.ToolsFor(runtime.RolePrimary, "build", false), true), Directory: work}); err != nil {
+	if err := rt.SendTask(ctx, sid, runtime.AgentTask{Role: runtime.RolePrimary, Model: "claude-fake", Provider: "fake", Prompt: "CANVAS-PROMPT", Tools: runtime.WithCanvas(runtime.ToolsFor(runtime.RolePrimary, "build", false), true, agent.CanvasActionsForRole(agent.Primary)), Directory: work}); err != nil {
+		t.Fatal(err)
+	}
+	if result := log.waitDone(t, turnWait); result.Error != "" || !strings.Contains(result.JSON, "canvas refused") {
+		t.Fatalf("Canvas turn: %+v", result)
+	}
+	requests := model.agentRequests()
+	if len(requests) != 2 || !hasTool(requests[0].tools, runtime.ReloCanvasTool) || hasTool(requests[0].tools, "shell") {
+		t.Fatalf("Canvas tool requests: %s", model.describe())
+	}
+	select {
+	case got := <-gateSeen:
+		if got.Action != "capture" {
+			t.Fatalf("canvas handler saw action %q, want capture", got.Action)
+		}
+	default:
+		t.Fatal("the Primary's capture never reached the canvas handler")
+	}
+	select {
+	case got := <-extensionReached:
+		t.Errorf("the Primary's capture reached the role-blind extension stub (%+v); the core role gate did not hold", got)
+	default:
+	}
+	if !strings.Contains(requests[1].body, refusal) {
+		t.Errorf("the role-gate refusal did not reach the model: %.500s", requests[1].body)
+	}
+	if strings.Contains(requests[1].body, "image/png") {
+		t.Error("a capture image reached the Primary's model request; the refused capture was still rendered")
+	}
+}
+
+// TestBuilderCanvasCaptureReachesTheExtension is the positive control for the role gate: a builder role passes
+// agent.CanvasActionAllowed, so its capture reaches the extension stub and the screenshot comes back to the model.
+// This is what the Primary used to exercise; it now covers the builder path the role gate must leave intact.
+func TestBuilderCanvasCaptureReachesTheExtension(t *testing.T) {
+	model := newFakeChat("CANVAS-PROMPT", func(n int, w http.ResponseWriter) {
+		if n == 1 {
+			streamChunks(w, toolCallDelta("call_canvas", runtime.ReloCanvasTool, `{"key":"canvas-key","action":"capture","id":"inventory"}`), "tool_calls")
+			return
+		}
+		streamChunks(w, map[string]any{"role": "assistant", "content": `{"status":"completed","summary":"canvas captured"}`}, "stop")
+	})
+	ctx, rt, work := startMessagingE2E(t, model)
+
+	reached := make(chan agentmsg.CanvasRequest, 1)
+	hub, err := agentmsg.Start(func(context.Context, agentmsg.Request) (any, error) { return nil, nil }, agentmsg.WithCanvas(func(_ context.Context, request agentmsg.CanvasRequest) (any, error) {
+		if !agent.CanvasActionAllowed(agent.Worker, request.Action) {
+			return nil, fmt.Errorf("canvas %s is not available to the %s role; canvas authoring is reserved for builder agents", request.Action, agent.Worker)
+		}
+		reached <- request
+		return map[string]any{"artifact": map[string]any{"id": request.ID}, "capture": map[string]any{"mime": "image/png", "data": canvasScreenshotPNG, "visualInspectionAvailable": false}}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hub.Close() })
+	sid, err := rt.StartSession(ctx, runtime.SessionConfig{Title: "canvas", Directory: work, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rt.CloseSession(context.Background(), sid) }()
+	if err := rt.(runtime.MessageRuntime).ConfigureMessages(ctx, work, runtime.MessageTools{URL: hub.URL, Secret: hub.Secret}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := rt.Events(ctx, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := watchEvents(events, model)
+	if err := rt.SendTask(ctx, sid, runtime.AgentTask{Role: "worker", Model: "claude-fake", Provider: "fake", Prompt: "CANVAS-PROMPT", Tools: runtime.WithCanvas(runtime.ToolsFor("worker", "build", true), true, agent.CanvasActionsForRole(agent.Worker)), Directory: work}); err != nil {
 		t.Fatal(err)
 	}
 	if result := log.waitDone(t, turnWait); result.Error != "" || !strings.Contains(result.JSON, "captured") {
 		t.Fatalf("Canvas turn: %+v", result)
 	}
 	requests := model.agentRequests()
-	if len(requests) != 2 || !hasTool(requests[0].tools, runtime.ReloCanvasTool) || hasTool(requests[0].tools, "shell") {
+	if len(requests) != 2 || !hasTool(requests[0].tools, runtime.ReloCanvasTool) {
 		t.Fatalf("Canvas tool requests: %s", model.describe())
+	}
+	select {
+	case got := <-reached:
+		if got.Action != "capture" {
+			t.Fatalf("extension saw action %q, want capture", got.Action)
+		}
+	default:
+		t.Fatal("the builder's capture never reached the extension stub")
 	}
 	if !strings.Contains(requests[1].body, "image/png") {
 		t.Fatalf("capture image did not reach model: %.500s", requests[1].body)

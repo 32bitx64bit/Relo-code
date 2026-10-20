@@ -168,6 +168,8 @@ func ToolsFor(role, mode string, mutating bool) map[string]bool {
 			"read": false, "grep": false, "glob": false, "list": false, "ls": false,
 			"write": false, "edit": false, "bash": false, "shell": false, "webfetch": false, "websearch": false,
 			// Enabled after the wildcard; setTools emits it as an explicit allow so it survives the "*" deny.
+			// The canvas tool joins it through WithCanvas, on the same terms: the Primary keeps a read-only
+			// canvas path, and what it may do with that tool is decided where the caller's role is known.
 			ReloAgentsTool: true,
 		}
 	}
@@ -190,10 +192,24 @@ const ReloAgentsTool = "relo_agents"
 // only when the connected extension advertises Canvas support.
 const ReloCanvasTool = "relo_canvas"
 
-// WithCanvas adds the relo_canvas allow rule to a tool policy. Without it the policy is returned unchanged, so an
-// extension that does not support Canvas never sees the tool.
-func WithCanvas(tools map[string]bool, enabled bool) map[string]bool {
-	if !enabled {
+// WithCanvas adds the relo_canvas allow rule to a tool policy, scoped to the canvas actions the turn may use.
+// Without it the policy is returned unchanged, so an extension that does not support Canvas never sees the tool.
+//
+// The rule names the tool, not the actions: the MCP catalog is served by one loopback endpoint that authenticates
+// with a single server-wide secret (internal/agentmsg/agentmsg.go), so the action list cannot be advertised per role
+// there. The scope passed in is what the turn advertises to the model, and it is the scope the core enforces (see
+// internal/agent/canvas_policy.go and internal/orchestrator/canvas.go): a builder role authors artifacts with every
+// action, a role that may not author keeps the read-only path (list, open, inspect) to check a worker's result, and
+// the core refuses the mutating actions before the extension is asked. A turn with no canvas action at all gets no
+// canvas tool.
+//
+// The Primary's policy denies every tool with "*" and re-allows the ones it may use. The explicit allow this
+// function adds must survive that deny, which is why opencode.setTools sends the allows of a wildcard-denied policy
+// after the deny instead of in map order. The re-enable path hands back the tool, never an action: the scope of a
+// role that may not author holds no create or update, and the core refuses those calls before the extension is
+// asked.
+func WithCanvas(tools map[string]bool, enabled bool, actions []string) map[string]bool {
+	if !enabled || len(actions) == 0 {
 		return tools
 	}
 	tools[ReloCanvasTool] = true

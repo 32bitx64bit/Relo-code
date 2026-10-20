@@ -259,10 +259,14 @@ type Coord struct {
 	peerKeys        map[string]peerIdentity // per-runtime capabilities; protected by mu, never persisted
 	// CanvasEnabled is set from the extension's initialize payload (`canvas: true`). When false, no relo_canvas tool
 	// is registered and no canvas.requested event is emitted, so an older extension cannot hang a request.
-	CanvasEnabled   bool
-	canvasPending   map[string]*canvasCall // request ID -> in-flight canvas call; guarded by canvasMu
-	canvasMu        sync.Mutex
-	canvasRate      map[string][]time.Time // agent ID -> recent canvas request times; guarded by canvasMu
+	CanvasEnabled bool
+	canvasPending map[string]*canvasCall // request ID -> in-flight canvas call; guarded by canvasMu
+	canvasMu      sync.Mutex
+	canvasRate    map[string][]time.Time // agent ID -> recent canvas request times; guarded by canvasMu
+	// canvasAuditFn receives one metadata-only record per canvas request and per canvas reply, so the event
+	// log can prove which role called canvas. It never receives artifact content; guarded by canvasAuditMu.
+	canvasAuditFn   func(CanvasAudit)
+	canvasAuditMu   sync.RWMutex
 	escalations     map[string]string
 	failures        map[string]string // task ID -> why its last attempt failed, for the attempt that replaces it; guarded by mu
 	directSem       chan struct{}     // guarded by mu; one mutating agent at a time in direct mode

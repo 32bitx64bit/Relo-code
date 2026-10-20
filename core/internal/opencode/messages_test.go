@@ -241,7 +241,7 @@ func TestPrimaryPermissionsAllowReloAgentsAndCanvasAfterWildcardDeny(t *testing.
 	srv, seen, mu := recordingServer(t)
 	c := NewClientWithAuth(srv.URL, "opencode", "secret")
 	defer c.Close()
-	tools := runtime.WithCanvas(runtime.ToolsFor(runtime.RolePrimary, "build", false), true)
+	tools := runtime.WithCanvas(runtime.ToolsFor(runtime.RolePrimary, "build", false), true, []string{"list", "open", "inspect"})
 	if err := c.setTools(context.Background(), "ses_p", tools); err != nil {
 		t.Fatal(err)
 	}

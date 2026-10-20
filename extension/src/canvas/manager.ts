@@ -11,9 +11,19 @@ export interface CanvasBridgeRequest {
   requestId: string;
   sessionId: string;
   agentId: string;
+  /** Alias of agentId. The core sends both; agentId wins when they disagree. */
+  owner?: string;
+  /**
+   * Whether the caller may read an artifact that carries no owner. The core decides it from the
+   * role policy; the extension only applies it, so the role logic stays in the core.
+   */
+  readUnowned?: boolean;
   workspace: string;
   request: unknown;
 }
+
+/** Longest owner id accepted from the core envelope. */
+const MAX_OWNER_LENGTH = 128;
 
 export class CanvasManager implements vscode.Disposable {
   readonly store: CanvasStore;
@@ -76,33 +86,54 @@ export class CanvasManager implements vscode.Disposable {
     if (!raw || typeof raw !== "object") throw new Error("Invalid Canvas request");
     const event = raw as CanvasBridgeRequest;
     if (event.sessionId !== sessionID || path.resolve(event.workspace) !== path.resolve(this.root())) throw new Error("Canvas request belongs to a different session or repository");
-    return this.execute(event.request);
+    return this.execute(event.request, this.ownerOf(event), event.readUnowned === true);
   }
 
-  async execute(raw: unknown): Promise<unknown> {
+  /**
+   * The owner is the agent the core envelope names. It never comes from the agent's own request
+   * body, so an agent cannot claim an artifact that belongs to another one. A request without an
+   * owner is refused: an unscoped request would read every artifact in the workspace.
+   */
+  private ownerOf(event: CanvasBridgeRequest): string {
+    const candidate = typeof event.agentId === "string" && event.agentId.length > 0
+      ? event.agentId
+      : typeof event.owner === "string" ? event.owner : "";
+    if (candidate.length === 0 || candidate.length > MAX_OWNER_LENGTH) throw new Error("Canvas request does not identify the agent that owns the artifact");
+    return candidate;
+  }
+
+  /**
+   * Serves one Canvas action. When an owner is given, only that agent's artifacts are visible:
+   * list returns the owner's artifacts, and opening, inspecting or capturing another agent's
+   * artifact is refused. An artifact that carries no owner belongs to nobody, so it is served
+   * only when the core marked the caller as allowed to read unowned artifacts.
+   * Editor-driven calls pass no owner and are not filtered.
+   */
+  async execute(raw: unknown, owner?: string, readUnowned = false): Promise<unknown> {
     if (this.disposed) throw new Error("Canvas is closed");
     const request = parseCanvasRequest(raw);
-    if (request.action === "list") return { ok: true, artifacts: (await this.store.list()).map((artifact) => ({ id: artifact.id, name: artifact.name, format: artifact.format, entry: artifact.entry, revision: artifact.revision, createdAt: artifact.createdAt, updatedAt: artifact.updatedAt, files: Object.keys(artifact.files), assets: Object.keys(artifact.assets ?? {}) })) };
+    // The owner is reported so a caller can tell its own artifacts from the legacy ones it may also read.
+    if (request.action === "list") return { ok: true, artifacts: (await this.store.list(owner, readUnowned)).map((artifact) => ({ id: artifact.id, name: artifact.name, format: artifact.format, entry: artifact.entry, revision: artifact.revision, createdAt: artifact.createdAt, updatedAt: artifact.updatedAt, files: Object.keys(artifact.files), assets: Object.keys(artifact.assets ?? {}), ...(artifact.owner ? { owner: artifact.owner } : {}) })) };
     if (!vscode.workspace.isTrusted) throw new Error("Canvas rendering requires a trusted workspace");
     if (request.action === "create") {
-      const artifact = await this.store.create(request);
+      const artifact = await this.store.create(request, owner);
       await this.publish(artifact);
       await this.open(artifact.id);
       return this.info(artifact);
     }
     const id = request.id ?? this.activeID;
     if (!id) throw new Error("Specify a Canvas artifact ID or open a Canvas first");
-    let artifact = await this.store.get(id);
+    let artifact = await this.store.get(id, owner, readUnowned);
     if (["inspect", "capture", "popout"].includes(request.action)) {
       const document = vscode.workspace.textDocuments.find((item) => item.uri.fsPath === this.store.artifactPath(id));
-      if (document?.isDirty) artifact = await this.document(document);
+      if (document?.isDirty) artifact = await this.document(document, owner, readUnowned);
     }
     if (request.action === "update") {
       const uri = vscode.Uri.file(this.store.artifactPath(id));
       if (vscode.workspace.textDocuments.some((document) => document.uri.toString() === uri.toString() && document.isDirty)) {
         throw new Error("Canvas source has unsaved edits; save it before an agent update");
       }
-      artifact = await this.store.update({ ...request, id });
+      artifact = await this.store.update({ ...request, id }, owner, readUnowned);
       await this.publish(artifact);
       await this.changed(uri);
       return this.info(artifact);
@@ -144,7 +175,7 @@ export class CanvasManager implements vscode.Disposable {
 
 
   private info(artifact: CanvasDocument): Record<string, unknown> {
-    return { ok: true, artifact: { id: artifact.id, name: artifact.name, format: artifact.format, entry: artifact.entry, revision: artifact.revision, createdAt: artifact.createdAt, updatedAt: artifact.updatedAt, source: this.store.artifactPath(artifact.id), files: Object.keys(artifact.files), assets: Object.keys(artifact.assets ?? {}) }, views: this.editor.count(vscode.Uri.file(this.store.artifactPath(artifact.id))), rendered: this.rendered.has(artifact.id), errors: this.errors.get(artifact.id) ?? [] };
+    return { ok: true, artifact: { id: artifact.id, name: artifact.name, format: artifact.format, entry: artifact.entry, revision: artifact.revision, createdAt: artifact.createdAt, updatedAt: artifact.updatedAt, source: this.store.artifactPath(artifact.id), files: Object.keys(artifact.files), assets: Object.keys(artifact.assets ?? {}), ...(artifact.owner ? { owner: artifact.owner } : {}) }, views: this.editor.count(vscode.Uri.file(this.store.artifactPath(artifact.id))), rendered: this.rendered.has(artifact.id), errors: this.errors.get(artifact.id) ?? [] };
   }
 
   private async open(id: string): Promise<void> {
@@ -160,10 +191,10 @@ export class CanvasManager implements vscode.Disposable {
     while (!this.rendered.has(id) && !this.disposed && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
   }
 
-  private async document(document: vscode.TextDocument): Promise<CanvasDocument> {
+  private async document(document: vscode.TextDocument, owner?: string, readUnowned = false): Promise<CanvasDocument> {
     const artifact = parseCanvasDocument(JSON.parse(document.getText()));
     if (path.resolve(document.uri.fsPath) !== path.resolve(this.store.artifactPath(artifact.id))) throw new Error("Canvas must be inside the selected repository's .relo/canvas directory, with its ID as filename");
-    await this.store.get(artifact.id); // validates the persisted path and rejects symlink escapes
+    await this.store.get(artifact.id, owner, readUnowned); // validates the persisted path, rejects symlink escapes and foreign owners
     return artifact;
   }
 

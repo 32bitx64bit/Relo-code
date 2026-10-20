@@ -300,6 +300,35 @@ func (s *Store) List(table, session string) ([]json.RawMessage, error) {
 	return out, rows.Err()
 }
 
+// EventRow is one stored event: the name of the event and the payload that was written with it.
+type EventRow struct {
+	Name    string          `json:"name"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+// EventRows returns the stored events of a session, newest first, with the name of each event.
+func (s *Store) EventRows(session string, limit int) ([]EventRow, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.db.Query(`SELECT name, payload FROM events WHERE session_id=? ORDER BY id DESC LIMIT ?`, session, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EventRow
+	for rows.Next() {
+		var row EventRow
+		var payload string
+		if err := rows.Scan(&row.Name, &payload); err != nil {
+			return nil, err
+		}
+		row.Payload = json.RawMessage(payload)
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
 // DeleteSession removes a session and everything stored for it.
 func (s *Store) DeleteSession(id string) error {
 	tx, err := s.db.Begin()

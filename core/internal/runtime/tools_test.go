@@ -3,6 +3,8 @@ package runtime
 import (
 	"strings"
 	"testing"
+
+	"github.com/relocode/relo/internal/agent"
 )
 
 func TestToolsForMatrix(t *testing.T) {
@@ -128,7 +130,7 @@ func TestAgentsDoNotCarryToolsReloNeverUses(t *testing.T) {
 
 // relo_canvas is an explicit allow only when enabled. Primary keeps every repository tool denied either way.
 func TestCanvasToolAllowedForPrimaryWhileRepositoryDenied(t *testing.T) {
-	on := WithCanvas(ToolsFor(RolePrimary, "build", false), true)
+	on := WithCanvas(ToolsFor(RolePrimary, "build", false), true, agent.CanvasActionsForRole(agent.Primary))
 	if !on[ReloCanvasTool] {
 		t.Fatalf("Primary lacks %s when canvas is enabled: %v", ReloCanvasTool, on)
 	}
@@ -137,22 +139,58 @@ func TestCanvasToolAllowedForPrimaryWhileRepositoryDenied(t *testing.T) {
 			t.Errorf("Primary repository tool %q = %v (present %v), want explicit deny", name, v, ok)
 		}
 	}
-	off := WithCanvas(ToolsFor(RolePrimary, "build", false), false)
+	off := WithCanvas(ToolsFor(RolePrimary, "build", false), false, agent.CanvasActionsForRole(agent.Primary))
 	if _, ok := off[ReloCanvasTool]; ok {
 		t.Fatalf("canvas listed while disabled: %v", off)
 	}
 }
 
 func TestCanvasToolEnabledForWorkersAndNeverGrantsRepoTools(t *testing.T) {
-	got := WithCanvas(ToolsFor("worker", "build", true), true)
+	got := WithCanvas(ToolsFor("worker", "build", true), true, agent.CanvasActionsForRole(agent.Worker))
 	if !got[ReloCanvasTool] {
 		t.Fatalf("worker lacks canvas: %v", got)
 	}
 	if got["write"] != true || got["edit"] != true {
 		t.Fatalf("canvas wiring changed worker repo tools: %v", got)
 	}
-	planned := WithCanvas(ToolsFor("worker", "plan", false), true)
+	planned := WithCanvas(ToolsFor("worker", "plan", false), true, agent.CanvasActionsForRole(agent.Worker))
 	if planned["write"] || planned["edit"] {
 		t.Fatalf("plan mode repo writes enabled by canvas: %v", planned)
 	}
+}
+
+// The canvas exposure follows the role scope: a builder role keeps every action, a role that may not author keeps
+// the read-only path, and a turn with no canvas action at all gets no canvas tool.
+func TestCanvasExposureFollowsTheRoleScope(t *testing.T) {
+	authoring := agent.CanvasActionsForRole(agent.Worker)
+	readOnly := agent.CanvasActionsForRole(agent.Primary)
+	if len(authoring) <= len(readOnly) {
+		t.Fatalf("builder scope = %v, primary scope = %v", authoring, readOnly)
+	}
+	for _, action := range []string{agent.CanvasActionCreate, agent.CanvasActionUpdate} {
+		if !contains(authoring, action) {
+			t.Errorf("builder scope lost %s: %v", action, authoring)
+		}
+		if contains(readOnly, action) {
+			t.Errorf("primary scope advertises %s: %v", action, readOnly)
+		}
+	}
+	// A restricted role keeps the tool: listing, opening and inspecting a canvas is how it checks a worker's result.
+	if got := WithCanvas(ToolsFor(RolePrimary, "build", false), true, readOnly); !got[ReloCanvasTool] {
+		t.Fatalf("primary lost the read-only canvas path: %v", got)
+	}
+	// A turn with no canvas action gets no canvas tool, so the tool is never offered without a scope behind it.
+	if got := WithCanvas(ToolsFor(RolePrimary, "build", false), true, nil); got[ReloCanvasTool] {
+		t.Fatalf("canvas offered without a scope: %v", got)
+	}
+}
+
+// contains reports whether the scope names an action.
+func contains(scope []string, action string) bool {
+	for _, name := range scope {
+		if name == action {
+			return true
+		}
+	}
+	return false
 }

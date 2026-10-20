@@ -1194,6 +1194,17 @@ func plural(n int, word string) string {
 	return fmt.Sprintf("%d %ss", n, word)
 }
 
+// canvasScopeText names the canvas actions the role may use, so the turn advertises exactly the actions the policy
+// grants. A builder role keeps the full guidance, which already lists every action, so only a narrower scope is
+// spelled out. The list comes from the role policy (core/internal/agent/canvas_policy.go), so it can never drift from
+// what the core refuses.
+func canvasScopeText(role agent.Role, actions []string) string {
+	if agent.CanvasAuthoringRole(role) || len(actions) == 0 {
+		return ""
+	}
+	return "\n- Your canvas actions are: " + strings.Join(actions, ", ") + "."
+}
+
 func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts, ask string, schema map[string]any) (string, error) {
 	rt := c.RuntimeSnapshot()
 	if rt == nil {
@@ -1255,6 +1266,9 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 	}
 	promptText := dynamic + ask
 	canvasTools := false
+	// The canvas tool is scoped to the role: the policy names the actions this agent may use, and the core refuses
+	// any action outside it (core/internal/orchestrator/canvas.go), so the turn never offers more than it may use.
+	canvasActions := agent.CanvasActionsForRole(a.Role)
 	if messenger, ok := rt.(runtime.MessageRuntime); ok {
 		if err := c.StartMessages(); err != nil {
 			return "", fmt.Errorf("start agent messaging: %w", err)
@@ -1268,16 +1282,18 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 			return "", err
 		}
 		promptText += "\n\nRelo agent messaging is available through relo_agents. Your private key is " + key + ". Use action list for live peer IDs, send with to/text, and inbox to acknowledge received messages. Never copy your key into messages or reports."
-		if c.canvasOn() {
+		if c.canvasOn() && len(canvasActions) > 0 {
 			canvasTools = true
-			promptText += "\n\n" + prompt.CanvasGuidance + " Your Canvas key is the same private key: pass it as key to relo_canvas. Never copy it into artifacts or reports."
+			// The canvas guidance follows the role: a builder role authors artifacts, every other role may only
+			// inspect one. The core refuses the actions a role may not perform, so this text never promises more.
+			promptText += "\n\n" + prompt.CanvasGuidanceFor(a.Role) + canvasScopeText(a.Role, canvasActions) + " Your Canvas key is the same private key: pass it as key to relo_canvas. Never copy it into artifacts or reports."
 		}
 	}
 	peerText, peerIDs := c.peerTurnText(a.ID)
 	if peerText != "" {
 		promptText += "\n\n" + peerText
 	}
-	tools := runtime.WithCanvas(runtime.ToolsFor(string(a.Role), string(sess.Mode), agent.Mutating(a.Role) && sess.Mode == ModeBuild), canvasTools)
+	tools := runtime.WithCanvas(runtime.ToolsFor(string(a.Role), string(sess.Mode), agent.Mutating(a.Role) && sess.Mode == ModeBuild), canvasTools, canvasActions)
 	send := func(text string) error {
 		return rt.SendTask(ctx, sid, runtime.AgentTask{
 			AgentID: a.ID, Role: string(a.Role), Model: model, Provider: prov,

@@ -16,6 +16,36 @@ import {
 
 const CANVAS_DIR = path.join(".relo", "canvas");
 
+/** Longest owner id accepted from the core envelope. */
+const MAX_OWNER_LENGTH = 128;
+
+/**
+ * Reports whether an artifact may be seen by the given owner. An owner of undefined means an
+ * editor-side call that is not made on behalf of an agent, so it is never filtered.
+ * An artifact owned by another agent is never visible. An artifact that carries no owner was
+ * written before ownership was recorded, so it belongs to nobody: only a caller the core marked
+ * as allowed to read an unowned artifact may see it.
+ */
+function visibleTo(document: CanvasDocument, owner?: string, readUnowned = false): boolean {
+  if (owner === undefined) return true;
+  if (!document.owner) return readUnowned;
+  return document.owner === owner;
+}
+
+/**
+ * Refuses a read or a write on an artifact that belongs to another agent, and on an artifact
+ * that carries no owner when the caller may not read one.
+ */
+function assertOwned(document: CanvasDocument, owner?: string, readUnowned = false): void {
+  if (owner === undefined) return;
+  if (!document.owner) {
+    if (readUnowned) return;
+    throw new CanvasError("not_owned", `Canvas ${document.id} has no owner and is not readable by this agent`);
+  }
+  if (document.owner === owner) return;
+  throw new CanvasError("not_owned", `Canvas ${document.id} belongs to another agent`);
+}
+
 function errorCode(error: unknown): string | undefined {
   return typeof error === "object" && error !== null && "code" in error ? String((error as { code: unknown }).code) : undefined;
 }
@@ -46,9 +76,12 @@ export class CanvasStore {
     return path.join(this.rootGetter(), CANVAS_DIR, `${id}${CANVAS_FILE_EXTENSION}`);
   }
 
-  async create(raw: CanvasRequest | unknown): Promise<CanvasDocument> {
+  async create(raw: CanvasRequest | unknown, owner?: string): Promise<CanvasDocument> {
     const request = parseCanvasRequest(raw);
     if (request.action !== "create") throw new CanvasError("invalid_request", "create expects action create");
+    if (owner !== undefined && (owner.length === 0 || owner.length > MAX_OWNER_LENGTH)) {
+      throw new CanvasError("invalid_owner", "Canvas owner must be a string of 1 to 128 characters");
+    }
     return this.serial(async () => {
       const dir = await this.ensureDirectory();
       const now = new Date().toISOString();
@@ -61,6 +94,7 @@ export class CanvasStore {
         entry: request.entry,
         files: request.files,
         assets: request.assets,
+        ...(owner ? { owner } : {}),
         createdAt: now,
         updatedAt: now,
         revision: 1,
@@ -70,16 +104,26 @@ export class CanvasStore {
     });
   }
 
-  async get(id: string): Promise<CanvasDocument> {
+  /**
+   * Reads an artifact. When an owner is given, an artifact owned by another agent is refused, and an
+   * artifact that carries no owner is refused unless the caller may read unowned artifacts.
+   */
+  async get(id: string, owner?: string, readUnowned = false): Promise<CanvasDocument> {
     assertCanvasId(id);
-    return this.serial(() => this.read(id));
+    return this.serial(async () => {
+      const document = await this.read(id);
+      assertOwned(document, owner, readUnowned);
+      return document;
+    });
   }
 
   /**
    * Replaces name, format, entry, files, and assets when supplied; omitted fields keep their stored value.
    * `files` and `assets` are replaced wholesale, not merged. `revision` must equal the stored revision.
+   * An artifact owned by another agent is refused; an artifact without an owner is refused unless the
+   * caller may read unowned artifacts, and is then claimed by the writer.
    */
-  async update(raw: CanvasRequest | unknown): Promise<CanvasDocument> {
+  async update(raw: CanvasRequest | unknown, owner?: string, readUnowned = false): Promise<CanvasDocument> {
     const request = parseCanvasRequest(raw);
     if (request.action !== "update" || request.id === undefined || request.revision === undefined) {
       throw new CanvasError("invalid_request", "update requires id and revision");
@@ -89,6 +133,7 @@ export class CanvasStore {
     return this.serial(async () => {
       const dir = await this.ensureDirectory();
       const current = await this.read(id);
+      assertOwned(current, owner, readUnowned);
       if (current.revision !== expected) {
         throw new CanvasError("revision_conflict", `Canvas ${id} is at revision ${current.revision}, not ${expected}; read it again before updating`);
       }
@@ -99,6 +144,7 @@ export class CanvasStore {
         entry: request.entry ?? current.entry,
         files: request.files ?? current.files,
         assets: request.assets ?? current.assets,
+        ...(owner ? { owner } : current.owner ? { owner: current.owner } : {}),
         createdAt: current.createdAt,
         updatedAt: new Date().toISOString(),
         revision: current.revision + 1,
@@ -108,8 +154,10 @@ export class CanvasStore {
     });
   }
 
-  /** Lists valid artifacts sorted by name then ID. Invalid or foreign files are skipped. */
-  async list(): Promise<CanvasDocument[]> {
+  /** Lists valid artifacts sorted by name then ID, keeping only the ones the owner may see.
+   * Invalid or foreign files are skipped. An artifact that carries no owner is listed only for a
+   * caller that may read unowned artifacts. */
+  async list(owner?: string, readUnowned = false): Promise<CanvasDocument[]> {
     return this.serial(async () => {
       const dir = await this.existingDirectory();
       if (!dir) return [];
@@ -120,7 +168,8 @@ export class CanvasStore {
         const id = entry.name.slice(0, -CANVAS_FILE_EXTENSION.length);
         if (!isCanvasId(id)) continue;
         try {
-          documents.push(await this.read(id));
+          const document = await this.read(id);
+          if (visibleTo(document, owner, readUnowned)) documents.push(document);
         } catch {
           // Corrupt or symlinked artifacts are reported by get(); list stays usable.
         }

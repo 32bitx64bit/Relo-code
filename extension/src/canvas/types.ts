@@ -26,6 +26,12 @@ export interface CanvasDocument {
   entry: string;
   files: Record<string, string>;
   assets?: Record<string, CanvasAsset>;
+  /**
+   * The agent that owns the artifact, taken from the core envelope that carried the request.
+   * It is absent on artifacts written before ownership was recorded: those belong to nobody,
+   * so they are served only to a caller the core allowed to read unowned artifacts.
+   */
+  owner?: string;
   createdAt: string;
   updatedAt: string;
   revision: number;
@@ -154,6 +160,16 @@ function validateRevision(value: unknown): number {
   return value as number;
 }
 
+/** The owner is the agent id the core envelope carried. It is optional so documents written before
+ * ownership was recorded keep parsing. */
+function validateOwner(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || value.length === 0 || value.length > 128) {
+    fail("invalid_document", "Canvas owner must be a string of 1 to 128 characters");
+  }
+  return value;
+}
+
 function validateFiles(value: unknown): Record<string, string> {
   if (!isObject(value)) fail("invalid_document", "Canvas files must be an object of path to source text");
   const keys = Object.keys(value);
@@ -221,6 +237,7 @@ export function parseCanvasDocument(raw: unknown): CanvasDocument {
   const files = validateFiles(raw.files);
   const entry = validateEntry(raw.entry, format, files);
   const assets = validateAssets(raw.assets);
+  const owner = validateOwner(raw.owner);
   const document: CanvasDocument = {
     version: CANVAS_DOCUMENT_VERSION,
     id,
@@ -229,6 +246,7 @@ export function parseCanvasDocument(raw: unknown): CanvasDocument {
     entry,
     files,
     ...(assets ? { assets } : {}),
+    ...(owner ? { owner } : {}),
     createdAt: validateTimestamp(raw.createdAt, "createdAt"),
     updatedAt: validateTimestamp(raw.updatedAt, "updatedAt"),
     revision: validateRevision(raw.revision),
