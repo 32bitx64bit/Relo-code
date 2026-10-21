@@ -74,3 +74,5 @@ No live token numbers are claimed from health/model discovery alone. The live ha
 ## Permissions
 
 OpenCode permission events are forwarded to VS Code. Relo policy (`relo.permissions.*`) may allow automatically; otherwise user must approve before Relo replies to OpenCode.
+
+**YOLO mode** (`relo.permissions.yolo`, off by default) answers every request that would ask with `once`, so agents never stop for approval. That includes installs, deletes, commits, pushes, network access, paths outside the workspace and commands classified destructive. An action set to `deny` stays denied. Turning it on also approves requests already waiting. It governs Relo's permission policy only: read-only roles still run with their tools disabled, and the Primary still gets none. Claude Code agents ([claude-code.md](claude-code.md)) follow it too, since their shell requests go through the same policy.

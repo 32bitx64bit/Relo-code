@@ -745,6 +745,9 @@ func (a *App) applySettings(p map[string]any) {
 			a.Coord.Perm.Set(item.action, permission.Deny)
 		}
 	}
+	if on, ok := p["permissionYolo"].(bool); ok {
+		a.Coord.SetYolo(on)
+	}
 	if level := str(p, "logLevel", ""); level != "" && a.Log != nil {
 		a.Log.SetLevel(logging.ParseLevel(level))
 	}

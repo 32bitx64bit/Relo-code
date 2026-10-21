@@ -27,7 +27,7 @@ Dirty paths are not refused. The live accept path protects user edits by three-w
 
 Non-Git workspaces run in **direct mode**. Mutating workers run in the workspace directory itself (no worktree). Only one mutating worker runs at a time; read-only workers run concurrently. Changes are recorded with status `applied`: accept is a no-op and reject says the edit was made in place and cannot be reverted (run `git init` to enable isolation). Relo posts one system chat notice per session. Auto-review is skipped (no diff). Verification still runs in the workspace; failing to find Git never fails a task. Run `git init` to enable isolation.
 
-Permission defaults allow read, write, test, and build; delete, install, commit, push, network, outside-workspace access, and destructive commands require approval. Unknown actions default to approval. Commands are split into individual operators and dangerous commands default to approval. `MapReply(Ask)` maps to OpenCode's `reject` response; ask is not implicitly approved because runtime permission requests do not expose an interactive hold at this layer.
+Permission defaults allow read, write, test, and build; delete, install, commit, push, network, outside-workspace access, and destructive commands require approval. Unknown actions default to approval. `relo.permissions.yolo` turns every approval into an allow, except for actions set to deny. Commands are split into individual operators and dangerous commands default to approval. `MapReply(Ask)` maps to OpenCode's `reject` response; ask is not implicitly approved because runtime permission requests do not expose an interactive hold at this layer.
 
 ## Integration
 

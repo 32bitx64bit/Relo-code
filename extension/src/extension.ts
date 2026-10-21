@@ -799,6 +799,7 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
     permissionNetwork: c.get("permissions.network"),
     permissionOutside: c.get("permissions.outside"),
     permissionDestructive: c.get("permissions.destructive"),
+    permissionYolo: c.get<boolean>("permissions.yolo", false),
   };
 }
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/relocode/relo/internal/agent"
 	"github.com/relocode/relo/internal/logging"
+	"github.com/relocode/relo/internal/permission"
 	"github.com/relocode/relo/internal/prompt"
 	"github.com/relocode/relo/internal/routing"
 	rt "github.com/relocode/relo/internal/runtime"
@@ -522,6 +523,85 @@ func TestPermissionWaitCancelsAndRepeatedReplyIsSafe(t *testing.T) {
 	case <-done2:
 	case <-time.After(time.Second):
 		t.Fatal("repeated permission replies blocked")
+	}
+}
+
+type replyRecorder struct {
+	rt.AgentRuntime
+	mu      sync.Mutex
+	replies map[string]string
+}
+
+func (r *replyRecorder) ReplyPermission(_ context.Context, _, permID, response string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.replies[permID] = response
+	return nil
+}
+
+func (r *replyRecorder) reply(id string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.replies[id]
+}
+
+func TestYoloApprovesWithoutAskingAndReleasesWaiting(t *testing.T) {
+	c := New(logging.New(nil, logging.Error))
+	c.CreateSession(t.TempDir(), "yolo", ModeBuild)
+	rec := &replyRecorder{AgentRuntime: rt.NewMock(), replies: map[string]string{}}
+	c.SetRuntime(rec)
+	ask := func(id, title, cmd string) {
+		c.askPerm(context.Background(), agent.Agent{ID: "a"}, rt.Event{Session: "s", Permission: map[string]any{"id": id, "title": title, "pattern": cmd}})
+	}
+
+	waiting := make(chan struct{})
+	go func() {
+		defer close(waiting)
+		ask("held", "network", "curl https://example.com")
+	}()
+	deadline := time.After(time.Second)
+	for {
+		c.mu.Lock()
+		_, exists := c.pending["held"]
+		c.mu.Unlock()
+		if exists {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("permission not registered")
+		default:
+			goruntime.Gosched()
+		}
+	}
+	c.SetYolo(true)
+	select {
+	case <-waiting:
+	case <-time.After(time.Second):
+		t.Fatal("turning YOLO on left a waiting request held")
+	}
+	if got := rec.reply("held"); got != "once" {
+		t.Fatalf("held request answered %q", got)
+	}
+
+	ask("rm", "bash", "rm -rf build")
+	ask("net", "network", "curl https://example.com")
+	for _, id := range []string{"rm", "net"} {
+		if got := rec.reply(id); got != "once" {
+			t.Fatalf("%s answered %q under YOLO", id, got)
+		}
+	}
+	c.mu.Lock()
+	left := len(c.pending)
+	c.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d requests left pending under YOLO", left)
+	}
+
+	c.SetPermission(permission.Network, permission.Deny)
+	ask("denied", "network", "curl https://example.com")
+	if got := rec.reply("denied"); got != "reject" {
+		t.Fatalf("an explicit deny answered %q under YOLO", got)
 	}
 }
 

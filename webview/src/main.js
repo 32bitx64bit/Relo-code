@@ -776,7 +776,7 @@
     { id: "context", title: "Context", keys: ["relo.context.compactAt", "relo.context.autoRefresh", "relo.context.refreshThreshold", "relo.context.maxUtilization", "relo.context.compressionStrategy", "relo.context.keepRawHistory", "relo.context.projectMemory"] },
     { id: "changes", title: "Changes", keys: ["relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics"] },
     { id: "verification", title: "Verification", keys: ["relo.autoVerify", "relo.autoReview", "relo.report.maxChars"] },
-    { id: "permissions", title: "Permissions", keys: ["relo.permissions.read", "relo.permissions.write", "relo.permissions.test", "relo.permissions.build", "relo.permissions.install", "relo.permissions.delete", "relo.permissions.gitCommit", "relo.permissions.gitPush", "relo.permissions.network", "relo.permissions.outside", "relo.permissions.destructive"] },
+    { id: "permissions", title: "Permissions", keys: ["relo.permissions.read", "relo.permissions.write", "relo.permissions.test", "relo.permissions.build", "relo.permissions.install", "relo.permissions.delete", "relo.permissions.gitCommit", "relo.permissions.gitPush", "relo.permissions.network", "relo.permissions.outside", "relo.permissions.destructive", "relo.permissions.yolo"] },
     { id: "claudeCode", title: "Claude Code", keys: ["relo.claudeCode.enabled", "relo.claudeCode.path"] },
     { id: "advanced", title: "Advanced", keys: ["relo.runtime", "relo.openCode.path", "relo.logLevel"] },
   ];
@@ -803,6 +803,7 @@
     "relo.openCode.path": "OpenCode path",
     "relo.claudeCode.enabled": "Run agents on Claude Code",
     "relo.claudeCode.path": "Claude Code path",
+    "relo.permissions.yolo": "YOLO mode",
     "relo.logLevel": "Log level",
     "relo.primaryModel": "Primary model",
     "relo.tier1Model": "Tier 1 model (medium and hard tasks)",

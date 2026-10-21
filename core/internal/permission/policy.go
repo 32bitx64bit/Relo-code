@@ -34,6 +34,7 @@ const (
 type Policy struct {
 	mu    sync.Mutex
 	rules map[Action]Decision
+	yolo  bool
 }
 
 func Default() *Policy {
@@ -50,13 +51,32 @@ func (p *Policy) Set(a Action, d Decision) {
 	p.rules[a] = d
 }
 
+// SetYolo turns auto-approval on or off. While it is on, every action the rules would ask about is allowed.
+func (p *Policy) SetYolo(on bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.yolo = on
+}
+
+func (p *Policy) Yolo() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.yolo
+}
+
+// Get is the decision for an action. YOLO mode turns Ask into Allow; an action the user set to Deny stays denied,
+// since refusing it is a decision, not a prompt.
 func (p *Policy) Get(a Action) Decision {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if d, ok := p.rules[a]; ok {
-		return d
+	d, ok := p.rules[a]
+	if !ok {
+		d = Ask
 	}
-	return Ask
+	if d == Ask && p.yolo {
+		return Allow
+	}
+	return d
 }
 
 func Classify(title, command, path, workspace string) Action {

@@ -32,6 +32,27 @@ func (c *Coord) SetPermission(action permission.Action, decision permission.Deci
 	}
 }
 
+// SetYolo switches YOLO mode. Turning it on also approves the requests already waiting, so an agent held at a prompt
+// carries on at once.
+func (c *Coord) SetYolo(on bool) {
+	p := c.permissions()
+	if p == nil {
+		return
+	}
+	p.SetYolo(on)
+	if !on {
+		return
+	}
+	c.mu.Lock()
+	for _, pending := range c.pending {
+		select {
+		case pending.Reply <- "once":
+		default:
+		}
+	}
+	c.mu.Unlock()
+}
+
 func (c *Coord) modelForDifficulty(role agent.Role, difficulty string) string {
 	cfg := c.routeConfig()
 	model := cfg.For(agent.TierFor(role), role, difficulty)

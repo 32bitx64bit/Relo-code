@@ -831,6 +831,11 @@
             "deny"
           ],
           "default": "ask"
+        },
+        "relo.permissions.yolo": {
+          "type": "boolean",
+          "default": false,
+          "description": "YOLO mode: approve every permission request automatically, including installs, deletes, git commits and pushes, network access, paths outside the workspace and destructive commands, so agents can work without stopping. An action set to deny above stays denied. Only turn this on in a project and environment you are prepared to lose."
         }
       }
     }

@@ -114,3 +114,29 @@ func TestApplySettingsIgnorePathsHidesBuildOutput(t *testing.T) {
 	core.applySettings(map[string]any{"ignorePaths": []any{"**/obj/**", "  ", 7}})
 	assertChanged("after ignorePaths", "src/x.go")
 }
+
+func TestApplySettingsYolo(t *testing.T) {
+	dir := t.TempDir()
+	core, err := New(Config{Workspace: dir, DBPath: filepath.Join(dir, "relo.db"), Runtime: "mock"}, logging.New(&bytes.Buffer{}, logging.Error))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+
+	if core.Coord.Perm.Yolo() {
+		t.Fatal("YOLO is on by default")
+	}
+	core.applySettings(map[string]any{"permissionYolo": true})
+	if !core.Coord.Perm.Yolo() {
+		t.Fatal("permissionYolo did not turn YOLO on")
+	}
+	// A settings push without the key (an older client) leaves the mode as it was.
+	core.applySettings(map[string]any{})
+	if !core.Coord.Perm.Yolo() {
+		t.Fatal("a settings push without permissionYolo turned YOLO off")
+	}
+	core.applySettings(map[string]any{"permissionYolo": false})
+	if core.Coord.Perm.Yolo() {
+		t.Fatal("permissionYolo false did not turn YOLO off")
+	}
+}

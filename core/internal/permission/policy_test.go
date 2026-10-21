@@ -65,3 +65,21 @@ func TestMapReplyAskAndDefaults(t *testing.T) {
 		t.Fatal("sensitive or unknown action not Ask by default")
 	}
 }
+
+func TestYoloAllowsAskButKeepsDeny(t *testing.T) {
+	p := Default()
+	p.Set(GitPush, Deny)
+	p.SetYolo(true)
+	for _, a := range []Action{Delete, Install, GitCommit, Network, Outside, Destructive, Action("unknown")} {
+		if got := p.Get(a); got != Allow {
+			t.Fatalf("%s under YOLO = %s, want allow", a, got)
+		}
+	}
+	if got := p.Get(GitPush); got != Deny {
+		t.Fatalf("an explicit deny became %s under YOLO", got)
+	}
+	p.SetYolo(false)
+	if p.Get(Destructive) != Ask || p.Get(Action("unknown")) != Ask {
+		t.Fatal("turning YOLO off did not restore the rules")
+	}
+}
