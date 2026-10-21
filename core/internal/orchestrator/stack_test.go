@@ -31,7 +31,7 @@ func TestDependentTasksSeeTheChangesTheyDependOn(t *testing.T) {
 	if w.Worktree == dir {
 		t.Fatal("the worker should have its own worktree")
 	}
-	if err := os.WriteFile(filepath.Join(w.Worktree, "a.txt"), []byte("one\nrenamed\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dirOf(t, c, w), "a.txt"), []byte("one\nrenamed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Graph.Update(work.ID, func(x *taskgraph.Task) { x.AgentID = w.ID }); err != nil {
@@ -53,7 +53,7 @@ func TestDependentTasksSeeTheChangesTheyDependOn(t *testing.T) {
 		if a.Worktree == dir || a.Worktree == w.Worktree {
 			t.Fatalf("%s: worktree = %s, want a copy of its own", role, a.Worktree)
 		}
-		if got, _ := os.ReadFile(filepath.Join(a.Worktree, "a.txt")); string(got) != "one\nrenamed\n" {
+		if got, _ := agentFile(c, a, "a.txt"); got != "one\nrenamed\n" {
 			t.Fatalf("%s: a.txt = %q, want it to contain the change it depends on", role, got)
 		}
 		var note, diff string
@@ -82,7 +82,7 @@ func TestDependentTasksSeeTheChangesTheyDependOn(t *testing.T) {
 	// A task with no dependency on it still starts from the user's tree, without the unaccepted change.
 	solo := c.Graph.Add(taskgraph.Task{Title: "Unrelated", Role: string(agent.Worker), Workspace: dir, Model: "mock/t1", Difficulty: "easy"})
 	u := c.spawn(solo, agent.Worker)
-	if got, _ := os.ReadFile(filepath.Join(u.Worktree, "a.txt")); string(got) != "one\n" {
+	if got, _ := agentFile(c, u, "a.txt"); got != "one\n" {
 		t.Fatalf("an unrelated worker saw the pending change: %q", got)
 	}
 	// And a probe with no dependency still reads the user's folder directly.
@@ -105,7 +105,7 @@ func TestRecordedChangesCarryNeedsAndBaseRev(t *testing.T) {
 
 	work := c.Graph.Add(taskgraph.Task{Title: "First", Role: string(agent.Worker), Workspace: dir, Model: "mock/t1", Difficulty: "medium"})
 	w := c.spawn(work, agent.Worker)
-	if err := os.WriteFile(filepath.Join(w.Worktree, "a.txt"), []byte("one\nfirst\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dirOf(t, c, w), "a.txt"), []byte("one\nfirst\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Graph.Update(work.ID, func(x *taskgraph.Task) { x.AgentID = w.ID }); err != nil {
@@ -121,7 +121,7 @@ func TestRecordedChangesCarryNeedsAndBaseRev(t *testing.T) {
 
 	next := c.Graph.Add(taskgraph.Task{Title: "Second", Role: string(agent.Worker), Workspace: dir, Model: "mock/t1", Difficulty: "easy", Depends: []string{work.ID}})
 	b := c.spawn(next, agent.Worker)
-	if err := os.WriteFile(filepath.Join(b.Worktree, "a.txt"), []byte("one\nfirst\nsecond\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dirOf(t, c, b), "a.txt"), []byte("one\nfirst\nsecond\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Graph.Update(next.ID, func(x *taskgraph.Task) { x.AgentID = b.ID }); err != nil {
@@ -161,15 +161,15 @@ func TestSpawnAfterAcceptSeesTheAcceptedFile(t *testing.T) {
 	c.refreshSnapshot()
 
 	early := c.spawn(c.Graph.Add(taskgraph.Task{Title: "Early", Role: string(agent.Worker), Workspace: dir, Model: "mock/t1", Difficulty: "easy"}), agent.Worker)
-	if _, err := os.Stat(early.Worktree); err != nil {
-		t.Fatal(err)
+	if !c.WS.Available(early.ID, early.Worktree) {
+		t.Fatal("the early worker has no workspace")
 	}
 	// The user accepts a change into the workspace while agents are running.
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("one\naccepted\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	late := c.spawn(c.Graph.Add(taskgraph.Task{Title: "Late", Role: string(agent.Worker), Workspace: dir, Model: "mock/t1", Difficulty: "easy"}), agent.Worker)
-	if got, _ := os.ReadFile(filepath.Join(late.Worktree, "a.txt")); string(got) != "one\naccepted\n" {
+	if got, _ := agentFile(c, late, "a.txt"); got != "one\naccepted\n" {
 		t.Fatalf("the late agent saw %q, want the accepted file", got)
 	}
 }
@@ -188,7 +188,7 @@ func TestRecutQueuedRestacksLineageOntoFreshBase(t *testing.T) {
 
 	work := c.Graph.Add(taskgraph.Task{Title: "First", Role: string(agent.Worker), Workspace: dir, Model: "mock/t1", Difficulty: "medium"})
 	w := c.spawn(work, agent.Worker)
-	if err := os.WriteFile(filepath.Join(w.Worktree, "a.txt"), []byte("one\nfirst\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dirOf(t, c, w), "a.txt"), []byte("one\nfirst\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Graph.Update(work.ID, func(x *taskgraph.Task) { x.AgentID = w.ID }); err != nil {
@@ -213,16 +213,16 @@ func TestRecutQueuedRestacksLineageOntoFreshBase(t *testing.T) {
 
 	c.setLineage(b.ID, []Dep{{ID: parent.ID, PatchHash: "stale"}})
 	c.recutQueued(next, b)
-	if _, err := os.Stat(filepath.Join(b.Worktree, "c.txt")); err == nil {
+	if _, err := agentFile(c, b, "c.txt"); err == nil {
 		t.Fatal("a hash-mismatched parent must keep the old base")
 	}
 
 	c.setLineage(b.ID, lineage)
 	c.recutQueued(next, b)
-	if got, _ := os.ReadFile(filepath.Join(b.Worktree, "c.txt")); string(got) != "accepted\n" {
+	if got, _ := agentFile(c, b, "c.txt"); got != "accepted\n" {
 		t.Fatalf("recut worktree c.txt = %q, want the fresh base", got)
 	}
-	if got, _ := os.ReadFile(filepath.Join(b.Worktree, "a.txt")); string(got) != "one\nfirst\n" {
+	if got, _ := agentFile(c, b, "a.txt"); got != "one\nfirst\n" {
 		t.Fatalf("recut worktree a.txt = %q, want the re-stacked parent", got)
 	}
 	if got := c.lineageOf(b.ID); len(got) != 1 || got[0].ID != parent.ID {

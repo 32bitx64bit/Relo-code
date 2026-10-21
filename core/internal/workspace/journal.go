@@ -60,6 +60,9 @@ func (m *Manager) JournalChange(changeID string, writes []JournalWrite) (string,
 	}
 	m.journalMu.Lock()
 	defer m.journalMu.Unlock()
+	if commit, ok := m.landedEntry(changeID, writes); ok {
+		return commit, nil
+	}
 	rec := journalRecord{At: time.Now().UnixNano()}
 	if changeID != "" {
 		rec.ChangeIDs = []string{changeID}
@@ -121,6 +124,39 @@ func (m *Manager) JournalChange(changeID string, writes []JournalWrite) (string,
 		return "", err
 	}
 	return commit, nil
+}
+
+// landedEntry finds the entry of an accept that was stopped after its file write and is now being retried. The
+// workspace already holds every post-image, so a new entry would record the agent's bytes as the pre-image and an
+// undo would restore nothing. The first entry still holds the user's bytes and stays the one an undo uses. The
+// workspace is compared first, which costs no Git command, so an ordinary accept never searches the journal.
+func (m *Manager) landedEntry(changeID string, writes []JournalWrite) (string, bool) {
+	if changeID == "" || len(writes) == 0 {
+		return "", false
+	}
+	posts := make(map[string]string, len(writes))
+	for _, w := range writes {
+		post := integration.BlobID(w.Post, w.PostExists)
+		current, exists, err := readWorkspaceFile(m.root, w.Path)
+		if err != nil || integration.BlobID(current, exists) != post {
+			return "", false
+		}
+		posts[w.Path] = post
+	}
+	rec, ref, err := m.JournalEntryFor(changeID)
+	if err != nil || len(rec.Files) != len(writes) {
+		return "", false
+	}
+	for _, f := range rec.Files {
+		if posts[f.Path] != f.Post {
+			return "", false
+		}
+	}
+	commit, err := git(m.root, "rev-parse", ref)
+	if err != nil {
+		return "", false
+	}
+	return commit, true
 }
 
 // JournalEntryFor returns the newest entry that mentions changeID.
@@ -216,16 +252,30 @@ func (m *Manager) UndoChange(changeID string) (UndoResult, error) {
 // KeepChangeBlob keeps a rejected or superseded agent file as refs/relo/changes/<id> so its bytes remain
 // recoverable after the worktree is released.
 func (m *Manager) KeepChangeBlob(changeID, worktree, rel string) error {
+	return m.KeepChangeBlobAt(changeID, worktree, rel, 0)
+}
+
+// KeepChangeBlobAt is KeepChangeBlob for a change proposed at revision rev of a virtual workspace: the bytes kept
+// are the ones proposed, not whatever the overlay holds now. rev is ignored for a worktree.
+func (m *Manager) KeepChangeBlobAt(changeID, worktree, rel string, rev uint64) error {
 	if !isGit(m.root) || changeID == "" || rel == "" {
 		return nil
 	}
 	m.journalMu.Lock()
 	defer m.journalMu.Unlock()
-	return m.keepChangeBlobLocked(changeID, worktree, rel)
+	return m.keepChangeBlobLocked(changeID, worktree, rel, rev)
 }
 
-func (m *Manager) keepChangeBlobLocked(changeID, worktree, rel string) error {
+func (m *Manager) keepChangeBlobLocked(changeID, worktree, rel string, rev uint64) error {
 	if err := validateRelative(rel); err != nil {
+		return err
+	}
+	// A virtual workspace already holds the file as a Git object, so keeping it is one ref, with nothing to read or hash.
+	if oid, virtual, err := m.virtualBlob(worktree, rel, rev); virtual || err != nil {
+		if err != nil || oid == "" {
+			return err
+		}
+		_, err = git(m.root, "update-ref", changeRefPrefix+strconv.FormatInt(time.Now().UnixNano(), 10)+"-"+changeRefID(changeID), oid)
 		return err
 	}
 	data, err := os.ReadFile(filepath.Join(worktree, filepath.FromSlash(rel)))
@@ -249,6 +299,8 @@ type BlobRef struct {
 	ChangeID string
 	Worktree string
 	Path     string
+	// Revision is the revision of a virtual workspace the change was proposed at; zero for a worktree.
+	Revision uint64
 }
 
 // KeepChangeBlobs retains several agent files with one hash-object call and one update-ref call, so a bulk
@@ -261,12 +313,23 @@ func (m *Manager) KeepChangeBlobs(refs []BlobRef) error {
 	defer m.journalMu.Unlock()
 	var kept []BlobRef
 	var paths []string
-	for _, r := range refs {
+	var virtualRefs strings.Builder
+	stamp := time.Now().UnixNano()
+	for i, r := range refs {
 		if r.ChangeID == "" || r.Path == "" {
 			continue
 		}
 		if err := validateRelative(r.Path); err != nil {
 			return err
+		}
+		if oid, virtual, err := m.virtualBlob(r.Worktree, r.Path, r.Revision); virtual || err != nil {
+			if err != nil {
+				return err
+			}
+			if oid != "" {
+				fmt.Fprintf(&virtualRefs, "update %s%d-%s %s\n", changeRefPrefix, stamp+int64(i), changeRefID(r.ChangeID), oid)
+			}
+			continue
 		}
 		full := filepath.Join(r.Worktree, filepath.FromSlash(r.Path))
 		if _, err := os.Stat(full); err != nil {
@@ -277,6 +340,11 @@ func (m *Manager) KeepChangeBlobs(refs []BlobRef) error {
 		}
 		kept = append(kept, r)
 		paths = append(paths, filepath.ToSlash(full))
+	}
+	if virtualRefs.Len() > 0 {
+		if _, err := gitStdin(m.root, virtualRefs.String(), "update-ref", "--stdin"); err != nil {
+			return err
+		}
 	}
 	if len(kept) == 0 {
 		return nil
@@ -289,7 +357,7 @@ func (m *Manager) KeepChangeBlobs(refs []BlobRef) error {
 	if len(shas) != len(kept) {
 		return m.keepChangeBlobsOne(kept)
 	}
-	stamp := time.Now().UnixNano()
+	stamp = time.Now().UnixNano()
 	var refsIn strings.Builder
 	for i, r := range kept {
 		fmt.Fprintf(&refsIn, "update %s%d-%s %s\n", changeRefPrefix, stamp+int64(i), changeRefID(r.ChangeID), shas[i])
@@ -302,7 +370,7 @@ func (m *Manager) KeepChangeBlobs(refs []BlobRef) error {
 // not drop every retained blob in the batch.
 func (m *Manager) keepChangeBlobsOne(refs []BlobRef) error {
 	for _, r := range refs {
-		if err := m.keepChangeBlobLocked(r.ChangeID, r.Worktree, r.Path); err != nil {
+		if err := m.keepChangeBlobLocked(r.ChangeID, r.Worktree, r.Path, r.Revision); err != nil {
 			return err
 		}
 	}

@@ -8,6 +8,8 @@ Parallel mutating workers do not share the user's working copy.
 
 Created with `git worktree add -b relo/<agent-id> <path> <base-commit>`. Agent IDs must contain only letters, digits, `.`, `_`, and `-`, and cannot start with a path traversal.
 
+With `relo.workspace.mode` set to `virtual` or `auto`, an agent's isolated copy can instead be a virtual workspace that is laid out on disk only while a tool needs real files (see [virtual-workspaces.md](virtual-workspaces.md)). The default is `worktree`, which is everything on this page; accept, reject, undo, conflicts and dependents behave the same either way.
+
 Relo records base commit, branch, and changed files. Probes and reviewers are read-only and stay on the main workspace, unless they depend on a task whose changes are not accepted yet (see Integration).
 
 ## Git safety

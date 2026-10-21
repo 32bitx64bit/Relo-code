@@ -216,7 +216,7 @@ func TestGitWorkspaceKeepsWorktreeAndReviewer(t *testing.T) {
 		t.Fatalf("git mutating agent should use worktree, got %q", a.Workspace)
 	}
 	// The worker's change is whatever git sees in its worktree, so make one.
-	if err := os.WriteFile(filepath.Join(a.Workspace, "out.txt"), []byte("work\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dirOf(t, c, a), "out.txt"), []byte("work\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.execWorker(context.Background(), task, a); err != nil {

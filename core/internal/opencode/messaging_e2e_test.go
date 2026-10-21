@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -326,7 +327,7 @@ func TestPrimaryCallsReloAgentsThroughTheHub(t *testing.T) {
 	case got := <-calls:
 		want := agentmsg.Request{Key: primaryKey, Action: "send", To: "worker-7", Text: coordinationTxt}
 		t.Logf("handler received: %+v", got)
-		if got != want {
+		if !reflect.DeepEqual(got, want) {
 			t.Errorf("handler received %+v, want %+v", got, want)
 		}
 	case <-time.After(5 * time.Second):

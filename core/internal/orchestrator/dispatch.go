@@ -229,8 +229,8 @@ func (c *Coord) recutQueued(t taskgraph.Task, a agent.Agent) {
 	if !ok || tree.Direct || tree.Path == "" {
 		return
 	}
-	if _, err := os.Stat(tree.Path); err != nil {
-		return
+	if _, err := os.Stat(tree.Path); err != nil && !tree.Virtual {
+		return // a virtual agent has no directory until it runs, and needs none to be re-cut
 	}
 	snap, err := ws.Snapshot()
 	if err != nil {

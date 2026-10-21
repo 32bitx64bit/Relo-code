@@ -28,7 +28,7 @@ func TestRunningDependentAfterParentRejectIsBlocked(t *testing.T) {
 	parent := Change{ID: "chgP", AgentID: "agent_p", Path: "a.txt", Status: "rejected"}
 	c.Restore(&Session{Workspace: dir, Mode: ModeBuild, Changes: []Change{parent}})
 
-	tree, err := c.WS.EnsureTree("agent_run", false)
+	tree, err := mountTree(c, "agent_run")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestRetriedParentRewritesDependentLineage(t *testing.T) {
 	c := New(logging.New(nil, logging.Error))
 	c.SetWorkspaceManager(workspace.New(dir))
 
-	oldTree, err := c.WS.EnsureTree("agent_old", false)
+	oldTree, err := mountTree(c, "agent_old")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestRetriedParentRewritesDependentLineage(t *testing.T) {
 	}
 	oldHash := hashText(oldPatch)
 
-	newTree, err := c.WS.EnsureTree("agent_new", false)
+	newTree, err := mountTree(c, "agent_new")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,14 +116,14 @@ func TestRetriedParentWithoutThePathBlocksDependent(t *testing.T) {
 	c := New(logging.New(nil, logging.Error))
 	c.SetWorkspaceManager(workspace.New(dir))
 
-	oldTree, err := c.WS.EnsureTree("agent_old", false)
+	oldTree, err := mountTree(c, "agent_old")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(oldTree.Path, "a.txt"), []byte("old\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	newTree, err := c.WS.EnsureTree("agent_new", false)
+	newTree, err := mountTree(c, "agent_new")
 	if err != nil {
 		t.Fatal(err)
 	}

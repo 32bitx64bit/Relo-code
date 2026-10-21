@@ -17,7 +17,7 @@ import (
 // proposeFromAgent records a proposal for a named agent and writes the agent's version in its worktree.
 func proposeFromAgent(t *testing.T, core *App, agentID, changeID, rel, body string) orchestrator.Change {
 	t.Helper()
-	tree, err := core.Coord.WS.EnsureTree(agentID, false)
+	tree, err := mountTree(core, agentID)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -90,7 +90,7 @@ func TestLeasedOverlapStacksTheEarlierPendingPatch(t *testing.T) {
 	if a.Worktree == dir {
 		t.Fatal("the worker should have its own worktree")
 	}
-	if err := os.WriteFile(filepath.Join(a.Worktree, "a.txt"), []byte("one\nfirst\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dirOf(t, c, a), "a.txt"), []byte("one\nfirst\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Graph.Update(first.ID, func(x *taskgraph.Task) { x.AgentID = a.ID }); err != nil {
@@ -122,10 +122,10 @@ func TestLeasedOverlapStacksTheEarlierPendingPatch(t *testing.T) {
 	defer releaseSecond()
 
 	b := c.spawnSoft(second, agent.Worker, soft)
-	if got, _ := os.ReadFile(filepath.Join(b.Worktree, "a.txt")); string(got) != "one\nfirst\n" {
+	if got, _ := agentFile(c, b, "a.txt"); got != "one\nfirst\n" {
 		t.Fatalf("the later agent saw %q, want the earlier pending patch", got)
 	}
-	if err := os.WriteFile(filepath.Join(b.Worktree, "a.txt"), []byte("one\nfirst\nsecond\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dirOf(t, c, b), "a.txt"), []byte("one\nfirst\nsecond\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Graph.Update(second.ID, func(x *taskgraph.Task) { x.AgentID = b.ID }); err != nil {

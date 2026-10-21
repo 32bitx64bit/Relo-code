@@ -87,7 +87,7 @@ func TestApplySettingsIgnorePathsHidesBuildOutput(t *testing.T) {
 	if _, err := core.Coord.WS.Snapshot(); err != nil {
 		t.Fatal(err)
 	}
-	tree, err := core.Coord.WS.EnsureTree("agent-1", false)
+	tree, err := mountTree(core, "agent-1")
 	if err != nil {
 		t.Fatal(err)
 	}

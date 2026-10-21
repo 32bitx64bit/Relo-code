@@ -280,6 +280,8 @@ func claimSnapshotNotice(k snapshotNoticeKey) bool {
 }
 
 func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent) error {
+	// Registered first so it runs last: the agent's session is closed before its directory is imported and removed.
+	defer c.settleDirectory(a)
 	defer c.finishPeerTurn(c.SessionID(), a.ID)
 	defer c.closeAgentSession(a.ID)
 	defer func() {
@@ -316,6 +318,7 @@ func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent)
 	c.Agents.Update(a.ID, func(x *agent.Agent) { x.Status = agent.Starting; x.Phase = "context"; x.Activity = "Building context" })
 	c.emit("agent.started", c.freshAgent(a))
 	c.Engine.Ingest(a.ID, c.workerSeed(t, a.Role))
+	c.bindWorkspaceContext(a.ID)
 	gen, err := c.Engine.Build(ctxeng.BuildRequest{
 		AgentID: a.ID, TaskID: t.ID, Role: string(a.Role), Phase: phaseFor(a.Role),
 		Budget: a.Budget, Reason: "worker start", Query: ctxeng.Query{Task: t.Title, Keywords: strings.Fields(t.Title + " " + t.Description), Failures: a.Role == agent.Debug},
@@ -331,6 +334,12 @@ func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent)
 	// generic "do the task in your context", and the model had to find it. The pack keeps only the title, so a
 	// summary of the conversation cannot lose what the agent is for.
 	parts := prompt.ComposePartsWith(a.Role, *gen, "", resolved.Profile.Fragment(a.Role))
+	// A virtual workspace is laid out as a directory only now, when tools are about to need real files.
+	if err := c.materializeDirectory(a); err != nil {
+		c.fail(a.ID, err)
+		c.failTask(t, a, err)
+		return err
+	}
 	body, err := c.runAgent(ctx, a, parts, taskBrief(t), prompt.ReportSchema)
 	if err != nil {
 		c.fail(a.ID, err)
@@ -356,6 +365,42 @@ func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent)
 	}
 	c.acceptReport(t, a, rep, outcome)
 	return nil
+}
+
+// materializeDirectory makes the files of an agent that lives in a virtual workspace exist on disk for its tools.
+// An agent on a worktree already has its directory, and one that shares the user's folder has none of its own.
+func (c *Coord) materializeDirectory(a agent.Agent) error {
+	ws := c.workspace()
+	if ws == nil || a.Worktree == "" || a.Worktree == ws.Root() {
+		return nil
+	}
+	tree, ok := ws.Tree(a.ID)
+	if !ok || !tree.Virtual {
+		return nil
+	}
+	dir, err := ws.Materialize(a.ID)
+	if err != nil {
+		return fmt.Errorf("lay out the agent's workspace: %w", err)
+	}
+	if dir != a.Workspace {
+		c.Agents.Update(a.ID, func(x *agent.Agent) { x.Workspace, x.Worktree = dir, dir })
+	}
+	return nil
+}
+
+// settleDirectory imports whatever the agent's tools wrote and removes its directory, keeping the work in Git. A
+// failed import keeps the directory so nothing is lost; the next start recovers it.
+func (c *Coord) settleDirectory(a agent.Agent) {
+	ws := c.workspace()
+	if ws == nil {
+		return
+	}
+	if tree, ok := ws.Tree(a.ID); !ok || !tree.Virtual {
+		return
+	}
+	if err := ws.Settle(a.ID); err != nil {
+		c.logWarn("import the agent's edits", err)
+	}
 }
 
 // taskBrief is the message a worker starts from: its task in full, last, where the model is most likely to act on it.
@@ -865,13 +910,14 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		f := c.Engine.PromoteFinding(ctxeng.Finding{
 			TaskID: t.ID, AgentID: a.ID, Kind: sf.Kind, Summary: sf.Summary, Evidence: sf.Evidence,
 			RootCause: sf.RootCause, Files: sf.Files, Symbols: sf.Symbols, Confidence: sf.Confidence, Verified: sf.Verified,
+			From: c.deriveFiles(a.ID, sf.Files),
 		})
 		c.emit("finding.created", f)
 	}
 	for _, line := range rep.Findings {
 		f := c.Engine.PromoteFinding(ctxeng.Finding{
 			TaskID: t.ID, AgentID: a.ID, Kind: ctxeng.KindArchitecture, Summary: line, Confidence: 0.7, Verified: a.Role == agent.Probe,
-			RootCause: rep.Cause, Files: files,
+			RootCause: rep.Cause, Files: files, From: c.deriveFiles(a.ID, files),
 		})
 		c.emit("finding.created", f)
 	}
@@ -948,7 +994,7 @@ func (c *Coord) changesFor(a agent.Agent, rep RawReport) []Change {
 		}
 		return out
 	}
-	found, err := ws.ChangedFiles(a.ID)
+	found, rev, err := ws.Proposed(a.ID)
 	if err != nil {
 		c.logWarn("list worktree changes", err)
 		return nil
@@ -967,7 +1013,7 @@ func (c *Coord) changesFor(a agent.Agent, rep RawReport) []Change {
 	}
 	out := make([]Change, 0, len(found))
 	for _, f := range found {
-		out = append(out, Change{ID: id.New("chg"), AgentID: a.ID, Path: f.Path, Kind: f.Kind, Added: f.Added, Deleted: f.Deleted, Status: "proposed", Worktree: a.Worktree, BaseRev: baseRev, Needs: needs, Lineage: lineage})
+		out = append(out, Change{ID: id.New("chg"), AgentID: a.ID, Path: f.Path, Kind: f.Kind, Added: f.Added, Deleted: f.Deleted, Status: "proposed", Worktree: a.Worktree, Rev: rev, BaseRev: baseRev, Needs: needs, Lineage: lineage})
 	}
 	if kind, reason := c.lineageState(lineage); kind != "" {
 		for i := range out {
@@ -1399,6 +1445,7 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 				c.abortAgentSession(a.ID, rt, sid)
 				c.discardStream(a, st)
 				if isContextLimit(ev.Error) {
+					c.syncWorkspaceContext(a.ID)
 					gen, reason, unhealthy := c.Engine.MaybeRefresh(a.ID, 0.01, true)
 					if unhealthy && gen != nil {
 						c.emit("context.refreshed", map[string]any{"agentId": a.ID, "reason": "context-limit error: " + reason})

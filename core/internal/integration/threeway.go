@@ -71,17 +71,28 @@ var MergeShadow func(path string, defaultClean, histogramClean bool)
 // Analyze decides what accepting one file would do to the workspace, without touching it. It returns the conflict
 // kind and hunk locations as well as the reason, so a caller can store and display them.
 func Analyze(root, worktree, rel string, baseText []byte, hadBase bool) (Analysis, error) {
-	return analyze(root, worktree, rel, baseText, hadBase, false, nil, false)
+	return analyze(root, DirSource{worktree}, rel, baseText, hadBase, false, nil, false)
+}
+
+// AnalyzeSource is Analyze with the agent's side read from src, so a change held in a virtual overlay is decided by
+// exactly the rules that decide one held in a worktree.
+func AnalyzeSource(root string, src Source, rel string, baseText []byte, hadBase bool) (Analysis, error) {
+	return analyze(root, src, rel, baseText, hadBase, false, nil, false)
 }
 
 // AnalyzeWithOurs is Analyze with the workspace side supplied by the caller instead of read from root. A group
 // accept uses it to check a later member against the bytes an earlier member of the same group would write, so a
 // dependent's stacked base is not mistaken for a conflict while its parent is still only planned.
 func AnalyzeWithOurs(root, worktree, rel string, baseText []byte, hadBase bool, ours []byte, hasOurs bool) (Analysis, error) {
-	return analyze(root, worktree, rel, baseText, hadBase, true, ours, hasOurs)
+	return analyze(root, DirSource{worktree}, rel, baseText, hadBase, true, ours, hasOurs)
 }
 
-func analyze(root, worktree, rel string, baseText []byte, hadBase bool, overrideOurs bool, givenOurs []byte, givenHasOurs bool) (Analysis, error) {
+// AnalyzeSourceWithOurs is AnalyzeWithOurs with the agent's side read from src.
+func AnalyzeSourceWithOurs(root string, src Source, rel string, baseText []byte, hadBase bool, ours []byte, hasOurs bool) (Analysis, error) {
+	return analyze(root, src, rel, baseText, hadBase, true, ours, hasOurs)
+}
+
+func analyze(root string, src Source, rel string, baseText []byte, hadBase bool, overrideOurs bool, givenOurs []byte, givenHasOurs bool) (Analysis, error) {
 	AnalyzeCount.Add(1)
 	path, err := normalizePath(rel)
 	if err != nil {
@@ -94,11 +105,10 @@ func analyze(root, worktree, rel string, baseText []byte, hadBase bool, override
 	if err := checkSymlinkPath(root, path); err != nil {
 		return conflictAnalysis(out, KindSymlink, err.Error()), nil
 	}
-	if err := checkSymlinkPath(worktree, path); err != nil {
+	if err := src.Check(path); err != nil {
 		return conflictAnalysis(out, KindSymlink, err.Error()), nil
 	}
 	oursPath := filepath.Join(root, filepath.FromSlash(path))
-	theirsPath := filepath.Join(worktree, filepath.FromSlash(path))
 	var ours []byte
 	var hasOurs bool
 	if overrideOurs {
@@ -111,9 +121,8 @@ func analyze(root, worktree, rel string, baseText []byte, hadBase bool, override
 			return out, oursErr
 		}
 	}
-	theirs, theirsErr := os.ReadFile(theirsPath)
-	hasTheirs := theirsErr == nil
-	if theirsErr != nil && !os.IsNotExist(theirsErr) {
+	theirs, hasTheirs, theirsErr := src.Read(path)
+	if theirsErr != nil {
 		return out, theirsErr
 	}
 	out.Ours = blobID(ours, hasOurs)
@@ -242,7 +251,7 @@ const casAttempts = 3
 // while the agent worked are kept: a clean merge is written, anything that overlaps is reported as a ConflictError
 // and nothing is touched. baseText is the file at base; hadBase is false when it did not exist there.
 func Merge(root, worktree, rel string, baseText []byte, hadBase bool) (Outcome, error) {
-	return MergeWithHook(root, worktree, rel, baseText, hadBase, nil)
+	return MergeSource(root, DirSource{worktree}, rel, baseText, hadBase, nil)
 }
 
 // MergeWithHook is Merge with a journal hook. Every write is a compare-and-swap: the target is re-hashed after the
@@ -250,8 +259,14 @@ func Merge(root, worktree, rel string, baseText []byte, hadBase bool) (Outcome, 
 // WorkspaceChangedError. The write goes to a temporary file in the target directory and is renamed into place;
 // the target's existing mode and symlink status are kept.
 func MergeWithHook(root, worktree, rel string, baseText []byte, hadBase bool, hook JournalHook) (Outcome, error) {
+	return MergeSource(root, DirSource{worktree}, rel, baseText, hadBase, hook)
+}
+
+// MergeSource is MergeWithHook with the agent's side read from src. The compare-and-swap, the journal hook and the
+// write are the same whatever src is.
+func MergeSource(root string, src Source, rel string, baseText []byte, hadBase bool, hook JournalHook) (Outcome, error) {
 	for attempt := 0; attempt < casAttempts; attempt++ {
-		a, err := Analyze(root, worktree, rel, baseText, hadBase)
+		a, err := AnalyzeSource(root, src, rel, baseText, hadBase)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -277,7 +292,7 @@ func MergeWithHook(root, worktree, rel string, baseText []byte, hadBase bool, ho
 				return Outcome{Path: a.Path}, err
 			}
 		}
-		if err := applyAnalysis(root, worktree, a); err != nil {
+		if err := applyAnalysis(root, src, a); err != nil {
 			return Outcome{Path: a.Path}, err
 		}
 		written, writtenExists, err := readTarget(root, a.Path)
@@ -297,6 +312,11 @@ func MergeWithHook(root, worktree, rel string, baseText []byte, hadBase bool, ho
 // so it does not merge, but it still refuses protected paths and symlinks and journals the pre-image through hook
 // before writing. The target's mode is kept and a symlink is never followed.
 func TakeWithHook(root, worktree, rel string, hook JournalHook) (Outcome, error) {
+	return TakeSource(root, DirSource{worktree}, rel, hook)
+}
+
+// TakeSource is TakeWithHook with the agent's side read from src.
+func TakeSource(root string, src Source, rel string, hook JournalHook) (Outcome, error) {
 	path, err := normalizePath(rel)
 	if err != nil {
 		return Outcome{}, err
@@ -308,12 +328,11 @@ func TakeWithHook(root, worktree, rel string, hook JournalHook) (Outcome, error)
 	if err := checkSymlinkPath(root, path); err != nil {
 		return out, err
 	}
-	if err := checkSymlinkPath(worktree, path); err != nil {
+	if err := src.Check(path); err != nil {
 		return out, err
 	}
-	theirs, theirsErr := os.ReadFile(filepath.Join(worktree, filepath.FromSlash(path)))
-	hasTheirs := theirsErr == nil
-	if theirsErr != nil && !os.IsNotExist(theirsErr) {
+	theirs, hasTheirs, theirsErr := src.Read(path)
+	if theirsErr != nil {
 		return out, theirsErr
 	}
 	ours, hasOurs, err := readTarget(root, path)
@@ -343,7 +362,7 @@ func TakeWithHook(root, worktree, rel string, hook JournalHook) (Outcome, error)
 		if err := os.Remove(filepath.Join(root, filepath.FromSlash(path))); err != nil && !os.IsNotExist(err) {
 			return out, err
 		}
-	} else if err := writeAtomic(filepath.Join(root, filepath.FromSlash(path)), filepath.Join(worktree, filepath.FromSlash(path)), theirs); err != nil {
+	} else if err := writeAtomic(filepath.Join(root, filepath.FromSlash(path)), src, path, theirs); err != nil {
 		return out, err
 	}
 	return out, nil
@@ -364,22 +383,26 @@ func readTarget(root, path string) ([]byte, bool, error) {
 // Check runs the decisions of Merge without writing anything. It returns the reason Merge would refuse the file, or ""
 // when Merge would apply it.
 func Check(root, worktree, rel string, baseText []byte, hadBase bool) (string, error) {
+	return CheckSource(root, DirSource{worktree}, rel, baseText, hadBase)
+}
+
+// CheckSource is Check with the agent's side read from src.
+func CheckSource(root string, src Source, rel string, baseText []byte, hadBase bool) (string, error) {
 	if _, err := normalizePath(rel); err != nil {
 		return err.Error(), nil
 	}
-	a, err := Analyze(root, worktree, rel, baseText, hadBase)
+	a, err := AnalyzeSource(root, src, rel, baseText, hadBase)
 	if err != nil {
 		return "", err
 	}
 	return a.Reason, nil
 }
 
-func applyAnalysis(root, worktree string, a Analysis) error {
+func applyAnalysis(root string, src Source, a Analysis) error {
 	dst := filepath.Join(root, filepath.FromSlash(a.Path))
-	src := filepath.Join(worktree, filepath.FromSlash(a.Path))
 	switch a.Action {
 	case "created", "updated", "merged":
-		return writeAtomic(dst, src, a.Merged)
+		return writeAtomic(dst, src, a.Path, a.Merged)
 	case "deleted":
 		if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
 			return err
@@ -502,7 +525,7 @@ func protectedPath(path string) bool {
 // writeAtomic writes data through a temporary file in dst's directory and renames it into place. An existing
 // target keeps its permission bits; a new file takes the agent file's mode. A symlink target is refused, never
 // followed: the pre-write symlink check in Analyze already refuses one, and Lstat here closes the gap.
-func writeAtomic(dst, src string, data []byte) error {
+func writeAtomic(dst string, src Source, rel string, data []byte) error {
 	dir := filepath.Dir(dst)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -515,8 +538,8 @@ func writeAtomic(dst, src string, data []byte) error {
 		mode = st.Mode().Perm()
 	} else if !os.IsNotExist(err) {
 		return err
-	} else if st, serr := os.Stat(src); serr == nil {
-		mode = st.Mode().Perm()
+	} else if m, ok := src.Mode(rel); ok {
+		mode = m
 	}
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(dst)+".relo-*.tmp")
 	if err != nil {

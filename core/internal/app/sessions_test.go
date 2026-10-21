@@ -48,7 +48,7 @@ func newGitCore(t *testing.T, files map[string]string) (*App, string) {
 func proposeChange(t *testing.T, core *App, dir, rel string, edit func(path string)) orchestrator.Change {
 	t.Helper()
 	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
-	tree, err := core.Coord.WS.EnsureTree("agent_t1", false)
+	tree, err := mountTree(core, "agent_t1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestChangeDiffReturnsBothSides(t *testing.T) {
 func TestAcceptAllReportsConflictsAndAppliesTheRest(t *testing.T) {
 	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n", "b.txt": "uno\n"})
 	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
-	tree, err := core.Coord.WS.EnsureTree("agent_t2", false)
+	tree, err := mountTree(core, "agent_t2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestAcceptAllClearsConflictState(t *testing.T) {
 func TestAcceptAllBatchKeepsSameFileOrderAndPartialFailures(t *testing.T) {
 	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n", "b.txt": "uno\n", "c.txt": "tres\n"})
 	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
-	tree, err := core.Coord.WS.EnsureTree("agent_batch", false)
+	tree, err := mountTree(core, "agent_batch")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,11 +259,11 @@ func TestAcceptAllBatchKeepsSameFileOrderAndPartialFailures(t *testing.T) {
 func TestAcceptAllMergesSamePathChangesFromDifferentAgents(t *testing.T) {
 	core, dir := newGitCore(t, map[string]string{"a.txt": "one\ntwo\nthree\nfour\n"})
 	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
-	firstTree, err := core.Coord.WS.EnsureTree("agent_first", false)
+	firstTree, err := mountTree(core, "agent_first")
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondTree, err := core.Coord.WS.EnsureTree("agent_second", false)
+	secondTree, err := mountTree(core, "agent_second")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +344,7 @@ func TestUndoRefusesAfterTheUserEditsTheFile(t *testing.T) {
 func TestDirtyPathIsRefusedAndOtherPathsStillLand(t *testing.T) {
 	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n", "b.txt": "uno\n"})
 	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
-	tree, err := core.Coord.WS.EnsureTree("agent_dirty", false)
+	tree, err := mountTree(core, "agent_dirty")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +408,7 @@ func TestAutoApplySkipsADirtyPath(t *testing.T) {
 func TestAutoApplyLandsCleanPathBesideADirtyOne(t *testing.T) {
 	core, dir := newGitCore(t, map[string]string{"a.txt": "base\n", "b.txt": "uno\n"})
 	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
-	tree, err := core.Coord.WS.EnsureTree("agent_t1", false)
+	tree, err := mountTree(core, "agent_t1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +458,7 @@ func TestJournalFailureFailsOverwriteClosedAndAllowsCreate(t *testing.T) {
 		t.Fatalf("failed journal still wrote the file: %q", got)
 	}
 
-	tree, err := core.Coord.WS.EnsureTree(ch.AgentID, false)
+	tree, err := mountTree(core, ch.AgentID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -551,7 +551,7 @@ func TestAcceptsRecordLandedAction(t *testing.T) {
 	s := core.Coord.Current()
 	for _, name := range []string{"a.txt", "b.txt"} {
 		agentID := "agent-" + name
-		tree, err := core.Coord.WS.EnsureTree(agentID, false)
+		tree, err := mountTree(core, agentID)
 		if err != nil {
 			t.Fatal(err)
 		}

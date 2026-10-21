@@ -27,6 +27,9 @@ func (e *Engine) unhealthyLocked(st *state, threshold float64) (bool, string) {
 	if !st.Metrics.LastProgress.IsZero() && e.now().Sub(st.Metrics.LastProgress) > 20*time.Minute && st.Metrics.Generations > 0 {
 		return true, "stalled progress"
 	}
+	if staleInGeneration(st) {
+		return true, "stale file excerpt"
+	}
 	if len(st.Generations) > 0 {
 		hist := 0
 		for _, it := range st.Generations[len(st.Generations)-1].Items {

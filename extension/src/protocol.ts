@@ -432,7 +432,7 @@ function upsertAgent(list: AgentInfo[], item: AgentInfo): AgentInfo[] {
 
 export const Events = [
   "session.created", "session.opened", "session.updated", "agent.created", "agent.started", "agent.activity", "agent.updated", "agent.completed", "agent.failed", "agent.escalated",
-  "context.created", "context.refreshed", "context.compressed", "context.replaced", "context.item.promoted", "context.item.dropped",
+  "context.created", "context.refreshed", "context.compressed", "context.stale", "context.replaced", "context.item.promoted", "context.item.dropped",
   "task.created", "task.updated", "task.completed", "task.failed", "finding.created", "finding.verified", "memory.updated",
   "usage.updated", "changes.updated", "verification.started", "verification.completed", "backend.status", "permission.asked",
   "chat.message", "chat.delta", "chat.discard", "cache.updated", "canvas.requested", "log",

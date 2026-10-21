@@ -21,7 +21,7 @@ func buildRejectChanges(t *testing.T, core *App, dir string, n, a int) {
 	s := core.Coord.Current()
 	trees := make([]string, a)
 	for i := 0; i < a; i++ {
-		tree, err := core.Coord.WS.EnsureTree(fmt.Sprintf("agent_%d", i), false)
+		tree, err := mountTree(core, fmt.Sprintf("agent_%d", i))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -156,7 +156,12 @@ func TestRejectRetentionFailureKeepsWorktreeAndNotes(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(ch.Worktree, "a.txt")); err != nil {
 		t.Fatalf("worktree file was discarded after a failed retention: %v", err)
 	}
-	gitText(t, dir, "show-ref", "--verify", "refs/heads/relo/agent_t1")
+	if isVirtual(core, ch.AgentID) {
+		// The agent's work is held by its overlay ref until the workspace is released, not by a branch.
+		gitText(t, dir, "show-ref", "--verify", "refs/relo/vws/agent_t1/overlay")
+	} else {
+		gitText(t, dir, "show-ref", "--verify", "refs/heads/relo/agent_t1")
+	}
 	joined := strings.Join(notes, "\n")
 	if !strings.Contains(joined, "could not be kept") || !strings.Contains(joined, ch.ID) {
 		t.Fatalf("retention failure has no visible note: %q", joined)

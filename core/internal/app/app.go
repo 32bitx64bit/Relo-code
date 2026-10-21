@@ -74,6 +74,7 @@ type App struct {
 	// never saved under another's id.
 	sessMu     sync.Mutex
 	decisionMu sync.Mutex // serialises change decisions for the current session
+	vwMu       sync.Mutex // serialises mirroring of virtual workspaces into the store
 	cleanupMu  sync.Mutex // serialises worktree discard and release outside decisionMu
 	// cleanupHoldMu guards cleanupHolds. A rejected agent is held here from the decision until its blob is
 	// retained, so a concurrent accept cannot release the worktree in between.
@@ -200,12 +201,15 @@ func New(cfg Config, log *logging.Logger) (*App, error) {
 	// Canvas calls are audited in the event log with metadata only: the raw payloads stay out of the log.
 	a.Coord.SetCanvasAudit(a.logCanvasAudit)
 	ws := workspace.New(cfg.Workspace)
+	ws.SetNotifier(a.workspaceNotice)
+	ws.SetObserver(a.workspaceEvent)
 	a.Coord.SetWorkspaceManager(ws)
 	a.Coord.Verify = verification.Runner{Root: cfg.Workspace}
 	a.Coord.Configure(a.Coord.Settings, scheduler.New(scheduler.Limits{PathLeases: a.Coord.Settings.PathLeases}), a.Coord.Route)
 	if _, err := ws.Snapshot(); err != nil {
 		log.Warn("workspace snapshot", map[string]any{"error": err.Error(), "workspace": cfg.Workspace})
 	}
+	a.reconcileWorkspaces()
 	return a, nil
 }
 
@@ -343,7 +347,7 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 		if !ok {
 			return nil, ipc.Fail{C: "not_found", M: "agent not found"}
 		}
-		return map[string]any{"path": ag.Worktree}, nil
+		return a.openAgentDirectory(ag)
 	case "task.list":
 		return a.Coord.Graph.List(), nil
 	case "task.get":
@@ -557,6 +561,35 @@ func (a *App) initialize(ctx context.Context, p map[string]any) (any, error) {
 	}, nil
 }
 
+// applyWorkspaceSettings reads relo.workspace.* from an initialize/settings.apply payload. Only keys that are present
+// change anything, and a mode the core does not know means worktrees, so a bad value can never turn the feature on.
+func (a *App) applyWorkspaceSettings(p map[string]any) {
+	ws := a.Coord.WS
+	if ws == nil {
+		return
+	}
+	cfg, changed := ws.Config(), false
+	if v := str(p, "workspaceMode", ""); v != "" {
+		cfg.Mode, changed = workspace.Mode(v), true
+	}
+	if v := str(p, "workspaceMaterialization", ""); v != "" {
+		cfg.Materialization, changed = v, true
+	}
+	if v, ok := p["workspaceVirtualReads"].(bool); ok {
+		cfg.VirtualReads, changed = v, true
+	}
+	if changed {
+		ws.Configure(cfg)
+	}
+}
+
+// workspaceNotice shows the user what the workspace layer decided on its own: a fallback to worktrees, a recovery
+// after a stop, a file that was not kept. It never blocks the caller, which may hold workspace locks.
+func (a *App) workspaceNotice(kind, message string) {
+	a.Log.Info("workspace notice", map[string]any{"kind": kind, "message": message})
+	go a.Coord.Note(message)
+}
+
 func (a *App) applySettings(p map[string]any) {
 	if enabled, ok := p["autoApply"].(bool); ok {
 		a.autoApply.Store(enabled)
@@ -633,6 +666,7 @@ func (a *App) applySettings(p map[string]any) {
 	if n := int(num(p, "reportMaxChars", 0)); n > 0 {
 		s.ReportMaxChars = n
 	}
+	a.applyWorkspaceSettings(p)
 	if list, ok := pathList(p, "ignorePaths"); ok {
 		if ws := a.Coord.WS; ws != nil {
 			ws.SetIgnore(list)
@@ -1065,6 +1099,9 @@ func (a *App) Close() {
 		a.persist()
 		a.Coord.StopAll(context.Background())
 		a.Coord.CloseMessages()
+		if ws := a.Coord.WS; ws != nil {
+			_ = ws.Close()
+		}
 		a.procMu.Lock()
 		a.swapProcLocked(nil)
 		a.procMu.Unlock()

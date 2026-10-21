@@ -78,6 +78,9 @@ type Change struct {
 	Integration *Integration `json:"integration,omitempty"`
 	// Reason is why a change was discarded, such as "resolved by agent". Empty for other decisions.
 	Reason string `json:"reason,omitempty"`
+	// Rev is the revision of the agent's virtual workspace this change was proposed at. It is pinned until the
+	// change is decided, so accepting reads exactly what was proposed. Zero for a change from a worktree.
+	Rev uint64 `json:"rev,omitempty"`
 }
 
 // Dep is a dependency applied when a change's base was stacked.

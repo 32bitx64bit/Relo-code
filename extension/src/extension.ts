@@ -39,7 +39,7 @@ let postedRepository = "";
 let canvas: CanvasManager;
 
 // Settings that core consumes; a change to any of them re-applies to the running core.
-const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context", "relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics", "relo.changes.ignorePaths", "relo.changes.unionPaths", "relo.changes.takeLatestPaths", "relo.scheduler.pathLeases"];
+const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context", "relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics", "relo.changes.ignorePaths", "relo.changes.unionPaths", "relo.changes.takeLatestPaths", "relo.scheduler.pathLeases", "relo.workspace"];
 
 export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   output = vscode.window.createOutputChannel("Relo");
@@ -737,6 +737,9 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
     unionPaths: c.get<string[]>("changes.unionPaths", ["*.md", "*.txt"]),
     takeLatestPaths: c.get<string[]>("changes.takeLatestPaths", []),
     pathLeases: c.get<boolean>("scheduler.pathLeases", false),
+    workspaceMode: c.get<string>("workspace.mode", "worktree"),
+    workspaceMaterialization: c.get<string>("workspace.materialization", "automatic"),
+    workspaceVirtualReads: c.get<boolean>("workspace.virtualReads", false),
     routingMode: c.get<string>("routing.mode", "simple"),
     contextLimit: c.get<number>("models.contextLimit", 0),
     providers,

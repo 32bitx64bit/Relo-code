@@ -426,8 +426,8 @@ func TestInAGitRepoAQueuedWorkerRunsBesideTheOthersWhenASlotFrees(t *testing.T) 
 		}
 		return false
 	})
-	if _, err := os.Stat(filepath.Join(dir, ".relo", "worktrees", queued.ID)); err != nil {
-		t.Errorf("the queued worker has no worktree to start in: %v", err)
+	if !c.WS.Available(queued.ID, filepath.Join(dir, ".relo", "worktrees", queued.ID)) {
+		t.Errorf("the queued worker has no workspace to start in")
 	}
 	r.release(first)
 	third := nextBegun(t, r)

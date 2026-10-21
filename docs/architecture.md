@@ -67,7 +67,7 @@ With `relo.scheduler.pathLeases` on (default off), a task may declare the files 
 
 ## Persistence
 
-SQLite at `<workspace>/.relo/relo.db` (WAL). Tables: sessions, agents, tasks, generations, findings, memory, reports, usage, changes, verification, events.
+SQLite at `<workspace>/.relo/relo.db` (WAL). Tables: sessions, agents, tasks, generations, findings, memory, reports, usage, changes, verification, events, vworkspaces. `vworkspaces` mirrors the virtual workspaces Git holds under `refs/relo/vws/` (see [virtual-workspaces.md](virtual-workspaces.md)); it is rebuilt from Git and reconciled at start, so it is never the source of truth.
 
 ## IPC
 

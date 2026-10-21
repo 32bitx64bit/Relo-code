@@ -32,6 +32,7 @@ type state struct {
 	Pool              []Item
 	Generations       []*Generation
 	Metrics           Metrics
+	Workspace         *WorkspaceContextRef // the repository state new generations are built against
 }
 
 func New() *Engine {
@@ -102,6 +103,10 @@ func (e *Engine) Ingest(agentID string, items []Item) {
 		}
 		if it.Created.IsZero() {
 			it.Created = now
+		}
+		if foreign(it, agentID) {
+			st.Metrics.ForeignRejected++
+			continue
 		}
 		EnsureTokens(&it)
 		if st.hold(it) {
@@ -251,6 +256,10 @@ func (e *Engine) Replace(agentID string, items []Item, reason string) (*Generati
 		if it.Created.IsZero() {
 			it.Created = now
 		}
+		if foreign(it, agentID) {
+			st.Metrics.ForeignRejected++
+			continue
+		}
 		EnsureTokens(&it)
 		st.Pool = append(st.Pool, it)
 	}
@@ -279,6 +288,16 @@ func (e *Engine) Fork(agentID string) (string, *Generation, error) {
 	cp.ID = dstID
 	cp.Generations = append([]*Generation{}, src.Generations...)
 	cp.Pool = append([]Item{}, src.Pool...)
+	// A fork is a deliberate copy of what the source knew. It has no workspace of its own yet, and what was cut from
+	// the source's files is marked as brought along rather than found.
+	cp.Workspace = nil
+	for i := range cp.Pool {
+		if d := cp.Pool[i].From; d != nil && d.AgentID != dstID {
+			marked := *d
+			marked.Imported = true
+			cp.Pool[i].From = &marked
+		}
+	}
 	cp.Metrics = cloneMetrics(src.Metrics)
 	e.agents[dstID] = &cp
 	gen, err := e.buildLocked(BuildRequest{
@@ -378,6 +397,7 @@ func (e *Engine) PromoteFinding(f Finding) Finding {
 		Title:      f.Summary,
 		FindingID:  f.ID,
 		Phase:      st.Phase,
+		From:       f.From,
 	}
 	EnsureTokens(&it)
 	st.Pool = append(st.Pool, it)
@@ -427,6 +447,7 @@ func (e *Engine) Inspect(agentID string) Inspection {
 	ins.Used = gen.Tokens
 	ins.Included = gen.Items
 	ins.Reason = gen.Reason
+	ins.Workspace = cloneRef(gen.Workspace)
 	for _, it := range gen.Items {
 		ins.Composition[string(it.Class)] += it.Tokens
 	}
@@ -507,6 +528,9 @@ func (e *Engine) RestoreGeneration(g Generation) {
 	}
 	if newest {
 		st.Phase, st.Budget, st.Strategy = g.Phase, g.Budget, g.Strategy
+		if st.Workspace == nil {
+			st.Workspace = cloneRef(g.Workspace)
+		}
 	}
 	st.Metrics.Generations = len(st.Generations)
 }
@@ -608,6 +632,10 @@ func (e *Engine) buildLocked(req BuildRequest, boundary bool) (*Generation, erro
 		if it.Created.IsZero() {
 			it.Created = now
 		}
+		if foreign(it, req.AgentID) {
+			st.Metrics.ForeignRejected++
+			continue
+		}
 		EnsureTokens(&it)
 		if st.hold(it) {
 			continue
@@ -630,6 +658,14 @@ func (e *Engine) buildLocked(req BuildRequest, boundary bool) (*Generation, erro
 	if scope != nil {
 		items, scopeDropped = applyScopeToItems(items, scope, dependencies)
 	}
+	// Only a boundary build (or the first) may change what the stable block says, so only it acts on stale items.
+	var stale map[string]string
+	if boundary || len(st.Generations) == 0 {
+		stale = staleIDs(st.Pool)
+		var staleDropped []Dropped
+		items, staleDropped = applyFreshness(items, stale)
+		scopeDropped = append(scopeDropped, staleDropped...)
+	}
 	pool := Retrieve(items, req.Query)
 	if len(pool) == 0 {
 		pool = items
@@ -650,6 +686,7 @@ func (e *Engine) buildLocked(req BuildRequest, boundary bool) (*Generation, erro
 			if scope != nil {
 				previous, _ = applyScopeToItems(previous, scope, dependencies)
 			}
+			previous, _ = applyFreshness(previous, stale)
 			sel.Included = retainWithinHysteresis(previous, sel.Included, st.Budget)
 		}
 	}
@@ -664,6 +701,7 @@ func (e *Engine) buildLocked(req BuildRequest, boundary bool) (*Generation, erro
 		Dropped:        sel.Dropped,
 		Compressed:     sel.Compressed,
 		Deferred:       deferred,
+		Workspace:      cloneRef(st.Workspace),
 		BuiltAt:        now,
 		Tokens:         sel.Tokens,
 		Budget:         st.Budget,
@@ -694,6 +732,14 @@ func (e *Engine) buildLocked(req BuildRequest, boundary bool) (*Generation, erro
 
 // carryDeferred returns the deferred IDs for a non-boundary build: items already deferred by
 // prior stay deferred, and stable items newly added by this build are deferred.
+func cloneRef(r *WorkspaceContextRef) *WorkspaceContextRef {
+	if r == nil {
+		return nil
+	}
+	cp := *r
+	return &cp
+}
+
 func carryDeferred(prior *Generation, items []Item) []string {
 	priorIDs := make(map[string]bool, len(prior.Items))
 	for _, it := range prior.Items {
@@ -1066,6 +1112,9 @@ func renderItem(b *strings.Builder, it Item) {
 		b.WriteString("Verified.\n")
 	} else if it.Source == SourceHypothesis {
 		b.WriteString("Unverified hypothesis - do not treat as fact.\n")
+	}
+	if it.Stale != "" {
+		b.WriteString("Stale - " + it.Stale + "; check the file before relying on this.\n")
 	}
 	b.WriteString(it.Content)
 	b.WriteString("\n\n")

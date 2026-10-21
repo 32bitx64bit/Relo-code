@@ -69,6 +69,11 @@ type Item struct {
 	Kind       string    `json:"kind,omitempty"`
 	Title      string    `json:"title,omitempty"`
 	FindingID  string    `json:"findingId,omitempty"`
+	// From says which workspace files this item was cut from, and their content hashes at the time, so a later check
+	// can tell whether it still describes them. Nil for items that are not derived from files.
+	From *Derivation `json:"from,omitempty"`
+	// Stale is why the files this item was cut from no longer match it; empty while it is current.
+	Stale string `json:"stale,omitempty"`
 }
 
 type Dropped struct {
@@ -100,6 +105,9 @@ type Generation struct {
 	// render in the dynamic section so the Static block stays byte-identical until the
 	// next boundary build (refresh/replace/limit refresh) clears this list.
 	Deferred []string `json:"deferred,omitempty"`
+	// Workspace is the repository state this generation was built against; nil for an agent that works in the user's
+	// own folder rather than in an isolated workspace.
+	Workspace *WorkspaceContextRef `json:"workspace,omitempty"`
 }
 
 func (g *Generation) isDeferred(id string) bool {
@@ -125,6 +133,8 @@ type Metrics struct {
 	LastProgress    time.Time      `json:"lastProgress"`
 	RefreshReasons  []string       `json:"refreshReasons,omitempty"`
 	RepeatedActions int            `json:"repeatedActions"`
+	// ForeignRejected counts items refused because they were cut from another agent's workspace.
+	ForeignRejected int `json:"foreignRejected,omitempty"`
 }
 
 type Query struct {
@@ -170,6 +180,8 @@ type Inspection struct {
 	Composition map[string]int `json:"composition"`
 	Reason      string         `json:"refreshReason,omitempty"`
 	Metrics     Metrics        `json:"metrics"`
+	// Workspace is the repository state the generation was built against.
+	Workspace *WorkspaceContextRef `json:"workspace,omitempty"`
 }
 
 type Finding struct {
@@ -186,6 +198,8 @@ type Finding struct {
 	Confidence float64   `json:"confidence"`
 	Verified   bool      `json:"verified"`
 	Created    time.Time `json:"created"`
+	// From pins the finding to the content of the files it cites, so it can be flagged when they change.
+	From *Derivation `json:"from,omitempty"`
 }
 
 const (

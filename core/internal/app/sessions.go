@@ -304,7 +304,7 @@ func (a *App) changeDiff(id string) (any, error) {
 		out["note"] = "Edited in place (no Git): there is no earlier version to compare with."
 	default:
 		if a.ownWorktree(ch.Worktree) {
-			if _, err := os.Stat(ch.Worktree); err == nil {
+			if src, ok := a.changeSource(ch); ok {
 				if _, found := a.Coord.WS.Tree(ch.AgentID); !found {
 					_, _ = a.Coord.WS.EnsureTree(ch.AgentID, false)
 				}
@@ -318,7 +318,10 @@ func (a *App) changeDiff(id string) (any, error) {
 				}
 				var bin bool
 				var trunc bool
-				after, hasAfter, bin, trunc = readCapped(filepath.Join(ch.Worktree, rel))
+				if data, exists, rerr := src.Read(ch.Path); rerr == nil && exists {
+					after, bin, trunc = capText(data)
+					hasAfter = true
+				}
 				binary, truncated = binary || bin, truncated || trunc
 			}
 		}
@@ -517,7 +520,11 @@ func (a *App) takeAgentChangeLocked(id string) (any, error, string, string) {
 		a.blockChange(ch.ID, "journal_failed", "the recovery journal could not be written, so nothing was changed: "+jerr.Error())
 		return ipc.Fail{C: "journal_failed", M: path + ": the recovery journal could not be written, so nothing was changed: " + jerr.Error()}
 	}
-	outcome, err := integration.TakeWithHook(a.Cfg.Workspace, ch.Worktree, ch.Path, journal)
+	src, ok := a.changeSource(ch)
+	if !ok {
+		return nil, ipc.Fail{C: "not_found", M: "the agent's workspace no longer exists, so this change cannot be applied"}, "", ""
+	}
+	outcome, err := integration.TakeSource(a.Cfg.Workspace, src, ch.Path, journal)
 	if err != nil {
 		var fail ipc.Fail
 		if errors.As(err, &fail) {
@@ -576,7 +583,8 @@ func (a *App) mergeChange(ch orchestrator.Change) (integration.Outcome, error) {
 		a.blockChange(ch.ID, "unsaved_buffer", "the file has unsaved changes in the editor; save it and try again")
 		return integration.Outcome{}, ipc.Fail{C: "unsaved_buffer", M: ch.Path + ": the file has unsaved changes in the editor, so nothing was written"}
 	}
-	if _, err := os.Stat(ch.Worktree); err != nil {
+	src, ok := a.changeSource(ch)
+	if !ok {
 		return integration.Outcome{}, ipc.Fail{C: "not_found", M: "the agent's worktree no longer exists, so this change cannot be applied"}
 	}
 	tree, err := a.Coord.WS.EnsureTree(ch.AgentID, false)
@@ -600,7 +608,7 @@ func (a *App) mergeChange(ch orchestrator.Change) (integration.Outcome, error) {
 		a.blockChange(ch.ID, "journal_failed", "the recovery journal could not be written, so nothing was changed: "+jerr.Error())
 		return ipc.Fail{C: "journal_failed", M: path + ": the recovery journal could not be written, so nothing was changed: " + jerr.Error()}
 	}
-	outcome, err := integration.MergeWithHook(a.Cfg.Workspace, tree.Path, ch.Path, base, hadBase, journal)
+	outcome, err := integration.MergeSource(a.Cfg.Workspace, src, ch.Path, base, hadBase, journal)
 	if err != nil {
 		var ce integration.ConflictError
 		switch {
@@ -659,6 +667,8 @@ type rejectJob struct {
 	agentID  string
 	worktree string
 	path     string
+	// rev is the revision of the agent's virtual workspace the change was proposed at; zero for a worktree.
+	rev uint64
 }
 
 func (a *App) rejectChange(id string) (any, error) {
@@ -757,7 +767,11 @@ func (a *App) rejectDecisionsLocked(decisions []rejectDecision) []rejectJob {
 	jobs := make([]rejectJob, 0, len(decisions))
 	held := map[string]bool{}
 	for _, d := range decisions {
-		jobs = append(jobs, rejectJob{changeID: d.changeID, agentID: d.agentID, worktree: d.worktree, path: d.path})
+		job := rejectJob{changeID: d.changeID, agentID: d.agentID, worktree: d.worktree, path: d.path}
+		if ch, ok := a.Coord.FindChange(d.changeID); ok {
+			job.rev = ch.Rev
+		}
+		jobs = append(jobs, job)
 		if !held[d.agentID] {
 			held[d.agentID] = true
 			a.holdCleanup(d.agentID)
@@ -783,8 +797,8 @@ func (a *App) keepRejectedBlobs(jobs []rejectJob) map[string]error {
 	}
 	var refs []workspace.BlobRef
 	for _, j := range jobs {
-		if _, err := os.Stat(j.worktree); err == nil && a.ownWorktree(j.worktree) {
-			refs = append(refs, workspace.BlobRef{ChangeID: j.changeID, Worktree: j.worktree, Path: j.path})
+		if a.agentWorkspaceExists(j.agentID, j.worktree) {
+			refs = append(refs, workspace.BlobRef{ChangeID: j.changeID, Worktree: j.worktree, Path: j.path, Revision: j.rev})
 		}
 	}
 	if len(refs) == 0 {
@@ -816,7 +830,7 @@ func (a *App) retainBlob(r workspace.BlobRef) error {
 	if a.keepBlob != nil {
 		return a.keepBlob(r.ChangeID, r.Worktree, r.Path)
 	}
-	return a.Coord.WS.KeepChangeBlob(r.ChangeID, r.Worktree, r.Path)
+	return a.Coord.WS.KeepChangeBlobAt(r.ChangeID, r.Worktree, r.Path, r.Revision)
 }
 
 // finishRejectsLocked cleans the agent worktrees and releases the ones nothing waits for, then persists the
@@ -846,7 +860,7 @@ func (a *App) finishRejectsLocked(jobs []rejectJob, failed map[string]error) {
 		if _, bad := failed[j.changeID]; bad {
 			continue
 		}
-		if _, err := os.Stat(j.worktree); err != nil || !a.ownWorktree(j.worktree) {
+		if !a.agentWorkspaceExists(j.agentID, j.worktree) {
 			continue
 		}
 		tree, err := a.Coord.WS.EnsureTree(j.agentID, false)

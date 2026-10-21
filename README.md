@@ -32,7 +32,7 @@ Visual Studio Code  --stdio JSON-RPC-->  Relo Core (Go)
                                         OpenCode serve
 ```
 
-See [docs/architecture.md](docs/architecture.md) and [docs/context-engine.md](docs/context-engine.md).
+See [docs/architecture.md](docs/architecture.md) and [docs/context-engine.md](docs/context-engine.md). Agents work in Git worktrees by default; virtual workspaces, an opt-in alternative that lays files out only when a tool needs them, are described in [docs/virtual-workspaces.md](docs/virtual-workspaces.md). A proposal for running part of the work on a native runtime next to OpenCode is in [docs/hybrid-runtime.md](docs/hybrid-runtime.md).
 
 ## Quick start
 

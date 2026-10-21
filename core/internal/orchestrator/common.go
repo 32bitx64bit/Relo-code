@@ -87,6 +87,7 @@ func (c *Coord) RespondPermission(id, response string) {
 }
 
 func (c *Coord) RefreshAgent(id, reason string) (*ctxeng.Generation, error) {
+	c.syncWorkspaceContext(id)
 	gen, err := c.Engine.Refresh(id, reason)
 	if err == nil {
 		c.Agents.Update(id, func(x *agent.Agent) { x.Generation = gen.Number })

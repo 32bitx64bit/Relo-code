@@ -623,6 +623,38 @@
           "scope": "window",
           "description": "Have tasks declare the files they will edit and keep two tasks with overlapping paths from running at once. The later task waits for the earlier to finish, then starts with the earlier task's pending patches applied to those paths and records them as dependencies. Off ignores declared paths."
         },
+        "relo.workspace.mode": {
+          "type": "string",
+          "enum": [
+            "worktree",
+            "virtual",
+            "auto"
+          ],
+          "enumDescriptions": [
+            "Every agent gets its own Git worktree: a full checkout of the repository. The default, and the fallback for everything below.",
+            "Agents share one immutable base snapshot and each keeps its own edits as Git objects. A folder is checked out only while a tool needs real files. Falls back to a worktree, with a notice, in a repository whose Git settings rewrite file content on checkout.",
+            "Virtual workspaces where the repository supports them, worktrees everywhere else."
+          ],
+          "default": "worktree",
+          "scope": "window",
+          "description": "How Relo isolates each agent's edits. Applies to agents created after the change; an agent already working keeps what it has. Your own folder is never written by either mode, and neither mode stages, commits or pushes."
+        },
+        "relo.workspace.materialization": {
+          "type": "string",
+          "enum": [
+            "automatic",
+            "worktree"
+          ],
+          "default": "automatic",
+          "scope": "window",
+          "description": "How a folder is made for an agent in a virtual workspace when its tools need real files (build, test, shell). Both choices use a Git worktree today; automatic lets Relo pick a cheaper method when one exists. Ignored in worktree mode."
+        },
+        "relo.workspace.virtualReads": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Serve the model's file reads from the virtual workspace without a folder. Takes effect only when the runtime guarantees that every file tool goes through Relo; OpenCode runs its own file tools, so with it this is ignored (with a notice) and agents read their folders."
+        },
         "relo.autoVerify": {
           "type": "boolean",
           "default": true,

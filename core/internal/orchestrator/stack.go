@@ -211,7 +211,17 @@ func (c *Coord) stackInto(ws *workspace.Manager, a agent.Agent, parts []stackPar
 		if len(diff) > maxDiffChars {
 			diff = diff[:maxDiffChars] + "\n... (diff cut here; read the files for the rest)"
 		}
-		items = append(items, ctxeng.Item{Class: ctxeng.ClassCode, Source: ctxeng.SourceRepo, Title: "Diff under review", Content: diff, Durability: 1, Relevance: 1})
+		var paths []string
+		seen := map[string]bool{}
+		for _, p := range parts {
+			for _, f := range p.files {
+				if !seen[f.Path] {
+					seen[f.Path] = true
+					paths = append(paths, f.Path)
+				}
+			}
+		}
+		items = append(items, ctxeng.Item{Class: ctxeng.ClassCode, Source: ctxeng.SourceRepo, Title: "Diff under review", Content: diff, Files: paths, Durability: 1, Relevance: 1, From: c.deriveFiles(a.ID, paths)})
 	}
 	return items, deps
 }

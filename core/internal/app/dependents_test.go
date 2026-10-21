@@ -43,6 +43,9 @@ func proposeDependent(t *testing.T, core *App, parent orchestrator.Change, agent
 			t.Fatalf("stack parent: %v", err)
 		}
 	}
+	if err := mountDir(core, agentID); err != nil {
+		t.Fatal(err)
+	}
 	edit(filepath.Join(tree.Path, rel))
 	lineage := []orchestrator.Dep{{ID: parent.ID, PatchHash: patchHash(t, core, parent.AgentID, parent.Path)}}
 	s := core.Coord.Current()

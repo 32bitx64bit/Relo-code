@@ -613,8 +613,9 @@ func (a *App) plannedParentSide(ch orchestrator.Change) (*plannedOurs, string) {
 // analyzeChangeAgainst is analyzeChange with an optional in-memory workspace side for the change's path.
 func (a *App) analyzeChangeAgainst(ch orchestrator.Change, planned *plannedOurs) (integration.Analysis, error) {
 	// Do not recreate a released worktree: its proposed edits are no longer available.
-	if _, err := os.Stat(ch.Worktree); err != nil {
-		return integration.Analysis{}, fmt.Errorf("the agent's worktree is unavailable: %w", err)
+	src, ok := a.changeSource(ch)
+	if !ok {
+		return integration.Analysis{}, fmt.Errorf("the agent's worktree is unavailable: %w", os.ErrNotExist)
 	}
 	tree, err := a.Coord.WS.EnsureTree(ch.AgentID, false)
 	if err != nil {
@@ -629,9 +630,9 @@ func (a *App) analyzeChangeAgainst(ch orchestrator.Change, planned *plannedOurs)
 	}
 	var analysis integration.Analysis
 	if planned != nil {
-		analysis, err = integration.AnalyzeWithOurs(a.Cfg.Workspace, ch.Worktree, ch.Path, base, hadBase, planned.data, planned.exists)
+		analysis, err = integration.AnalyzeSourceWithOurs(a.Cfg.Workspace, src, ch.Path, base, hadBase, planned.data, planned.exists)
 	} else {
-		analysis, err = integration.Analyze(a.Cfg.Workspace, ch.Worktree, ch.Path, base, hadBase)
+		analysis, err = integration.AnalyzeSource(a.Cfg.Workspace, src, ch.Path, base, hadBase)
 	}
 	if err != nil {
 		return integration.Analysis{}, ipc.Fail{C: "integration_failed", M: fmt.Sprintf("%s: %v", ch.Path, err)}
@@ -708,8 +709,8 @@ func (a *App) currentConflictCopy(ch orchestrator.Change) string {
 // agentConflictCopy returns only the conflicting hunks of the agent's file with context. A change without hunk
 // locations falls back to the capped whole file.
 func (a *App) agentConflictCopy(ch orchestrator.Change) string {
-	data, err := os.ReadFile(filepath.Join(ch.Worktree, filepath.FromSlash(ch.Path)))
-	if err != nil {
+	data, exists, err := a.agentFile(ch)
+	if err != nil || !exists {
 		return "  agent version:\n  (agent version unavailable)\n"
 	}
 	if bytes.IndexByte(data, 0) >= 0 {
@@ -724,7 +725,7 @@ func (a *App) agentConflictCopy(ch orchestrator.Change) string {
 		}
 	}
 	if len(conflicting) == 0 {
-		return "  agent version:\n" + agentCopy(ch)
+		return "  agent version:\n" + agentCopy(data)
 	}
 	lines := strings.Split(string(data), "\n")
 	var b strings.Builder
@@ -746,17 +747,13 @@ func (a *App) agentConflictCopy(ch orchestrator.Change) string {
 		b.WriteString("```\n")
 	}
 	if b.Len() > promptDiffBytes {
-		return "  agent version:\n" + agentCopy(ch)
+		return "  agent version:\n" + agentCopy(data)
 	}
 	return b.String()
 }
 
 // agentCopy returns the agent's version of the file, capped at promptDiffBytes.
-func agentCopy(ch orchestrator.Change) string {
-	data, err := os.ReadFile(filepath.Join(ch.Worktree, filepath.FromSlash(ch.Path)))
-	if err != nil {
-		return "  (agent version unavailable)\n"
-	}
+func agentCopy(data []byte) string {
 	if bytes.IndexByte(data, 0) >= 0 {
 		return "  (binary, not shown)\n"
 	}

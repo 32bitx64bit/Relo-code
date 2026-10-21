@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -406,7 +407,52 @@ func TestHandlerReceivesRequestFields(t *testing.T) {
 		"arguments": map[string]any{"key": "k1", "action": "send", "to": "bob", "text": "yo"},
 	})
 	want := Request{Key: "k1", Action: "send", To: "bob", Text: "yo"}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v want %+v", got, want)
+	}
+}
+
+func TestSendCarriesPathsAndImportCarriesTheMessage(t *testing.T) {
+	var got Request
+	s := startTest(t, func(_ context.Context, r Request) (any, error) { got = r; return "ok", nil })
+	rpc(t, s, "tools/call", map[string]any{
+		"name":      "agents",
+		"arguments": map[string]any{"key": "k1", "action": "send", "to": "bob", "text": "api is ready", "paths": []string{"api/api.go", "api/doc.md"}},
+	})
+	if want := (Request{Key: "k1", Action: "send", To: "bob", Text: "api is ready", Paths: []string{"api/api.go", "api/doc.md"}}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("send: got %+v want %+v", got, want)
+	}
+	got = Request{}
+	rpc(t, s, "tools/call", map[string]any{
+		"name":      "agents",
+		"arguments": map[string]any{"key": "k1", "action": "import", "message": "peer_1", "paths": []string{"api/api.go"}},
+	})
+	if want := (Request{Key: "k1", Action: "import", Message: "peer_1", Paths: []string{"api/api.go"}}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("import: got %+v want %+v", got, want)
+	}
+}
+
+func TestPathsAreBoundedAndImportNeedsAMessage(t *testing.T) {
+	called := false
+	s := startTest(t, func(_ context.Context, r Request) (any, error) { called = true; return "ok", nil })
+	many := make([]string, MaxPaths+1)
+	for i := range many {
+		many[i] = "f.go"
+	}
+	for name, args := range map[string]map[string]any{
+		"too many paths":    {"key": "k", "action": "send", "to": "bob", "text": "x", "paths": many},
+		"an empty path":     {"key": "k", "action": "send", "to": "bob", "text": "x", "paths": []string{""}},
+		"a very long path":  {"key": "k", "action": "send", "to": "bob", "text": "x", "paths": []string{strings.Repeat("a", maxPathBytes+1)}},
+		"a path with a NUL": {"key": "k", "action": "send", "to": "bob", "text": "x", "paths": []string{"a\x00b"}},
+		"import no message": {"key": "k", "action": "import"},
+		"unknown field":     {"key": "k", "action": "send", "to": "bob", "text": "x", "branch": "main"},
+	} {
+		resp := rpc(t, s, "tools/call", map[string]any{"name": "agents", "arguments": args})
+		if resp["error"] == nil {
+			t.Fatalf("%s: accepted: %+v", name, resp)
+		}
+	}
+	if called {
+		t.Fatal("the handler ran for an invalid call")
 	}
 }

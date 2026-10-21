@@ -96,7 +96,7 @@ func TestResolveConflictsHandlesMissingTrees(t *testing.T) {
 					t.Fatal(err)
 				}
 			})
-			tree, err := core.Coord.WS.EnsureTree("agent_live", false)
+			tree, err := mountTree(core, "agent_live")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -110,6 +110,7 @@ func TestResolveConflictsHandlesMissingTrees(t *testing.T) {
 				}
 			}
 			wantReason := overlapReason
+			virtual := isVirtual(core, first.AgentID)
 			switch scenario {
 			case "released":
 				if err := core.Coord.WS.Release(first.AgentID); err != nil {
@@ -122,6 +123,10 @@ func TestResolveConflictsHandlesMissingTrees(t *testing.T) {
 				core.Coord.WS = workspace.New(dir)
 				first.AgentID = "invalid/agent"
 				wantReason = "invalid agent id"
+				if virtual {
+					// No workspace can belong to that id, so there is nothing to open and nothing to validate.
+					wantReason = "worktree is unavailable"
+				}
 			}
 			s := core.Coord.Current()
 			s.Changes = []orchestrator.Change{
@@ -255,13 +260,19 @@ func TestCheckChangeClassifiesNonTextChanges(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(ch.Worktree, "link.txt")); err != nil {
 		t.Fatal(err)
 	}
+	// A worktree lists the link and the merge refuses it. A virtual workspace never imports a link that leaves the
+	// workspace, so there is nothing to apply (the user was told when it was refused).
+	symlinkWant := "conflicted"
+	if isVirtual(core, ch.AgentID) {
+		symlinkWant = ""
+	}
 	cases := []struct {
 		name, path, kind, want string
 	}{
 		{"added", "new.txt", "added", ""},
 		{"deleted", "gone.txt", "deleted", ""},
 		{"binary", "bin.dat", "modified", ""},
-		{"symlink", "link.txt", "added", "conflicted"},
+		{"symlink", "link.txt", "added", symlinkWant},
 		{"protected", ".git/config", "modified", "conflicted"},
 	}
 	for _, c := range cases {

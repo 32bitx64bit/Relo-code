@@ -148,6 +148,21 @@ CREATE TABLE IF NOT EXISTS events (
   payload TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+-- vworkspaces mirrors the virtual workspaces Git holds (refs/relo/vws/*), for the UI, diagnostics and for noticing
+-- when Git and Relo disagree after a restart. Git is the source of truth: a row is rebuilt from refs, never trusted
+-- over them. The table is additive, so it needs no schema version and older builds ignore it.
+CREATE TABLE IF NOT EXISTS vworkspaces (
+  workspace TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  session_id TEXT NOT NULL DEFAULT '',
+  base_commit TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  tree_oid TEXT NOT NULL,
+  state TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (workspace, agent_id)
+);
 CREATE INDEX IF NOT EXISTS idx_agents_session ON agents(session_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
 CREATE INDEX IF NOT EXISTS idx_gen_agent ON generations(agent_id);
@@ -394,4 +409,62 @@ func (s *Store) Events(session string, limit int) ([]json.RawMessage, error) {
 		out = append(out, json.RawMessage(p))
 	}
 	return out, rows.Err()
+}
+
+// VWorkspace is the stored mirror of one virtual workspace: enough to list it and to compare it with what Git holds.
+// Payload is the workspace record as the engine published it.
+type VWorkspace struct {
+	Workspace  string          `json:"workspace"`
+	AgentID    string          `json:"agentId"`
+	SessionID  string          `json:"sessionId,omitempty"`
+	BaseCommit string          `json:"baseCommit"`
+	Revision   uint64          `json:"revision"`
+	Tree       string          `json:"tree"`
+	State      string          `json:"state"`
+	Payload    json.RawMessage `json:"payload"`
+	Updated    time.Time       `json:"updated"`
+}
+
+// PutVWorkspace inserts or replaces the mirror of one workspace. A write carrying an older revision than the stored
+// one is ignored, so mirrors written out of order by concurrent callers cannot move a workspace backwards.
+func (s *Store) PutVWorkspace(v VWorkspace) error {
+	payload := string(v.Payload)
+	if payload == "" {
+		payload = "{}"
+	}
+	_, err := s.db.Exec(`INSERT INTO vworkspaces(workspace, agent_id, session_id, base_commit, revision, tree_oid, state, payload, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(workspace, agent_id) DO UPDATE SET session_id=excluded.session_id, base_commit=excluded.base_commit,
+		revision=excluded.revision, tree_oid=excluded.tree_oid, state=excluded.state, payload=excluded.payload, updated_at=excluded.updated_at
+		WHERE excluded.base_commit<>vworkspaces.base_commit OR excluded.revision>=vworkspaces.revision`,
+		v.Workspace, v.AgentID, v.SessionID, v.BaseCommit, int64(v.Revision), v.Tree, v.State, payload, time.Now().Unix())
+	return err
+}
+
+// ListVWorkspaces returns the stored workspaces of one repository, oldest first.
+func (s *Store) ListVWorkspaces(workspace string) ([]VWorkspace, error) {
+	rows, err := s.db.Query(`SELECT agent_id, session_id, base_commit, revision, tree_oid, state, payload, updated_at
+		FROM vworkspaces WHERE workspace=? ORDER BY updated_at, agent_id`, workspace)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []VWorkspace
+	for rows.Next() {
+		v := VWorkspace{Workspace: workspace}
+		var rev, at int64
+		var payload string
+		if err := rows.Scan(&v.AgentID, &v.SessionID, &v.BaseCommit, &rev, &v.Tree, &v.State, &payload, &at); err != nil {
+			return nil, err
+		}
+		v.Revision, v.Payload, v.Updated = uint64(rev), json.RawMessage(payload), time.Unix(at, 0)
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// DeleteVWorkspace forgets the mirror of a workspace that was released. Its history stays in the event log.
+func (s *Store) DeleteVWorkspace(workspace, agentID string) error {
+	_, err := s.db.Exec(`DELETE FROM vworkspaces WHERE workspace=? AND agent_id=?`, workspace, agentID)
+	return err
 }

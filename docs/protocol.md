@@ -23,7 +23,7 @@ Every request must use `v: 1`, `kind: "req"`, non-empty `id` and `method`, and o
 
 ## Events
 
-`session.created`, `session.opened`, `session.updated`, `agent.created`, `agent.started`, `agent.activity`, `agent.updated`, `agent.completed`, `agent.failed`, `agent.escalated`, `context.created`, `context.refreshed`, `context.compressed`, `context.replaced`, `context.item.promoted`, `context.item.dropped`, `task.created`, `task.updated`, `task.completed`, `task.failed`, `finding.created`, `finding.verified`, `memory.updated`, `usage.updated`, `changes.updated`, `verification.started`, `verification.completed`, `backend.status`, `permission.asked`, `chat.message`, `chat.delta`, `chat.discard`, `cache.updated`, `log`.
+`session.created`, `session.opened`, `session.updated`, `agent.created`, `agent.started`, `agent.activity`, `agent.updated`, `agent.completed`, `agent.failed`, `agent.escalated`, `context.created`, `context.refreshed`, `context.compressed`, `context.stale`, `context.replaced`, `context.item.promoted`, `context.item.dropped`, `task.created`, `task.updated`, `task.completed`, `task.failed`, `finding.created`, `finding.verified`, `memory.updated`, `usage.updated`, `changes.updated`, `verification.started`, `verification.completed`, `backend.status`, `permission.asked`, `chat.message`, `chat.delta`, `chat.discard`, `cache.updated`, `log`.
 
 `agent.*` events carry a full `AgentInfo` (partial legacy payloads such as `{ "id", "activity" }` still merge). `agent.updated` is emitted after every agent change and is coalesced by the transport.
 
@@ -67,8 +67,14 @@ Clients may coalesce state posts: the VS Code extension posts state at most once
 
 Snapshot payloads may include additive `efficiency: { "preset": "off", "profiles": { "<role>": "<profile id>" } }`.
 
+`context.stale` payload: `{ "agentId": "…", "items": 2, "paths": ["src/a.go"] }`. Emitted when a context boundary (a new generation or a refresh) found file excerpts whose file changed since they were derived; stale replaceable excerpts are dropped and the rest are marked stale in the rendered context.
+
+Virtual workspaces (`relo.workspace.mode` `virtual` or `auto`, see [virtual-workspaces.md](virtual-workspaces.md)) add no IPC methods. Their revisions are written to the event log as `workspace.create|write|delete|rename|chmod|symlink|commit|rebase|capture|discard|dispose` with `{ agentId, revision, kind, paths, tree, commit, at }`, and are not sent to clients. What the workspace layer decides by itself reaches the user as a system chat message: `workspace.fallback` (virtual mode on a repository that rewrites content), `workspace.skipped` (a tool-made file that was not kept), `workspace.virtualReads` (the runtime cannot be routed), `workspace.lost` (edits no longer in Git). A change made from a virtual workspace carries `rev`, the revision it was proposed at.
+
+The peer messaging tool (`agents`, MCP server `relo-agentmsg`) takes `paths` (at most 32 workspace-relative paths, 512 bytes each) on `send` to attach a pointer to files the sender changed, and `{ action: "import", message, paths }` to let the recipient copy those files into its own workspace. Nothing is delivered implicitly.
+
 ## Settings and provider payloads
 
-`settings.apply` params: the `initialize` settings payload (`routingMode`, `contextLimit`, `providers`, `providerKeys`, `modelEfforts`, and any existing key). Core re-applies settings; when provider or key config changed and no agent is running it restarts the OpenCode child. Result: `{ "applied": true, "restartPending": false, "backend": { ... } }`. `providerKeys` values are used for the child env only and are never logged or echoed.
+`settings.apply` params: the `initialize` settings payload (`workspaceMode` `worktree|virtual|auto`, `workspaceMaterialization` `automatic|worktree`, `workspaceVirtualReads` boolean, `routingMode`, `contextLimit`, `providers`, `providerKeys`, `modelEfforts`, and any existing key). Core re-applies settings; when provider or key config changed and no agent is running it restarts the OpenCode child. Result: `{ "applied": true, "restartPending": false, "backend": { ... } }`. `providerKeys` values are used for the child env only and are never logged or echoed.
 
 `providers.discover` params: `{ "kind": "openai" | "anthropic", "baseURL": "…", "apiKey": "…" }`. Result: `{ "models": [ { "id": "…", "name": "…", "context": 0, "output": 0, "efforts": ["…"] } ], "error": "" }`. Upstream failures return `models: []` with a human-readable `error`, not an RPC error.

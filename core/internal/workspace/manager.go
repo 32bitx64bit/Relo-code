@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/relocode/relo/internal/pathglob"
+	"github.com/relocode/relo/internal/vws"
 )
 
 type Snapshot struct {
@@ -40,6 +41,9 @@ type Tree struct {
 	// Direct marks a mutating agent running in the workspace itself because the
 	// workspace is not a Git repository. Changes are applied in place with no undo.
 	Direct bool `json:"direct,omitempty"`
+	// Virtual marks an agent whose files are held as Git objects (a virtual workspace). Path is then where its
+	// directory is made when tools run, and it need not exist between runs.
+	Virtual bool `json:"virtual,omitempty"`
 }
 
 type Manager struct {
@@ -54,6 +58,18 @@ type Manager struct {
 	journalMu            sync.Mutex                    // serialises journal entries and undo
 	ignoreMu             sync.RWMutex                  // guards ignore; apart from mu, which callers hold while running git
 	ignore               []string                      // the user's ignorePaths, set by SetIgnore
+
+	cfgMu        sync.RWMutex
+	cfg          Config
+	routedTools  bool       // the runtime routes every file tool through Relo; false for OpenCode 2.x
+	vmu          sync.Mutex // guards the fields below; never held while running git on an agent's behalf
+	eng          *vws.Engine
+	engErr       error
+	vwsAbsent    bool // Git holds no virtual workspaces, so a worktree-mode run never opens the engine
+	notify       func(kind, message string)
+	observer     func(vws.Event)
+	recovered    vws.RecoverReport
+	fallbackSeen map[string]bool
 }
 
 func New(root string) *Manager {
@@ -229,6 +245,9 @@ func (m *Manager) snapshotIndex(s Snapshot) (index string, env []string, cleanup
 	return index, env, cleanup, nil
 }
 
+// Root is the user's workspace folder.
+func (m *Manager) Root() string { return m.root }
+
 func (m *Manager) Base() Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -263,6 +282,9 @@ func (m *Manager) EnsureTree(agentID string, readOnly bool) (Tree, error) {
 	dir := filepath.Join(m.root, ".relo", "worktrees", agentID)
 	if err := ensureWithin(m.root, dir); err != nil {
 		return Tree{}, fmt.Errorf("unsafe worktree directory: %w", err)
+	}
+	if t, ok, err := m.virtualTreeLocked(agentID, dir); err != nil || ok {
+		return t, err
 	}
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 		return Tree{}, err
@@ -323,6 +345,9 @@ func (m *Manager) Stack(agentID string, patches []string) ([]StackResult, error)
 	if !ok || t.Path == m.root {
 		return nil, fmt.Errorf("no isolated worktree for agent %q", agentID)
 	}
+	if t.Virtual {
+		return m.vStack(agentID, patches)
+	}
 	results := make([]StackResult, len(patches))
 	var failed []string
 	applied := 0
@@ -379,6 +404,9 @@ func (m *Manager) Recut(agentID, base string) (Tree, error) {
 	m.mu.Unlock()
 	if !ok || t.Path == m.root || t.Direct {
 		return Tree{}, fmt.Errorf("no isolated worktree for agent %q", agentID)
+	}
+	if t.Virtual {
+		return m.vRecut(t, base)
 	}
 	if _, err := git(t.Path, "rev-parse", "--show-toplevel"); err != nil {
 		return Tree{}, fmt.Errorf("re-cut %q: %w", agentID, err)
@@ -446,6 +474,9 @@ func (m *Manager) Changed(agentID string) ([]string, error) {
 		}
 		return out, nil
 	}
+	if t.Virtual {
+		return m.vChanged(agentID)
+	}
 	if _, err := git(t.Path, "add", "-A"); err != nil {
 		return nil, err
 	}
@@ -470,6 +501,9 @@ func (m *Manager) Patch(agentID string) (string, error) {
 	if t.Path == m.root {
 		return "", nil
 	}
+	if t.Virtual {
+		return m.vPatch(agentID)
+	}
 	if _, err := git(t.Path, "add", "-A"); err != nil {
 		return "", err
 	}
@@ -487,6 +521,9 @@ func (m *Manager) PatchPath(agentID, rel string) (string, error) {
 	if err := validateRelative(rel); err != nil {
 		return "", err
 	}
+	if t.Virtual {
+		return m.vPatchPath(agentID, rel)
+	}
 	if _, err := git(t.Path, "add", "-A"); err != nil {
 		return "", err
 	}
@@ -500,6 +537,9 @@ func (m *Manager) Discard(agentID, rel string) error {
 	}
 	if err := validateRelative(rel); err != nil {
 		return err
+	}
+	if t.Virtual {
+		return m.vDiscard(agentID, []string{rel})
 	}
 	if _, err := git(t.Path, "cat-file", "-e", t.Base+":"+filepath.ToSlash(rel)); err == nil {
 		_, err = git(t.Path, "restore", "--source="+t.Base, "--staged", "--worktree", "--", ":(literal)"+filepath.ToSlash(rel))
@@ -527,6 +567,9 @@ func (m *Manager) DiscardMany(agentID string, rels []string) error {
 		if err := validateRelative(rel); err != nil {
 			return err
 		}
+	}
+	if t.Virtual {
+		return m.vDiscard(agentID, rels)
 	}
 	var in strings.Builder
 	for _, rel := range rels {
@@ -586,6 +629,9 @@ func (m *Manager) Remove(agentID string) error {
 	if !ok || t.Path == m.root {
 		return nil
 	}
+	if t.Virtual {
+		return m.vRelease(agentID)
+	}
 	_, err := git(m.root, "worktree", "remove", "--force", t.Path)
 	return err
 }
@@ -612,6 +658,9 @@ func (m *Manager) ChangedFiles(agentID string) ([]FileChange, error) {
 	t, ok := m.Tree(agentID)
 	if !ok || t.Path == m.root {
 		return nil, nil
+	}
+	if t.Virtual {
+		return m.vChangedFiles(agentID)
 	}
 	if _, err := git(t.Path, "add", "-A"); err != nil {
 		return nil, err
@@ -681,6 +730,9 @@ func (m *Manager) BaseContent(agentID, rel string) (content []byte, ok bool, err
 	if err := validateRelative(rel); err != nil {
 		return nil, false, err
 	}
+	if t.Virtual {
+		return m.vBaseContent(agentID, rel)
+	}
 	spec := t.Base + ":" + filepath.ToSlash(rel)
 	if _, err := git(m.root, "cat-file", "-e", spec); err != nil {
 		return nil, false, nil
@@ -735,16 +787,22 @@ func (m *Manager) Sweep(keep map[string]bool) (removed int) {
 		return 0
 	}
 	dir := filepath.Join(m.root, ".relo", "worktrees")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return 0
-	}
 	m.mu.Lock()
 	live := map[string]bool{}
 	for id := range m.trees {
 		live[id] = true
 	}
 	m.mu.Unlock()
+	// A virtual workspace has no directory between runs, so it is swept by its refs, not by listing worktrees.
+	removed += m.sweepVirtual(keep, live)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if removed > 0 {
+			m.pruneJournal()
+			m.pruneChangeRefs()
+		}
+		return removed
+	}
 	for _, e := range entries {
 		name := e.Name()
 		if !e.IsDir() || keep[name] || live[name] {
@@ -792,6 +850,9 @@ func (m *Manager) Release(agentID string) error {
 	m.mu.Unlock()
 	if ok && t.Path == m.root {
 		return nil
+	}
+	if (ok && t.Virtual) || (!ok && m.hasVirtual(agentID)) {
+		return m.vRelease(agentID)
 	}
 	dir := filepath.Join(m.root, ".relo", "worktrees", agentID)
 	if _, err := os.Stat(dir); err == nil {

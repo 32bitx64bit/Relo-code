@@ -178,3 +178,42 @@ func TestUndoOfADeletedPathRestoresItsBytes(t *testing.T) {
 		t.Fatalf("restored %q", got)
 	}
 }
+
+// An accept stopped after its file write is retried against a file that already holds the agent's bytes. The retry
+// must not record those bytes as the pre-image, or the undo would have nothing of the user's to restore.
+func TestRetriedJournalKeepsTheOriginalPreImage(t *testing.T) {
+	dir := initRepo(t)
+	write(t, dir, "a.txt", "original\n")
+	run(t, dir, "git", "add", "a.txt")
+	run(t, dir, "git", "commit", "-m", "a")
+	m := New(dir)
+	post := []JournalWrite{{Path: "a.txt", Post: []byte("agent\n"), PostExists: true}}
+
+	first, err := m.JournalChange("chg", post)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, dir, "a.txt", "agent\n") // the write that landed before the stop
+	again, err := m.JournalChange("chg", post)
+	if err != nil || again != first {
+		t.Fatalf("retry = %q (%v), want the first entry %q", again, err, first)
+	}
+	if _, err := m.UndoChange("chg"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "a.txt")); string(got) != "original\n" {
+		t.Fatalf("undo restored %q", got)
+	}
+
+	// A retry before the write, or after the user changed the file, is a new decision and gets its own entry.
+	if second, err := m.JournalChange("chg", post); err != nil || second == first {
+		t.Fatalf("a retry before the write reused the old entry: %q (%v)", second, err)
+	}
+	write(t, dir, "a.txt", "agent\n")
+	write(t, dir, "a.txt", "user edit\n")
+	if third, err := m.JournalChange("chg", post); err != nil {
+		t.Fatal(err)
+	} else if rec, _, _ := m.JournalEntryFor("chg"); rec.Files[0].Pre == "" || third == first {
+		t.Fatalf("an edited file reused an entry: %+v", rec)
+	}
+}

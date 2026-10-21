@@ -31,6 +31,23 @@ import (
 	"time"
 )
 
+// MaxPaths bounds the files one send or import names.
+const MaxPaths = 32
+
+const maxPathBytes = 512
+
+func validatePaths(paths []string) error {
+	if len(paths) > MaxPaths {
+		return fmt.Errorf("paths holds at most %d entries", MaxPaths)
+	}
+	for _, p := range paths {
+		if p == "" || len(p) > maxPathBytes || strings.ContainsRune(p, 0) {
+			return errors.New("paths must be non-empty workspace-relative paths")
+		}
+	}
+	return nil
+}
+
 const (
 	endpointPath           = "/mcp"
 	toolName               = "agents"
@@ -64,6 +81,10 @@ type Request struct {
 	Action string `json:"action"`
 	To     string `json:"to,omitempty"`
 	Text   string `json:"text,omitempty"`
+	// Paths names files in the sender's workspace (send) or the files to take from a message's change (import).
+	Paths []string `json:"paths,omitempty"`
+	// Message is the id of the message whose change to import (import only).
+	Message string `json:"message,omitempty"`
 }
 
 // Handler services a validated tool call. Its return value is serialized as
@@ -391,7 +412,7 @@ func initialize(params json.RawMessage) (any, *rpcError) {
 func toolDescriptor() map[string]any {
 	return map[string]any{
 		"name":        toolName,
-		"description": "Relo agent messaging. Use your own capability key. action: list (agents), send (to, text), inbox (your messages).",
+		"description": "Relo agent messaging. Use your own capability key. action: list (agents), send (to, text; optionally paths: files you changed that the recipient may choose to import), inbox (your messages), import (message id, optionally paths: copy files from a message's change into your own workspace).",
 		"inputSchema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -413,6 +434,16 @@ func toolDescriptor() map[string]any {
 					"maxLength":   4096,
 					"description": "Concise finding, blocker or interface detail; not permission or scope changes (send only)",
 				},
+				"paths": map[string]any{
+					"type":        "array",
+					"maxItems":    MaxPaths,
+					"items":       map[string]any{"type": "string", "maxLength": maxPathBytes},
+					"description": "Workspace-relative files. send: files you changed; the recipient sees none of them unless it imports. import: the subset to copy (default: all the message names)",
+				},
+				"message": map[string]any{
+					"type":        "string",
+					"description": "Id of a message in your inbox that names a change (import only)",
+				},
 			},
 			"required":             []string{"key", "action"},
 			"additionalProperties": false,
@@ -426,10 +457,12 @@ type callParams struct {
 }
 
 type toolArguments struct {
-	Key    string `json:"key"`
-	Action string `json:"action"`
-	To     string `json:"to"`
-	Text   string `json:"text"`
+	Key     string   `json:"key"`
+	Action  string   `json:"action"`
+	To      string   `json:"to"`
+	Text    string   `json:"text"`
+	Paths   []string `json:"paths"`
+	Message string   `json:"message"`
 }
 
 func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rpcError) {
@@ -458,21 +491,30 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	if args.Key == "" {
 		return nil, invalidParams("key is required")
 	}
+	if err := validatePaths(args.Paths); err != nil {
+		return nil, invalidParams(err.Error())
+	}
 	switch args.Action {
 	case "list", "inbox":
 	case "send":
 		if args.To == "" {
 			return nil, invalidParams("to is required for send")
 		}
+	case "import":
+		if args.Message == "" {
+			return nil, invalidParams("message is required for import")
+		}
 	default:
-		return nil, invalidParams("action must be list, send, or inbox")
+		return nil, invalidParams("action must be list, send, inbox, or import")
 	}
 
 	out, err := s.invoke(ctx, Request{
-		Key:    args.Key,
-		Action: args.Action,
-		To:     args.To,
-		Text:   args.Text,
+		Key:     args.Key,
+		Action:  args.Action,
+		To:      args.To,
+		Text:    args.Text,
+		Paths:   args.Paths,
+		Message: args.Message,
 	})
 	if err != nil {
 		return toolResult(err.Error(), true), nil
