@@ -353,6 +353,14 @@ test("provider form output carries only known fields and never an API key", () =
   assert.ok(!JSON.stringify(p).includes("sk-leak"));
 });
 
+test("a model's own API kind survives the provider form, and only when it differs from the provider's", () => {
+  const saved = { id: "router", name: "router", kind: "openai", baseURL: "http://localhost:20128/v1", models: [
+    { id: "cc/claude-sonnet-5-5", name: "cc/claude-sonnet-5-5", kind: "anthropic" }, { id: "gpt", name: "gpt", kind: "openai" }, { id: "odd", name: "odd", kind: "grpc" }] };
+  const f = mainApi.formFromProvider(saved);
+  assert.deepEqual(f.models.map((m) => m.kind), ["anthropic", "openai", ""]);
+  assert.deepEqual(mainApi.providerFromForm(f).models, [{ id: "cc/claude-sonnet-5-5", name: "cc/claude-sonnet-5-5", kind: "anthropic" }, { id: "gpt", name: "gpt" }, { id: "odd", name: "odd" }]);
+});
+
 test("slugify makes a valid provider id", () => {
   assert.equal(mainApi.slugify("My Gateway!"), "my-gateway");
   assert.equal(mainApi.slugify("  --X  "), "x");

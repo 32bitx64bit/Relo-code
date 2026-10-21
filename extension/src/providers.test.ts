@@ -110,6 +110,13 @@ test("sanitizeDiscovered keeps valid models, caps count, drops junk", () => {
   assert.equal(sanitizeDiscovered(Array.from({ length: 5000 }, (_, i) => ({ id: `m${i}` }))).length, 1000);
 });
 
+test("a model's own API kind is kept only as openai or anthropic", () => {
+  const r = validateProvider({ ...good, models: [{ id: "claude", kind: "anthropic" }, { id: "plain" }] });
+  assert.ok(r.ok);
+  if (r.ok) assert.deepEqual(r.provider.models, [{ id: "claude", name: "claude", kind: "anthropic" }, { id: "plain", name: "plain" }]);
+  assert.equal(validateProvider({ ...good, models: [{ id: "x", kind: "grpc" }] }).ok, false);
+});
+
 test("a model's vision flag is kept only as a boolean, and absent stays absent", () => {
   const out = sanitizeDiscovered([{ id: "sees", vision: true }, { id: "blind", vision: false }, { id: "silent" }, { id: "odd", vision: "yes" }]);
   assert.deepEqual(out, [{ id: "sees", name: "sees", vision: true }, { id: "blind", name: "blind", vision: false }, { id: "silent", name: "silent" }]);

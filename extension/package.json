@@ -462,6 +462,11 @@
                     "vision": {
                       "type": "boolean",
                       "description": "Whether the model accepts images. Leave it out to use what the endpoint or OpenCode's catalog reports, or a guess from the model id. Text-only models are declared so to OpenCode and never get the relo_image tool."
+                    },
+                    "kind": {
+                      "type": "string",
+                      "enum": ["openai", "anthropic"],
+                      "description": "The API this model is spoken to in at the provider's base URL, when it differs from the provider's kind. Set anthropic for Claude behind an OpenAI-compatible router such as 9router: the OpenAI format cannot carry the signature on Claude's thinking, so the thinking is dropped between tool steps and Claude re-derives it on every step."
                     }
                   }
                 }

@@ -27,6 +27,8 @@ export interface ProviderModel {
   efforts?: string[];
   /** Whether the model accepts images; absent when nobody said, so the core uses the catalog or a guess from the id. */
   vision?: boolean;
+  /** The API this model is spoken to in when it differs from its provider's: Claude behind an OpenAI-compatible router. */
+  kind?: ProviderKind;
 }
 
 export interface ProviderConfig {
@@ -108,6 +110,10 @@ export function validateModel(m: unknown): ModelCheck {
   if (m.vision != null) {
     if (typeof m.vision !== "boolean") return { ok: false, reason: "model vision must be a boolean" };
     model.vision = m.vision;
+  }
+  if (m.kind != null) {
+    if (m.kind !== "openai" && m.kind !== "anthropic") return { ok: false, reason: "model kind must be openai or anthropic" };
+    model.kind = m.kind;
   }
   return { ok: true, model };
 }

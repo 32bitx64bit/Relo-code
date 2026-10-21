@@ -31,8 +31,13 @@ const (
 // Model is one model a provider serves. Zero Context/Output mean "unknown".
 // Efforts are the reasoning levels the endpoint advertises (empty = unknown/none).
 // Vision says whether the model takes images: set by the user or by discovery, nil when nobody said.
+// Kind is the API this one model is spoken to in when it differs from its provider's, for a router that serves both
+// at one base URL. Claude behind an OpenAI-compatible router needs "anthropic": OpenAI's format has no field for the
+// signature on Claude's thinking, so the router drops that thinking on the next tool step and Claude re-derives
+// everything it had worked out, at full effort, on every step.
 type Model struct {
 	ID        string   `json:"id"`
+	Kind      string   `json:"kind,omitempty"`
 	Name      string   `json:"name,omitempty"`
 	Context   int      `json:"context,omitempty"`
 	Output    int      `json:"output,omitempty"`
@@ -82,6 +87,9 @@ func Validate(ps []Provider) error {
 				return fmt.Errorf("provider %q: duplicate model %q", p.ID, m.ID)
 			}
 			ids[m.ID] = true
+			if m.Kind != "" && m.Kind != KindOpenAI && m.Kind != KindAnthropic {
+				return fmt.Errorf("provider %q model %q: kind must be %q or %q", p.ID, m.ID, KindOpenAI, KindAnthropic)
+			}
 			if m.Context < 0 || m.Output < 0 {
 				return fmt.Errorf("provider %q model %q: negative limit", p.ID, m.ID)
 			}
@@ -107,10 +115,7 @@ func BuildConfig(ps []Provider, keys map[string]string, allowBuiltin bool) (stri
 	}
 	providers := map[string]any{}
 	for _, p := range ps {
-		pkg := pkgOpenAI
-		if p.Kind == KindAnthropic {
-			pkg = pkgAnthropic
-		}
+		pkg := packageFor(p.Kind)
 		options := map[string]any{"baseURL": strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")}
 		if keys[p.ID] != "" {
 			options["apiKey"] = "{env:" + EnvName(p.ID) + "}"
@@ -120,6 +125,10 @@ func BuildConfig(ps []Provider, keys map[string]string, allowBuiltin bool) (stri
 			entry := map[string]any{}
 			if m.Name != "" {
 				entry["name"] = m.Name
+			}
+			// OpenCode speaks to this model through the other SDK with the provider's base URL and key.
+			if m.Kind != "" && m.Kind != p.Kind {
+				entry["provider"] = map[string]any{"npm": packageFor(m.Kind)}
 			}
 			if m.Context > 0 || m.Output > 0 {
 				// OpenCode drops the WHOLE provider ("skipped malformed recognized value") when a limit has
@@ -170,6 +179,13 @@ func BuildConfig(ps []Provider, keys map[string]string, allowBuiltin bool) (stri
 	}
 	b, err := json.Marshal(cfg)
 	return string(b), err
+}
+
+func packageFor(kind string) string {
+	if kind == KindAnthropic {
+		return pkgAnthropic
+	}
+	return pkgOpenAI
 }
 
 // Env returns the child-process environment additions: OPENCODE_CONFIG_CONTENT plus one

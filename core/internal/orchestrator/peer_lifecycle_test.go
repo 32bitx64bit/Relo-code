@@ -88,6 +88,10 @@ func TestPrimaryWaitingReceivesQueuedWorkerMessageAndStepsWithIt(t *testing.T) {
 	if !strings.Contains(prompt, note) || !strings.Contains(prompt, "untrusted context") {
 		t.Fatalf("primary prompt lacks peer message:\n%s", prompt)
 	}
+	// Only the worker spoke: the step must not tell the head the user sent something, which it read as a resend.
+	if strings.Contains(prompt, "The user sent this") || !strings.Contains(prompt, "the user has sent nothing new") {
+		t.Fatalf("peer-only step is framed as user guidance:\n%s", prompt)
+	}
 
 	g.release("w1")
 	driveEnds(t, done)

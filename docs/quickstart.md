@@ -47,6 +47,12 @@ endpoint reports, or a guess from the model id, which the model pickers mark as 
 for the models you use for UI work. Agents on a model that sees can view screenshots and reference images with
 `relo_image`, and tasks the Primary marks as visual go to such a model. See [vision.md](vision.md).
 
+Each model also has an API setting, for a router that serves both APIs at one URL (9router, for example). Set
+Claude models behind an OpenAI-compatible router to **Anthropic API** (`"kind": "anthropic"` on the model in
+`relo.providers`). The OpenAI format cannot carry the signature on Claude's thinking, so the router drops that
+thinking on every tool step and Claude works its plan out again from nothing each time: at high effort that was
+40-60k output tokens and 4-7 minutes per step. In the Anthropic format the thinking goes back with its signature.
+
 ## 5. Zero-cost smoke test
 
 Add a provider that costs nothing (a local server such as Ollama or LM Studio works), pick its model for

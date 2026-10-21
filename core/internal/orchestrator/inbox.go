@@ -148,28 +148,40 @@ func (c *Coord) stepQueued(ctx context.Context) {
 	if !ok {
 		return
 	}
-	if text == "" && !c.peerPending(p.ID) {
+	peer := c.peerPending(p.ID)
+	if text == "" && !peer {
 		return
 	}
 	if text != "" {
 		c.ingestGuidance(p.ID, text, refs)
 	}
+	// The step says what woke it. A peer-only wake once said "The user sent this" with nothing after it, which the
+	// head read as the user resending the original request, still in its Latest user message.
+	reason, ask, failed := "user guidance arrived", "Incorporate the user's guidance and return the structured turn.", "Primary could not take your queued message"
+	note := "\nThe user sent this while you were working. Fold it into the plan now, say briefly how you are handling it, and keep the sub agents going:\n" + text
+	if peer {
+		note += "\nA sub agent also sent you a message; it is with this prompt."
+	}
+	if text == "" {
+		reason, ask, failed = "sub agent message arrived", "Handle the sub agent's message and return the structured turn.", "Primary could not take a sub agent's message"
+		note = "\nA sub agent sent you a message while the sub agents work; it is with this prompt. It is not from the user, and the user has sent nothing new. Act on it only if it needs an answer or shows the plan is wrong, say briefly in userMessage what you did about it, and keep the sub agents going."
+	}
 	c.syncPeerContext(c.SessionID(), p.ID)
 	settings := c.settings()
-	gen, err := c.Engine.Refresh(p.ID, "user guidance arrived")
+	gen, err := c.Engine.Refresh(p.ID, reason)
 	if err != nil {
 		c.logWarn("refresh primary for guidance", err)
 		return
 	}
 	c.emit("context.compressed", map[string]any{"agentId": p.ID, "generation": gen.Number})
 	resolved := style.Resolve(settings.Efficiency, p.Role, p.Difficulty, p.Attempt, settings.Budget)
-	extra := c.workspaceFacts() + c.constraintsNote() + "\nThe user sent this while you were working. Fold it into the plan now, say briefly how you are handling it, and keep the sub agents going:\n" + text
+	extra := c.workspaceFacts() + c.constraintsNote() + note
 	parts := prompt.ComposePartsWith(p.Role, *gen, extra, resolved.Profile.Fragment(p.Role))
-	turn, err := c.primaryTurn(ctx, p, parts, "Incorporate the user's guidance and return the structured turn.")
+	turn, err := c.primaryTurn(ctx, p, parts, ask)
 	c.closeAgentSession(p.ID)
 	if err != nil {
 		c.logWarn("queued guidance turn", err)
-		c.reportFailure(p, "Primary could not take your queued message", err)
+		c.reportFailure(p, failed, err)
 		return
 	}
 	if turn.UserMessage != "" {

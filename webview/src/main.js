@@ -1052,7 +1052,7 @@
   function formFromProvider(p) {
     return {
       editing: p.id, name: p.name || p.id, id: p.id, idTouched: true, kind: p.kind === "anthropic" ? "anthropic" : "openai", baseURL: p.baseURL || "",
-      models: (p.models || []).map((m) => ({ id: m.id, name: m.name || "", context: m.context ? String(m.context) : "", output: m.output ? String(m.output) : "", efforts: (m.efforts || []).join(", "), vision: visionChoice(m.vision) })),
+      models: (p.models || []).map((m) => ({ id: m.id, name: m.name || "", context: m.context ? String(m.context) : "", output: m.output ? String(m.output) : "", efforts: (m.efforts || []).join(", "), vision: visionChoice(m.vision), kind: m.kind === "anthropic" || m.kind === "openai" ? m.kind : "" })),
       busy: false, error: "", note: "", requestId: "",
     };
   }
@@ -1086,6 +1086,7 @@
         if (efforts.length) { out.reasoning = true; out.efforts = efforts; }
         if (m.vision === "yes") out.vision = true;
         else if (m.vision === "no") out.vision = false;
+        if ((m.kind === "anthropic" || m.kind === "openai") && m.kind !== f.kind) out.kind = m.kind;
         return out;
       }),
     };
@@ -1141,6 +1142,7 @@
           <input type="text" id="pm-out-${i}" data-pm-field="output" data-pm-index="${i}" value="${attr(m.output)}" placeholder="output" inputmode="numeric" aria-label="Max output tokens for ${attr(m.id)}"/>
           <input type="text" id="pm-eff-${i}" data-pm-field="efforts" data-pm-index="${i}" value="${attr(m.efforts)}" placeholder="efforts: low, high" aria-label="Reasoning efforts for ${attr(m.id)}"/>
           <select id="pm-vis-${i}" data-pm-field="vision" data-pm-index="${i}" aria-label="Image input for ${attr(m.id)}" title="Whether this model can see images. Auto uses what the endpoint reports or a guess from the id.">${[["", "Images: auto"], ["yes", "Sees images"], ["no", "Text only"]].map(([v, label]) => `<option value="${v}"${(m.vision || "") === v ? " selected" : ""}>${label}</option>`).join("")}</select>
+          <select id="pm-kind-${i}" data-pm-field="kind" data-pm-index="${i}" aria-label="API for ${attr(m.id)}" title="The API this model is spoken to in at the provider's URL. Claude behind an OpenAI-compatible router such as 9router needs Anthropic, or its thinking is dropped between tool steps.">${[["", "API: provider's"], ["anthropic", "Anthropic API"], ["openai", "OpenAI API"]].map(([v, label]) => `<option value="${v}"${(m.kind || "") === v ? " selected" : ""}>${label}</option>`).join("")}</select>
         </div>
       </div>`).join("");
     const more = f.models.length > shown ? `<button type="button" class="text-link" data-pm-all="1">Show all ${f.models.length} models</button>` : "";
@@ -1498,7 +1500,7 @@
       filterModels, defaultActive, navKeys, pickerRows, pickerListHtml, pickerOpenHtml, pickerClosedHtml, pickerCountText, cleanCollapsed,
       effectiveWindow: (cache, max) => withSettings(cache, "", () => effectiveWindow(max)),
       providerFormIssue: (f, existing) => withSettings({ values: { "relo.providers": existing || [] } }, "", () => providerFormIssue(f)),
-      providerFromForm,
+      providerFromForm, formFromProvider,
       slugify,
       orderedMenuCommands: () => MENU_COMMANDS.slice(),
       drawerNames: () => DRAWERS.slice(),
@@ -2105,7 +2107,7 @@
     const addModel = document.getElementById("pf-addmodel");
     if (addModel) addModel.addEventListener("click", () => {
       if (f.models.length >= 200) return;
-      f.models.push({ id: "", name: "", context: "", output: "", efforts: "", vision: "" });
+      f.models.push({ id: "", name: "", context: "", output: "", efforts: "", vision: "", kind: "" });
       providerShowAll = true;
       render();
       const el = document.getElementById("pm-id-" + (f.models.length - 1));
@@ -2165,7 +2167,7 @@
         if (!have.efforts && efforts) have.efforts = efforts;
         if (!have.vision && vision) have.vision = vision;
       } else if (f.models.length < 200) {
-        f.models.push({ id: d.id, name: typeof d.name === "string" && d.name !== d.id ? d.name : "", context: d.context ? String(d.context) : "", output: d.output ? String(d.output) : "", efforts, vision });
+        f.models.push({ id: d.id, name: typeof d.name === "string" && d.name !== d.id ? d.name : "", context: d.context ? String(d.context) : "", output: d.output ? String(d.output) : "", efforts, vision, kind: "" });
         added++;
       }
     }

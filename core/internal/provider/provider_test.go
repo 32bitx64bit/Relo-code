@@ -176,6 +176,55 @@ func TestBuildConfigEnablesOnlyReloProviders(t *testing.T) {
 	}
 }
 
+// Claude behind an OpenAI-compatible router is declared kind anthropic on the model: OpenCode then uses Anthropic's
+// SDK for that model alone, with the provider's base URL and key, and the model's signed thinking survives tool steps.
+func TestBuildConfigSpeaksAModelsOwnKind(t *testing.T) {
+	ps := []Provider{{ID: "router", Kind: KindOpenAI, BaseURL: "http://localhost:20128/v1", Models: []Model{
+		{ID: "cc/claude-sonnet-5-5", Kind: KindAnthropic}, {ID: "gpt", Kind: KindOpenAI}, {ID: "plain"}}}}
+	raw, err := BuildConfig(ps, map[string]string{"router": "k"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Provider map[string]struct {
+			NPM     string `json:"npm"`
+			Options struct {
+				BaseURL string `json:"baseURL"`
+				APIKey  string `json:"apiKey"`
+			} `json:"options"`
+			Models map[string]struct {
+				Provider *struct {
+					NPM string `json:"npm"`
+				} `json:"provider"`
+			} `json:"models"`
+		} `json:"provider"`
+	}
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	p := cfg.Provider["router"]
+	if p.NPM != pkgOpenAI || p.Options.BaseURL != "http://localhost:20128/v1" || p.Options.APIKey == "" {
+		t.Fatalf("provider = %+v, want the OpenAI SDK with the router's URL and key", p)
+	}
+	if m := p.Models["cc/claude-sonnet-5-5"]; m.Provider == nil || m.Provider.NPM != pkgAnthropic {
+		t.Errorf("claude model override = %+v, want %s", m.Provider, pkgAnthropic)
+	}
+	for _, id := range []string{"gpt", "plain"} {
+		if m := p.Models[id]; m.Provider != nil {
+			t.Errorf("%s: override %+v for a model that speaks its provider's API", id, m.Provider)
+		}
+	}
+	before := Fingerprint(ps, nil)
+	ps[0].Models[2].Kind = KindAnthropic
+	if Fingerprint(ps, nil) == before {
+		t.Error("fingerprint ignores a model's kind, so changing it would not restart the backend")
+	}
+	ps[0].Models[2].Kind = "grpc"
+	if err := Validate(ps); err == nil {
+		t.Error("an unknown model kind was accepted")
+	}
+}
+
 func TestBuildConfigDeclaresImageInput(t *testing.T) {
 	yes, no := true, false
 	ps := []Provider{{ID: "p", Kind: KindOpenAI, BaseURL: "http://localhost:1/v1", Models: []Model{
