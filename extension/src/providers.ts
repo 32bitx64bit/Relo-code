@@ -25,6 +25,8 @@ export interface ProviderModel {
   output?: number;
   reasoning?: boolean;
   efforts?: string[];
+  /** Whether the model accepts images; absent when nobody said, so the core uses the catalog or a guess from the id. */
+  vision?: boolean;
 }
 
 export interface ProviderConfig {
@@ -102,6 +104,10 @@ export function validateModel(m: unknown): ModelCheck {
       efforts.push(e);
     }
     model.efforts = efforts;
+  }
+  if (m.vision != null) {
+    if (typeof m.vision !== "boolean") return { ok: false, reason: "model vision must be a boolean" };
+    model.vision = m.vision;
   }
   return { ok: true, model };
 }

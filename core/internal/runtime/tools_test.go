@@ -194,3 +194,16 @@ func contains(scope []string, action string) bool {
 	}
 	return false
 }
+
+func TestImageToolIsNeverGrantedToThePrimary(t *testing.T) {
+	primary := WithImages(ToolsFor(RolePrimary, "build", false), RolePrimary, true)
+	if primary[ReloImageTool] {
+		t.Fatalf("the Primary was given %s: %v", ReloImageTool, primary)
+	}
+	if worker := WithImages(ToolsFor("worker", "build", true), "worker", true); !worker[ReloImageTool] {
+		t.Fatalf("a worker on a model that may see was not given %s", ReloImageTool)
+	}
+	if blind := WithImages(ToolsFor("worker", "build", true), "worker", false); blind[ReloImageTool] {
+		t.Fatalf("a worker on a text-only model was given %s", ReloImageTool)
+	}
+}

@@ -197,6 +197,10 @@ export interface ModelInfo {
   context?: number;
   output?: number;
   efforts?: string[];
+  /** "yes" or "no" when known; absent when unknown. */
+  vision?: "yes" | "no";
+  /** Where vision came from: "configured", "catalog" or "name" (a guess from the model id). */
+  visionSource?: "configured" | "catalog" | "name";
 }
 
 export interface RoutingState {

@@ -30,8 +30,8 @@ Exit code is non-zero only on hard failures (Go, Node, OpenCode, extension missi
 
 Settings (Ctrl+,, search `relo.`):
 
-- `relo.primaryModel`, `relo.tier1Model`, `relo.tier2Model` (format `provider/model`). Tier 2 is the cheap one: trivial and easy tasks and probes go there, medium and hard tasks to Tier 1, expert tasks to the Primary model.
-- `relo.routing.byDifficulty`, `relo.routing.escalate`
+- `relo.primaryModel`, `relo.tier1Model`, `relo.tier2Model` (format `provider/model`). Tier 2 is the cheap one: trivial and easy tasks and probes go there, medium, complex and hard tasks to Tier 1, expert tasks to the Primary model.
+- `relo.routing.byDifficulty` (advanced mode: one model per level `trivial|easy|medium|complex|hard|expert`; `complex` falls back to the `hard` model when unset), `relo.routing.escalate`
 - Token saving: `relo.efficiency.preset` (Saving level: `off|auto|max`), `relo.efficiency.voice` (Reply brevity), `relo.efficiency.craft` (Minimal code)
 - `relo.runtime` (`opencode` or `mock`), `relo.openCode.path`
 
@@ -41,6 +41,11 @@ Relo runs its own private OpenCode, separate from any OpenCode you have installe
 OpenCode config, sessions or logins, and OpenCode's built-in providers are switched off. The only models you see
 are the ones you add under Settings, Providers (an OpenAI- or Anthropic-compatible endpoint plus an API key).
 Relo keeps OpenCode's state in `~/.config/relo-code/opencode`. Your own OpenCode is never touched.
+
+Each model in the provider form has an Images setting: Auto, Sees images, or Text only. Auto uses what the
+endpoint reports, or a guess from the model id, which the model pickers mark as "guessed from the name". Set it
+for the models you use for UI work. Agents on a model that sees can view screenshots and reference images with
+`relo_image`, and tasks the Primary marks as visual go to such a model. See [vision.md](vision.md).
 
 ## 5. Zero-cost smoke test
 

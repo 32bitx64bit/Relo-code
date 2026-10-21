@@ -454,10 +454,11 @@
     return capped.shown.map((t) => {
       const deps = (t.dependencies || []).length;
       const diff = t.difficulty ? `<span class="badge" title="Difficulty">${esc(t.difficulty)}</span>` : "";
+      const eyes = t.vision ? `<span class="codicon codicon-eye" title="Needs a model that can see images" aria-label="Vision task"></span>` : "";
       return `<div class="drawer-row" role="treeitem" aria-level="1">
         ${mark(t.status)}
         <span class="grow" title="${esc(t.description || "")}">${esc(t.title || t.id)}</span>
-        ${diff}
+        ${eyes}${diff}
         ${deps ? `<span class="mini" title="Dependencies">${deps} dep${deps === 1 ? "" : "s"}</span>` : ""}
       </div>`;
     }).join("") + capped.toggle;
@@ -810,7 +811,7 @@
   const SIMPLE_ONLY = ["relo.tier1Model", "relo.tier2Model"];
   const ADVANCED_ONLY = ["relo.routing.byDifficulty"];
 
-  const DIFFICULTY_LEVELS = ["trivial", "easy", "medium", "hard", "expert"];
+  const DIFFICULTY_LEVELS = ["trivial", "easy", "medium", "complex", "hard", "expert"];
 
   function titleCase(s) {
     return String(s ?? "").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -856,13 +857,22 @@
     return (efforts || []).map((e) => EFFORT_SHORT[e] || e).join("/");
   }
 
-  // "ctx 200k · low/med/high", or "" when nothing is known.
+  // "ctx 200k · low/med/high · images", or "" when nothing is known.
   function modelHint(m) {
     if (!m) return "";
     const parts = [];
     if (m.context > 0) parts.push("ctx " + fmtTokens(m.context));
     if (m.efforts && m.efforts.length) parts.push(effortList(m.efforts));
+    if (m.vision === "yes") parts.push("images");
+    else if (m.vision === "no") parts.push("text only");
     return parts.join(" · ");
+  }
+
+  // What the model detail line says about image input, including when the answer is only a guess from the id.
+  function visionText(m) {
+    if (!m || (m.vision !== "yes" && m.vision !== "no")) return "images unknown";
+    const what = m.vision === "yes" ? "sees images" : "text only, cannot see images";
+    return m.visionSource === "name" ? `${what} (guessed from the name)` : what;
   }
 
   function contextLimit() {
@@ -1003,6 +1013,7 @@
     } else {
       bits.push("window unknown");
     }
+    bits.push(visionText(m));
     let effort = "";
     if (m && m.efforts && m.efforts.length) {
       const map = valueOf("relo.models.efforts") && typeof valueOf("relo.models.efforts") === "object" ? valueOf("relo.models.efforts") : {};
@@ -1041,9 +1052,14 @@
   function formFromProvider(p) {
     return {
       editing: p.id, name: p.name || p.id, id: p.id, idTouched: true, kind: p.kind === "anthropic" ? "anthropic" : "openai", baseURL: p.baseURL || "",
-      models: (p.models || []).map((m) => ({ id: m.id, name: m.name || "", context: m.context ? String(m.context) : "", output: m.output ? String(m.output) : "", efforts: (m.efforts || []).join(", ") })),
+      models: (p.models || []).map((m) => ({ id: m.id, name: m.name || "", context: m.context ? String(m.context) : "", output: m.output ? String(m.output) : "", efforts: (m.efforts || []).join(", "), vision: visionChoice(m.vision) })),
       busy: false, error: "", note: "", requestId: "",
     };
+  }
+
+  // A provider model's vision flag as the form's select value: "yes", "no", or "" for automatic.
+  function visionChoice(v) {
+    return v === true ? "yes" : v === false ? "no" : "";
   }
 
   function parseCount(v) {
@@ -1068,6 +1084,8 @@
         if (c) out.context = c;
         if (o) out.output = o;
         if (efforts.length) { out.reasoning = true; out.efforts = efforts; }
+        if (m.vision === "yes") out.vision = true;
+        else if (m.vision === "no") out.vision = false;
         return out;
       }),
     };
@@ -1122,6 +1140,7 @@
           <input type="text" id="pm-ctx-${i}" data-pm-field="context" data-pm-index="${i}" value="${attr(m.context)}" placeholder="context" inputmode="numeric" aria-label="Context window tokens for ${attr(m.id)}"/>
           <input type="text" id="pm-out-${i}" data-pm-field="output" data-pm-index="${i}" value="${attr(m.output)}" placeholder="output" inputmode="numeric" aria-label="Max output tokens for ${attr(m.id)}"/>
           <input type="text" id="pm-eff-${i}" data-pm-field="efforts" data-pm-index="${i}" value="${attr(m.efforts)}" placeholder="efforts: low, high" aria-label="Reasoning efforts for ${attr(m.id)}"/>
+          <select id="pm-vis-${i}" data-pm-field="vision" data-pm-index="${i}" aria-label="Image input for ${attr(m.id)}" title="Whether this model can see images. Auto uses what the endpoint reports or a guess from the id.">${[["", "Images: auto"], ["yes", "Sees images"], ["no", "Text only"]].map(([v, label]) => `<option value="${v}"${(m.vision || "") === v ? " selected" : ""}>${label}</option>`).join("")}</select>
         </div>
       </div>`).join("");
     const more = f.models.length > shown ? `<button type="button" class="text-link" data-pm-all="1">Show all ${f.models.length} models</button>` : "";
@@ -2086,7 +2105,7 @@
     const addModel = document.getElementById("pf-addmodel");
     if (addModel) addModel.addEventListener("click", () => {
       if (f.models.length >= 200) return;
-      f.models.push({ id: "", name: "", context: "", output: "", efforts: "" });
+      f.models.push({ id: "", name: "", context: "", output: "", efforts: "", vision: "" });
       providerShowAll = true;
       render();
       const el = document.getElementById("pm-id-" + (f.models.length - 1));
@@ -2139,12 +2158,14 @@
       if (!d || typeof d.id !== "string") continue;
       const have = f.models.find((m) => m.id === d.id);
       const efforts = Array.isArray(d.efforts) ? d.efforts.join(", ") : "";
+      const vision = visionChoice(d.vision);
       if (have) {
         if (!have.context && d.context) have.context = String(d.context);
         if (!have.output && d.output) have.output = String(d.output);
         if (!have.efforts && efforts) have.efforts = efforts;
+        if (!have.vision && vision) have.vision = vision;
       } else if (f.models.length < 200) {
-        f.models.push({ id: d.id, name: typeof d.name === "string" && d.name !== d.id ? d.name : "", context: d.context ? String(d.context) : "", output: d.output ? String(d.output) : "", efforts });
+        f.models.push({ id: d.id, name: typeof d.name === "string" && d.name !== d.id ? d.name : "", context: d.context ? String(d.context) : "", output: d.output ? String(d.output) : "", efforts, vision });
         added++;
       }
     }

@@ -52,7 +52,7 @@ func (c *Coord) StartMessages() error {
 	if c.messageServer != nil {
 		return nil
 	}
-	var opts []agentmsg.Option
+	opts := []agentmsg.Option{agentmsg.WithImages(c.imageRequest)}
 	if c.CanvasEnabled {
 		opts = append(opts, agentmsg.WithCanvas(c.canvasRequest))
 	}

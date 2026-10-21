@@ -1,10 +1,15 @@
 package opencode
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -34,9 +39,32 @@ const (
 	coordinationTxt = "COORDINATION-MARKER-7f3a"
 	steerMarker     = "STEER-MARKER-9c1d"
 	turnWait        = 30 * time.Second
-	// canvasScreenshotPNG is a 1x1 PNG the MCP endpoint lifts out of a capture result into an image content block.
-	canvasScreenshotPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWQAAAABJRU5ErkJggg=="
 )
+
+// canvasScreenshotPNG is a real 64x48 RGB PNG the MCP endpoint lifts out of a capture result into an image content
+// block. OpenCode drops an image it cannot decode (a 1x1 grey PNG was replaced with "[1 image omitted: could not be
+// decoded.]"), so the fixture must be one a model could actually look at.
+var canvasScreenshotPNG = testPNG(64, 48)
+
+// testPNG encodes a w×h RGB gradient as base64.
+func testPNG(w, h int) string {
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.SetRGBA(x, y, color.RGBA{uint8(x * 4), uint8(y * 5), 160, 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		panic(err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+// hasImagePart reports whether a model request carries the image as a data URL, not just its MIME type in some text.
+func hasImagePart(body, mime, data string) bool {
+	return strings.Contains(body, "data:"+mime+";base64,"+data[:64])
+}
 
 type agentRequest struct {
 	body  string
@@ -219,6 +247,12 @@ func (l *eventLog) snapshot() (tools []string, interrupted bool, doneCount int) 
 // state. Cleanups run in reverse order, so the process stops before the model server closes.
 func startMessagingE2E(t *testing.T, model http.Handler) (context.Context, runtime.AgentRuntime, string) {
 	t.Helper()
+	return startMessagingE2EWith(t, model, provider.Model{ID: "claude-fake", Context: 200000, Output: 8000})
+}
+
+// startMessagingE2EWith is startMessagingE2E with the fake provider serving the given model.
+func startMessagingE2EWith(t *testing.T, model http.Handler, served provider.Model) (context.Context, runtime.AgentRuntime, string) {
+	t.Helper()
 	if os.Getenv("RELO_E2E_OPENCODE") == "" {
 		t.Skip("set RELO_E2E_OPENCODE=1 to run against the installed opencode")
 	}
@@ -229,7 +263,7 @@ func startMessagingE2E(t *testing.T, model http.Handler) (context.Context, runti
 	srv := httptest.NewServer(model)
 	t.Cleanup(srv.Close)
 	work := t.TempDir()
-	ps := []provider.Provider{{ID: "fake", Name: "fake", Kind: provider.KindOpenAI, BaseURL: srv.URL + "/v1", Models: []provider.Model{{ID: "claude-fake", Context: 200000, Output: 8000}}}}
+	ps := []provider.Provider{{ID: "fake", Name: "fake", Kind: provider.KindOpenAI, BaseURL: srv.URL + "/v1", Models: []provider.Model{served}}}
 	penv, err := provider.Env(ps, map[string]string{"fake": "k"}, false)
 	if err != nil {
 		t.Fatal(err)
@@ -574,7 +608,7 @@ func TestBuilderCanvasCaptureReachesTheExtension(t *testing.T) {
 	default:
 		t.Fatal("the builder's capture never reached the extension stub")
 	}
-	if !strings.Contains(requests[1].body, "image/png") {
-		t.Fatalf("capture image did not reach model: %.500s", requests[1].body)
+	if !hasImagePart(requests[1].body, "image/png", canvasScreenshotPNG) {
+		t.Fatalf("capture pixels did not reach the model as an image part: %.800s", requests[1].body)
 	}
 }

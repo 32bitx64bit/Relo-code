@@ -106,7 +106,7 @@ func (c *Coord) spawnSoft(t taskgraph.Task, role agent.Role, soft []scheduler.So
 	mutating := agent.Mutating(role) && mode == ModeBuild
 	model := t.Model
 	if model == "" {
-		model = c.modelForDifficulty(role, t.Difficulty)
+		model = c.modelForTask(role, t.Difficulty, t.Vision)
 	}
 	a := c.Agents.Create(agent.Agent{
 		ParentID: parent.ID, Role: role, Title: t.Title, TaskID: t.ID,
@@ -1311,7 +1311,7 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 		dynamic += "\n\n"
 	}
 	promptText := dynamic + ask
-	canvasTools := false
+	canvasTools, imageTools := false, false
 	// The canvas tool is scoped to the role: the policy names the actions this agent may use, and the core refuses
 	// any action outside it (core/internal/orchestrator/canvas.go), so the turn never offers more than it may use.
 	canvasActions := agent.CanvasActionsForRole(a.Role)
@@ -1328,6 +1328,13 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 			return "", err
 		}
 		promptText += "\n\nRelo agent messaging is available through relo_agents. Your private key is " + key + ". Use action list for live peer IDs, send with to/text, and inbox to acknowledge received messages. Never copy your key into messages or reports."
+		if a.Role != agent.Primary {
+			// relo_image is offered unless the model is known to be text only; that model is told it cannot see
+			// instead, so it reports a visual check as unavailable rather than claiming one.
+			text, offered := imageGuidance(c.settings().VisionFor(a.Model))
+			imageTools = offered
+			promptText += "\n\n" + text
+		}
 		if c.canvasOn() && len(canvasActions) > 0 {
 			canvasTools = true
 			// The canvas guidance follows the role: a builder role authors artifacts, every other role may only
@@ -1340,6 +1347,7 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 		promptText += "\n\n" + peerText
 	}
 	tools := runtime.WithCanvas(runtime.ToolsFor(string(a.Role), string(sess.Mode), agent.Mutating(a.Role) && sess.Mode == ModeBuild), canvasTools, canvasActions)
+	tools = runtime.WithImages(tools, string(a.Role), imageTools)
 	send := func(text string) error {
 		return rt.SendTask(ctx, sid, runtime.AgentTask{
 			AgentID: a.ID, Role: string(a.Role), Model: model, Provider: prov,

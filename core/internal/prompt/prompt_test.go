@@ -55,7 +55,7 @@ func TestComposeCompatibilityAndPrimaryDifficulty(t *testing.T) {
 	}
 	item := PrimarySchema["properties"].(map[string]any)["tasks"].(map[string]any)["items"].(map[string]any)
 	difficulty := item["properties"].(map[string]any)["difficulty"].(map[string]any)
-	if got := difficulty["enum"].([]string); strings.Join(got, ",") != "trivial,easy,medium,hard,expert" {
+	if got := difficulty["enum"].([]string); strings.Join(got, ",") != "trivial,easy,medium,complex,hard,expert" {
 		t.Fatalf("difficulty enum = %v", got)
 	}
 }
@@ -109,7 +109,7 @@ func TestSchemaCapsAndRolePromptSizes(t *testing.T) {
 		prompt := For(role)
 		t.Logf("role=%s chars=%d", role, len(prompt))
 		// For already includes Shared; count what is actually sent rather than charging Shared twice.
-		if total := len(prompt); total > 5600 {
+		if total := len(prompt); total > 6200 {
 			t.Errorf("%s prompt too large: %d chars", role, total)
 		}
 	}
@@ -146,6 +146,23 @@ func TestPrimaryPromptSplitsWorkWithoutCollisions(t *testing.T) {
 		if !strings.Contains(p, rule) {
 			t.Errorf("Primary prompt missing planning rule %q", rule)
 		}
+	}
+}
+
+func TestPrimaryPromptRatesTheTaskNotTheFeature(t *testing.T) {
+	p := For(agent.Primary)
+	for _, rule := range []string{
+		"rate what this task's agent must still work out, not the feature or project",
+		"When unsure, pick lower",
+		"- complex: ",
+		"A new feature is not hard by itself",
+	} {
+		if !strings.Contains(p, rule) {
+			t.Errorf("Primary prompt missing difficulty rule %q", rule)
+		}
+	}
+	if strings.Contains(p, "tier-1 for") {
+		t.Error("Primary prompt still routes by tier name; difficulty picks the model")
 	}
 }
 
@@ -203,5 +220,16 @@ func TestCanvasGuidanceCoversSemanticPlanningRules(t *testing.T) {
 		if !strings.Contains(CanvasGuidance, rule) {
 			t.Errorf("canvas guidance missing rule %q", rule)
 		}
+	}
+}
+
+func TestPrimarySchemaCanAskForAModelThatSees(t *testing.T) {
+	props := PrimarySchema["properties"].(map[string]any)["tasks"].(map[string]any)["items"].(map[string]any)["properties"].(map[string]any)
+	field, ok := props["vision"].(map[string]any)
+	if !ok || field["type"] != "boolean" {
+		t.Fatalf("task schema has no boolean vision field: %v", props["vision"])
+	}
+	if d, _ := field["description"].(string); !strings.Contains(d, "model that can see") || !strings.Contains(d, "screenshot") {
+		t.Fatalf("vision field does not say when to set it: %q", d)
 	}
 }

@@ -35,6 +35,7 @@ type Task struct {
 	Children    []string  `json:"children"`
 	Workspace   string    `json:"workspace"`
 	Difficulty  string    `json:"difficulty"`
+	Vision      bool      `json:"vision,omitempty"` // the agent must look at images; routing prefers a model that sees
 	Attempts    int       `json:"attempts"`
 	Model       string    `json:"model"`
 	Role        string    `json:"role"`

@@ -1138,7 +1138,7 @@ function escapeHtml(value: string): string {
 }
 
 async function configureDifficultyRouting(): Promise<void> {
-  const levels = ["trivial", "easy", "medium", "hard", "expert"];
+  const levels = ["trivial", "easy", "medium", "complex", "hard", "expert"];
   const config = vscode.workspace.getConfiguration("relo");
   const routing = { ...(config.get<Record<string, string>>("routing.byDifficulty") ?? {}) };
   const models = state.backend.models.map((m) => `${m.provider}/${m.id}`);

@@ -270,6 +270,9 @@ type Coord struct {
 	// log can prove which role called canvas. It never receives artifact content; guarded by canvasAuditMu.
 	canvasAuditFn   func(CanvasAudit)
 	canvasAuditMu   sync.RWMutex
+	imageMu         sync.Mutex
+	imageRate       map[string][]time.Time // agent ID -> recent relo_image call times; guarded by imageMu
+	imageSlots      chan struct{}          // bounds images decoded at once; created lazily under imageMu
 	escalations     map[string]string
 	failures        map[string]string // task ID -> why its last attempt failed, for the attempt that replaces it; guarded by mu
 	directSem       chan struct{}     // guarded by mu; one mutating agent at a time in direct mode

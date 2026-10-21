@@ -5,6 +5,7 @@ import (
 
 	"github.com/relocode/relo/internal/provider"
 	"github.com/relocode/relo/internal/runtime"
+	"github.com/relocode/relo/internal/vision"
 )
 
 // models lists the runtime catalog with user-defined provider models reconciled against Relo config.
@@ -28,9 +29,18 @@ func (a *App) models(ctx context.Context) ([]runtime.Model, error) {
 // data, so those values are replaced: configured fields win, unknown stay zero/empty, and only then does a
 // same-ID model from a built-in provider donate missing fields. A model with reasoning off and no declared
 // efforts gets none of OpenCode's synthetic variants. models is not mutated.
+//
+// Image support is resolved the same way (internal/vision): configured, then a built-in model with the same id,
+// then a guess from the id. OpenCode's own answer for a custom model is ignored, because it says ["text","image"]
+// for every model that declares nothing. A built-in model the catalog says nothing about gets the guess too.
 func reconcile(models []runtime.Model, ps []provider.Provider) []runtime.Model {
 	if len(ps) == 0 {
-		return models
+		out := make([]runtime.Model, len(models))
+		copy(out, models)
+		for i := range out {
+			guessVision(&out[i])
+		}
+		return out
 	}
 	conf := map[string]provider.Model{}
 	for _, p := range ps {
@@ -48,8 +58,21 @@ func reconcile(models []runtime.Model, ps []provider.Provider) []runtime.Model {
 		m := &out[i]
 		c, ok := conf[m.Provider+"/"+m.ID]
 		if !ok {
+			if custom[m.Provider] {
+				m.Vision, m.VisionSource = vision.Resolve(nil, vision.Unknown, m.ID)
+			} else {
+				guessVision(m)
+			}
 			continue
 		}
+		catalog := vision.Unknown
+		for _, d := range models {
+			if d.ID == m.ID && !custom[d.Provider] && d.Vision != vision.Unknown {
+				catalog = d.Vision
+				break
+			}
+		}
+		m.Vision, m.VisionSource = vision.Resolve(c.Vision, catalog, m.ID)
 		m.Context, m.Output = c.Context, c.Output
 		m.Efforts = nil
 		if len(c.Efforts) > 0 {
@@ -76,4 +99,14 @@ func reconcile(models []runtime.Model, ps []provider.Provider) []runtime.Model {
 		}
 	}
 	return out
+}
+
+// guessVision fills an unknown answer from the model id.
+func guessVision(m *runtime.Model) {
+	if m.Vision != vision.Unknown {
+		return
+	}
+	if m.Vision = vision.Guess(m.ID); m.Vision != vision.Unknown {
+		m.VisionSource = vision.SourceName
+	}
 }

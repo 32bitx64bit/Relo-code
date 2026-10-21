@@ -60,7 +60,7 @@ Optional Fewer agents (off by default): one line telling Primary to merge or dro
 
 Modifiers, applied in order:
 1. difficulty `trivial|easy`: Reply brevity +1 notch (cap Telegraphic), budget x0.5 (Primary exempt; primary keeps its 24k).
-2. difficulty `hard`: no change. `expert`: Reply brevity capped at Short, Minimal code capped at Light (do not squeeze reasoning).
+2. difficulty `medium|complex|hard`: no change. `expert`: Reply brevity capped at Short, Minimal code capped at Light (do not squeeze reasoning).
 3. attempt >= 2 (escalation or retry): Reply brevity -1 notch. Terseness may have hurt; model escalates too.
 Aggressive also shrinks budgets x0.75 except Primary (primary keeps 24k). Primary is exempt from all budget scaling; caps still apply.
 

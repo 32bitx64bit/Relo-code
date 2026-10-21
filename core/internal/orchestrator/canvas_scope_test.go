@@ -97,6 +97,8 @@ func TestCanvasScopeBuilderIsUnchanged(t *testing.T) {
 	promptText, tools := canvasScopeTurn(t, agent.Worker, true)
 	want := runtime.ToolsFor(string(agent.Worker), string(ModeBuild), true)
 	want[runtime.ReloCanvasTool] = true
+	// relo_image does not depend on Canvas: it is offered because this fixture's model is not known to be text only.
+	want = runtime.WithImages(want, string(agent.Worker), true)
 	if !reflect.DeepEqual(tools, want) {
 		t.Fatalf("builder tool exposure changed:\n got %v\nwant %v", tools, want)
 	}

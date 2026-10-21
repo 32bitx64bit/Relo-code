@@ -47,6 +47,16 @@ func (c *Coord) modelForDifficulty(role agent.Role, difficulty string) string {
 	return model
 }
 
+// modelForTask is modelForDifficulty for a task that may need to look at images. A vision task whose model is not
+// known to see moves along the routing ladder to the nearest model that does (routing.Config.Seeing).
+func (c *Coord) modelForTask(role agent.Role, difficulty string, needsVision bool) string {
+	model := c.modelForDifficulty(role, difficulty)
+	if !needsVision {
+		return model
+	}
+	return c.routeConfig().Seeing(model, c.settings().Sees)
+}
+
 func (c *Coord) routeConfig() routing.Config {
 	cfg := c.routing()
 	if cfg.Primary == "" && cfg.Tier1 == "" && cfg.Tier2 == "" {

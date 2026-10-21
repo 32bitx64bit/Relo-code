@@ -362,8 +362,7 @@ li{margin:2px 0;font-size:13px;}
 .pm-top{display:flex;gap:2px;align-items:center;}
 .pm-top input{flex:1;min-width:0;font-size:12px;}
 .pm-grid{display:grid;grid-template-columns:1fr 1fr;gap:3px;}
-.pm-grid input{min-width:0;width:100%;font-size:12px;}
-.pm-grid input:last-child{grid-column:1 / 3;}
+.pm-grid input,.pm-grid select{min-width:0;width:100%;font-size:12px;}
 button:disabled{opacity:.5;cursor:default;}
 .drawer-row.dim{opacity:.6;}
 /* session history page */

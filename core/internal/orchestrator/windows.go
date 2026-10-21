@@ -5,6 +5,7 @@ import (
 
 	"github.com/relocode/relo/internal/routing"
 	"github.com/relocode/relo/internal/runtime"
+	"github.com/relocode/relo/internal/vision"
 )
 
 // RouteConfig builds the routing config for these settings.
@@ -48,6 +49,18 @@ func (s Settings) CompactAfter(model string) int {
 		return 0
 	}
 	return max(1, int(float64(w)*s.CompactAt))
+}
+
+// VisionFor says whether model takes images: vision.Yes, vision.No, or vision.Unknown when the catalog does not say
+// or does not list the model.
+func (s Settings) VisionFor(model string) string {
+	return s.Models[strings.TrimSpace(model)].Vision
+}
+
+// Sees reports whether model is known to take images. Unknown does not count: routing prefers a model that is known
+// to see over one that might.
+func (s Settings) Sees(model string) bool {
+	return s.VisionFor(model) == vision.Yes
 }
 
 // EffortFor returns the reasoning effort to request for model, or "" for the model default. The pick must be

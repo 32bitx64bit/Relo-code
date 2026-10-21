@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/relocode/relo/internal/vision"
 )
 
 const (
@@ -28,6 +30,7 @@ const (
 
 // Model is one model a provider serves. Zero Context/Output mean "unknown".
 // Efforts are the reasoning levels the endpoint advertises (empty = unknown/none).
+// Vision says whether the model takes images: set by the user or by discovery, nil when nobody said.
 type Model struct {
 	ID        string   `json:"id"`
 	Name      string   `json:"name,omitempty"`
@@ -35,6 +38,7 @@ type Model struct {
 	Output    int      `json:"output,omitempty"`
 	Reasoning bool     `json:"reasoning,omitempty"`
 	Efforts   []string `json:"efforts,omitempty"`
+	Vision    *bool    `json:"vision,omitempty"`
 }
 
 type Provider struct {
@@ -133,6 +137,16 @@ func BuildConfig(ps []Provider, keys map[string]string, allowBuiltin bool) (stri
 			}
 			if m.Reasoning || len(m.Efforts) > 0 {
 				entry["reasoning"] = true
+			}
+			// OpenCode assumes every custom model takes images. A model known (or guessed) to be text only is
+			// declared so, and OpenCode then replaces images in its context with a note instead of sending the
+			// provider image parts it would reject. Unknown models keep OpenCode's default.
+			if status, _ := vision.Resolve(m.Vision, vision.Unknown, m.ID); status != vision.Unknown {
+				input := []string{"text"}
+				if status == vision.Yes {
+					input = append(input, "image")
+				}
+				entry["modalities"] = map[string]any{"input": input, "output": []string{"text"}}
 			}
 			models[m.ID] = entry
 		}

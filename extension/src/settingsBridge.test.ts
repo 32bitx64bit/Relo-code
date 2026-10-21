@@ -157,6 +157,8 @@ test("models signature: changes when a model is added, or its limits or efforts 
   assert.notEqual(modelsSignature(a), modelsSignature([...a, { provider: "9router", id: "cx/new" }]));
   assert.notEqual(modelsSignature(a), modelsSignature([{ ...a[0], context: 100000 }]));
   assert.notEqual(modelsSignature(a), modelsSignature([{ ...a[0], efforts: ["low"] }]));
+  assert.notEqual(modelsSignature(a), modelsSignature([{ ...a[0], vision: "yes" }]));
+  assert.notEqual(modelsSignature([{ ...a[0], vision: "yes", visionSource: "name" }]), modelsSignature([{ ...a[0], vision: "yes", visionSource: "configured" }]));
   assert.equal(modelsSignature(undefined), "");
   assert.equal(modelsSignature([null, 3]).length > 0, true); // junk entries do not throw
 });

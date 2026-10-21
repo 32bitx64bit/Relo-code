@@ -1,5 +1,6 @@
 // Package agentmsg implements a minimal, loopback-only, authenticated
-// streamable-HTTP MCP server exposing a single "agents" tool to Relo agents.
+// streamable-HTTP MCP server exposing the "agents" tool to Relo agents, plus the
+// optional "canvas" and "image" tools when their handlers are registered.
 //
 // Security model:
 //   - Listens on 127.0.0.1 only, on an ephemeral port.
@@ -120,10 +121,7 @@ type Asset struct {
 type CanvasHandler func(context.Context, CanvasRequest) (any, error)
 
 // CanvasImage is an MCP image content block appended to a canvas result.
-type CanvasImage struct {
-	MIME string
-	Data string // base64 payload, never repeated in the text part
-}
+type CanvasImage = Image
 
 // CanvasResult is returned by a CanvasHandler when the result carries an image.
 // Text is serialized as the text content block; Image is appended when non-nil.
@@ -150,6 +148,7 @@ type Server struct {
 
 	handler   Handler
 	canvas    CanvasHandler
+	images    ImageHandler
 	listener  net.Listener
 	httpSrv   *http.Server
 	closeOnce sync.Once
@@ -366,6 +365,9 @@ func (s *Server) route(ctx context.Context, req rpcRequest) (any, *rpcError) {
 		if s.canvas != nil {
 			tools = append(tools, canvasToolDescriptor())
 		}
+		if s.images != nil {
+			tools = append(tools, imageToolDescriptor())
+		}
 		return map[string]any{"tools": tools}, nil
 	case "tools/call":
 		return s.callTool(ctx, req.Params)
@@ -475,6 +477,9 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	}
 	if p.Name == canvasToolName && s.canvas != nil {
 		return s.callCanvas(ctx, p.Arguments)
+	}
+	if p.Name == imageToolName && s.images != nil {
+		return s.callImage(ctx, p.Arguments)
 	}
 	if p.Name != toolName {
 		return nil, invalidParams("unknown tool")

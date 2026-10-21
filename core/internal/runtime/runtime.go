@@ -27,13 +27,16 @@ type AgentTask struct {
 
 // Model is one selectable model. Context/Output are the model's own maximums in tokens (0 = unknown).
 // Efforts are the reasoning effort levels the model accepts (OpenCode "variants"); empty = no effort control.
+// Vision is "yes", "no" or empty for unknown, and VisionSource says where that came from (see internal/vision).
 type Model struct {
-	ID       string   `json:"id"`
-	Provider string   `json:"provider"`
-	Name     string   `json:"name"`
-	Context  int      `json:"context,omitempty"`
-	Output   int      `json:"output,omitempty"`
-	Efforts  []string `json:"efforts,omitempty"`
+	ID           string   `json:"id"`
+	Provider     string   `json:"provider"`
+	Name         string   `json:"name"`
+	Context      int      `json:"context,omitempty"`
+	Output       int      `json:"output,omitempty"`
+	Efforts      []string `json:"efforts,omitempty"`
+	Vision       string   `json:"vision,omitempty"`
+	VisionSource string   `json:"visionSource,omitempty"`
 }
 
 // EffectiveWindow is the context window Relo plans against: the smaller of the global limit and the
@@ -187,6 +190,20 @@ func ToolsFor(role, mode string, mutating bool) map[string]bool {
 // ReloAgentsTool is the MCP tool, served by Relo's coordination hub under the "relo" server, that lets an agent
 // list and message its peers. OpenCode exposes it as "<server>_<tool>".
 const ReloAgentsTool = "relo_agents"
+
+// ReloImageTool is the MCP tool that shows an agent image files from its workspace. It is offered only to agents whose
+// model is not known to be text only; see WithImages.
+const ReloImageTool = "relo_image"
+
+// WithImages adds the relo_image allow rule to a tool policy when enabled. The Primary never gets it: it plans from
+// curated context and reads no files, and the core refuses its calls as well.
+func WithImages(tools map[string]bool, role string, enabled bool) map[string]bool {
+	if !enabled || role == RolePrimary {
+		return tools
+	}
+	tools[ReloImageTool] = true
+	return tools
+}
 
 // ReloCanvasTool is the optional MCP tool that drives Relo Canvas artifacts through the extension. It is enabled
 // only when the connected extension advertises Canvas support.

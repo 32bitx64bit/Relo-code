@@ -12,7 +12,7 @@ Primary is the engineering director. It returns a structured turn: objective, de
 | worker / architect / debug / integration | tier1 | yes in Build mode | Implementation / design / fix / merge |
 | test / reviewer | tier1 | no | Verify and independently review |
 
-Task difficulty routes trivial/easy work to Tier 2, medium/hard work to Tier 1, and expert work to Primary; explicit difficulty-to-model mappings take precedence. Default difficulty is easy for probe/test/reviewer, medium for worker/integration/debug, hard for architect/head, and expert for Primary.
+Task difficulty routes trivial/easy work to Tier 2, medium/complex/hard work to Tier 1, and expert work to Primary; explicit difficulty-to-model mappings take precedence. `complex` sits between medium and hard (a larger change that still follows existing patterns); without its own mapping it uses the hard model. The Primary rates each task by what its agent must still work out, not by the feature: implementing an architect's design is usually medium or complex, and when unsure it rates lower, since a failed task can be retried higher. Hard and expert tasks always get the automatic review, trivial ones never, and the rest only for a large diff. Default difficulty is easy for probe/test/reviewer, medium for worker/integration/debug, hard for architect/head, and expert for Primary.
 
 Plan and Review modes disable write/edit tools even for workers.
 

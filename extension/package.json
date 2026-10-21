@@ -436,7 +436,34 @@
               "models": {
                 "type": "array",
                 "items": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "context": {
+                      "type": "integer"
+                    },
+                    "output": {
+                      "type": "integer"
+                    },
+                    "reasoning": {
+                      "type": "boolean"
+                    },
+                    "efforts": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "vision": {
+                      "type": "boolean",
+                      "description": "Whether the model accepts images. Leave it out to use what the endpoint or OpenCode's catalog reports, or a guess from the model id. Text-only models are declared so to OpenCode and never get the relo_image tool."
+                    }
+                  }
                 }
               }
             }
@@ -445,7 +472,7 @@
         "relo.routing.byDifficulty": {
           "type": "object",
           "default": {},
-          "description": "Optional model overrides by task difficulty."
+          "description": "Optional model overrides by task difficulty: trivial, easy, medium, complex, hard, expert. Without a complex entry, complex tasks use the hard model."
         },
         "relo.routing.escalate": {
           "type": "boolean",

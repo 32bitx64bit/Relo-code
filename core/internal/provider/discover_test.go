@@ -177,3 +177,66 @@ func TestDiscoverValidatesInput(t *testing.T) {
 		t.Fatal("bad scheme accepted")
 	}
 }
+
+func TestDiscoverReadsImageSupport(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":[
+			{"id":"or-sees","architecture":{"input_modalities":["text","image"]}},
+			{"id":"or-blind","architecture":{"modality":"text->text"}},
+			{"id":"or-old","architecture":{"modality":"text+image->text"}},
+			{"id":"flat","input_modalities":["text"]},
+			{"id":"nested","modalities":{"input":["image","text"]}},
+			{"id":"ollama","capabilities":["completion","vision"]},
+			{"id":"ollama-text","capabilities":["completion","tools"]},
+			{"id":"obj","capabilities":{"vision":false}},
+			{"id":"litellm","supports_vision":true},
+			{"id":"odd","architecture":"x","capabilities":7,"supports_vision":"yes"},
+			{"id":"plain"}]}`)
+	}))
+	defer srv.Close()
+	models, err := Discover(context.Background(), KindOpenAI, srv.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"or-sees": "yes", "or-blind": "no", "or-old": "yes", "flat": "no", "nested": "yes", "ollama": "yes", "ollama-text": "", "obj": "no", "litellm": "yes", "odd": "", "plain": ""}
+	if len(models) != len(want) {
+		t.Fatalf("a model with odd fields was dropped: %d models", len(models))
+	}
+	for _, m := range models {
+		got := ""
+		if m.Vision != nil {
+			got = map[bool]string{true: "yes", false: "no"}[*m.Vision]
+		}
+		if got != want[m.ID] {
+			t.Errorf("%s: vision %q, want %q", m.ID, got, want[m.ID])
+		}
+	}
+}
+
+func TestDiscoverAnthropicImageInput(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":[
+			{"id":"claude-sees","capabilities":{"image_input":{"supported":true}}},
+			{"id":"claude-blind","capabilities":{"image_input":{"supported":false}}},
+			{"id":"claude-loose","capabilities":{"image_input":true,"thinking":true}},
+			{"id":"claude-silent","capabilities":{}}],"has_more":false}`)
+	}))
+	defer srv.Close()
+	models, err := Discover(context.Background(), KindAnthropic, srv.URL, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, m := range models {
+		got[m.ID] = "unknown"
+		if m.Vision != nil {
+			got[m.ID] = fmt.Sprint(*m.Vision)
+		}
+		if m.ID == "claude-loose" && !m.Reasoning {
+			t.Error("a bare-bool thinking flag was not read")
+		}
+	}
+	if fmt.Sprint(got) != "map[claude-blind:false claude-loose:true claude-sees:true claude-silent:unknown]" {
+		t.Fatalf("image_input read as %v", got)
+	}
+}

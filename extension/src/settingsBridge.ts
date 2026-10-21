@@ -144,15 +144,15 @@ export function settingsReply(
   return { type: "settings", values: out, defaults, schema: outSchema, models };
 }
 
-// What the webview's model pickers would show for a catalog: provider, id, limits and effort levels. Two catalogs
-// with the same signature need no new settings message.
+// What the webview's model pickers would show for a catalog: provider, id, limits, effort levels and image support.
+// Two catalogs with the same signature need no new settings message.
 export function modelsSignature(models: unknown): string {
   if (!Array.isArray(models)) return "";
   return models
     .map((m) => {
-      const x = (m ?? {}) as { provider?: unknown; id?: unknown; context?: unknown; output?: unknown; efforts?: unknown };
+      const x = (m ?? {}) as { provider?: unknown; id?: unknown; context?: unknown; output?: unknown; efforts?: unknown; vision?: unknown; visionSource?: unknown };
       const efforts = Array.isArray(x.efforts) ? x.efforts.join(",") : "";
-      return `${String(x.provider)}/${String(x.id)}:${String(x.context ?? 0)}:${String(x.output ?? 0)}:${efforts}`;
+      return `${String(x.provider)}/${String(x.id)}:${String(x.context ?? 0)}:${String(x.output ?? 0)}:${efforts}:${String(x.vision ?? "")}:${String(x.visionSource ?? "")}`;
     })
     .join("\n");
 }

@@ -2,6 +2,7 @@ package provider
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -172,5 +173,53 @@ func TestBuildConfigEnablesOnlyReloProviders(t *testing.T) {
 	open, err := BuildConfig(sample(), nil, true)
 	if err != nil || strings.Contains(open, "enabled_providers") {
 		t.Fatalf("allowBuiltin must leave the catalog alone: %s %v", open, err)
+	}
+}
+
+func TestBuildConfigDeclaresImageInput(t *testing.T) {
+	yes, no := true, false
+	ps := []Provider{{ID: "p", Kind: KindOpenAI, BaseURL: "http://localhost:1/v1", Models: []Model{
+		{ID: "declared-text", Vision: &no},
+		{ID: "claude-opus-5-5"},             // guessed yes from the name
+		{ID: "deepseek-v4.1-flash"},         // guessed no from the name
+		{ID: "deepseek-chat", Vision: &yes}, // the user knows better than the guess
+		{ID: "mystery-model"},               // unknown: OpenCode's default stays
+	}}}
+	raw, err := BuildConfig(ps, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Provider map[string]struct {
+			Models map[string]struct {
+				Modalities *struct {
+					Input  []string `json:"input"`
+					Output []string `json:"output"`
+				} `json:"modalities"`
+			} `json:"models"`
+		} `json:"provider"`
+	}
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"declared-text": "[text]", "claude-opus-5-5": "[text image]", "deepseek-v4.1-flash": "[text]", "deepseek-chat": "[text image]", "mystery-model": "none"}
+	for id, w := range want {
+		m := cfg.Provider["p"].Models[id]
+		got := "none"
+		if m.Modalities != nil {
+			got = fmt.Sprint(m.Modalities.Input)
+			if fmt.Sprint(m.Modalities.Output) != "[text]" {
+				t.Errorf("%s: output modalities %v", id, m.Modalities.Output)
+			}
+		}
+		if got != w {
+			t.Errorf("%s: input modalities %s, want %s", id, got, w)
+		}
+	}
+	// Changing a model's vision flag must restart the backend like any other provider edit.
+	before := Fingerprint(ps, nil)
+	ps[0].Models[4].Vision = &yes
+	if Fingerprint(ps, nil) == before {
+		t.Error("fingerprint ignores the vision flag")
 	}
 }

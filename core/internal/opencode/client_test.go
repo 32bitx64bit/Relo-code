@@ -795,8 +795,11 @@ func TestModelsParsesLimitsVariantsAndFamily(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{
 			map[string]any{"modelID": "gem", "providerID": "google", "name": "Gem", "enabled": true, "family": "gemini",
-				"limit":    map[string]any{"context": 1048576, "output": 65536},
-				"variants": []any{map[string]any{"id": "none"}, map[string]any{"id": "low"}, map[string]any{"id": ""}, map[string]any{"id": "high"}}},
+				"limit":        map[string]any{"context": 1048576, "output": 65536},
+				"variants":     []any{map[string]any{"id": "none"}, map[string]any{"id": "low"}, map[string]any{"id": ""}, map[string]any{"id": "high"}},
+				"capabilities": map[string]any{"input": []any{"text", "image", "pdf"}, "output": []any{"text"}}},
+			map[string]any{"modelID": "blind", "providerID": "google", "enabled": true, "capabilities": map[string]any{"input": []any{"text"}}},
+			map[string]any{"modelID": "silent", "providerID": "google", "enabled": true},
 			map[string]any{"modelID": "disabled", "providerID": "google", "enabled": false},
 		}})
 	})
@@ -808,12 +811,15 @@ func TestModelsParsesLimitsVariantsAndFamily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(models) != 1 {
+	if len(models) != 3 {
 		t.Fatalf("models = %+v, want only enabled", models)
 	}
 	m := models[0]
 	if m.Context != 1048576 || m.Output != 65536 || fmt.Sprint(m.Efforts) != "[low high]" {
 		t.Fatalf("parsed model = %+v", m)
+	}
+	if got := fmt.Sprint(m.Vision, "/", m.VisionSource, " ", models[1].Vision, "/", models[1].VisionSource, " ", models[2].Vision, "/", models[2].VisionSource); got != "yes/catalog no/catalog /" {
+		t.Fatalf("capabilities.input read as %s", got)
 	}
 }
 

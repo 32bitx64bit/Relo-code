@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/relocode/relo/internal/runtime"
+	"github.com/relocode/relo/internal/vision"
 )
 
 const serverUser = "opencode"
@@ -570,6 +571,9 @@ func (c *Client) Models(ctx context.Context) ([]runtime.Model, error) {
 			Variants []struct {
 				ID string `json:"id"`
 			} `json:"variants"`
+			Capabilities struct {
+				Input []string `json:"input"`
+			} `json:"capabilities"`
 		} `json:"data"`
 	}
 	if _, err := c.request(ctx, http.MethodGet, "/api/model", nil, &payload, false); err != nil {
@@ -587,7 +591,13 @@ func (c *Client) Models(ctx context.Context) ([]runtime.Model, error) {
 				efforts = append(efforts, v.ID)
 			}
 		}
-		out = append(out, runtime.Model{ID: m.ID, Provider: m.ProviderID, Name: m.Name, Context: m.Limit.Context, Output: m.Limit.Output, Efforts: efforts})
+		// capabilities.input is real catalog data for built-in providers. For a custom model it is whatever Relo
+		// declared, or OpenCode's made-up ["text","image"] when Relo declared nothing; app.reconcile replaces it.
+		model := runtime.Model{ID: m.ID, Provider: m.ProviderID, Name: m.Name, Context: m.Limit.Context, Output: m.Limit.Output, Efforts: efforts}
+		if model.Vision = vision.FromInputs(m.Capabilities.Input); model.Vision != vision.Unknown {
+			model.VisionSource = vision.SourceCatalog
+		}
+		out = append(out, model)
 		if m.Family != "" {
 			families[m.ProviderID+"/"+m.ID] = m.Family
 		}

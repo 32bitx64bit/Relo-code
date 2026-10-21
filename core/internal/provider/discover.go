@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/relocode/relo/internal/vision"
 )
 
 const (
@@ -86,6 +88,7 @@ func discoverOpenAI(ctx context.Context, client *http.Client, base, apiKey strin
 			MaxModelLen      tokenCount `json:"max_model_len"`
 			ContextWindow    tokenCount `json:"context_window"`
 			MaxContextLength tokenCount `json:"max_context_length"`
+			openAIVision
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &page); err != nil {
@@ -102,16 +105,125 @@ func discoverOpenAI(ctx context.Context, client *http.Client, base, apiKey strin
 				ctxTokens = alt
 			}
 		}
-		out = append(out, Model{ID: m.ID, Context: int(ctxTokens)})
+		out = append(out, Model{ID: m.ID, Context: int(ctxTokens), Vision: m.openAIVision.vision()})
 	}
 	return out, nil
+}
+
+// openAIVision holds the fields OpenAI-compatible listings use to say a model takes images. None is standard, so each
+// is kept raw and read leniently: one odd field must not fail the whole listing.
+type openAIVision struct {
+	Architecture       json.RawMessage `json:"architecture"`         // OpenRouter: {input_modalities} or {modality: "text+image->text"}
+	InputModalities    json.RawMessage `json:"input_modalities"`     // ["text","image"]
+	Modalities         json.RawMessage `json:"modalities"`           // {input: [...]} or [...]
+	Capabilities       json.RawMessage `json:"capabilities"`         // {vision: true}, {image_input: ...} or ["vision", ...]
+	SupportsVision     json.RawMessage `json:"supports_vision"`      // LiteLLM-style flags
+	SupportsImageInput json.RawMessage `json:"supports_image_input"` //
+}
+
+// vision returns the first answer any field gives, or nil when none says anything.
+func (v openAIVision) vision() *bool {
+	var arch struct {
+		InputModalities json.RawMessage `json:"input_modalities"`
+		Modality        string          `json:"modality"`
+	}
+	_ = json.Unmarshal(v.Architecture, &arch)
+	var modality []string
+	if in, _, ok := strings.Cut(arch.Modality, "->"); ok {
+		modality = strings.Split(in, "+")
+	}
+	var nested struct {
+		Input json.RawMessage `json:"input"`
+	}
+	_ = json.Unmarshal(v.Modalities, &nested)
+	for _, answer := range []string{
+		vision.FromInputs(stringList(arch.InputModalities)),
+		vision.FromInputs(modality),
+		vision.FromInputs(stringList(v.InputModalities)),
+		vision.FromInputs(stringList(nested.Input)),
+		vision.FromInputs(stringList(v.Modalities)),
+		capabilitiesVision(v.Capabilities),
+		vision.FromBool(flag(v.SupportsVision)),
+		vision.FromBool(flag(v.SupportsImageInput)),
+	} {
+		if answer != vision.Unknown {
+			yes := answer == vision.Yes
+			return &yes
+		}
+	}
+	return nil
+}
+
+// capabilitiesVision reads a capabilities field. As an object it may carry vision or image_input as a flag or as
+// {supported}, or an input modality list. As a list (Ollama style) only "vision" or "image" is read, as a yes: a list
+// that lacks them may just be incomplete.
+func capabilitiesVision(raw json.RawMessage) string {
+	if list := stringList(raw); len(list) > 0 {
+		for _, c := range list {
+			if c = strings.ToLower(strings.TrimSpace(c)); c == "vision" || c == "image" || c == "image_input" {
+				return vision.Yes
+			}
+		}
+		return vision.Unknown
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return vision.Unknown
+	}
+	for _, key := range []string{"vision", "image_input", "images"} {
+		var c levelCap
+		if b, ok := obj[key]; ok && json.Unmarshal(b, &c) == nil && c.known {
+			return vision.FromBool(&c.Supported)
+		}
+	}
+	for _, key := range []string{"input", "input_modalities"} {
+		if s := vision.FromInputs(stringList(obj[key])); s != vision.Unknown {
+			return s
+		}
+	}
+	return vision.Unknown
+}
+
+// stringList decodes a JSON array of strings, or nil for anything else.
+func stringList(raw json.RawMessage) []string {
+	var list []string
+	if len(raw) == 0 || json.Unmarshal(raw, &list) != nil {
+		return nil
+	}
+	return list
+}
+
+// flag decodes a JSON boolean, or nil for anything else.
+func flag(raw json.RawMessage) *bool {
+	var b bool
+	if len(raw) == 0 || json.Unmarshal(raw, &b) != nil {
+		return nil
+	}
+	return &b
 }
 
 // anthropicEffortLevels is the fixed ordering of effort levels as the API advertises them.
 var anthropicEffortLevels = []string{"low", "medium", "high", "xhigh", "max"}
 
+// levelCap is a capability flag: {"supported": bool} as Anthropic sends it, or a bare bool from a looser proxy. known
+// tells "absent" from "false". Anything else decodes as absent instead of failing the listing.
 type levelCap struct {
 	Supported bool `json:"supported"`
+	known     bool
+}
+
+func (l *levelCap) UnmarshalJSON(b []byte) error {
+	if f := flag(b); f != nil {
+		l.Supported, l.known = *f, true
+		return nil
+	}
+	var obj struct {
+		Supported *bool `json:"supported"`
+	}
+	if json.Unmarshal(b, &obj) == nil && obj.Supported != nil {
+		l.Supported, l.known = *obj.Supported, true
+	}
+	return nil
 }
 
 type anthropicModel struct {
@@ -128,7 +240,8 @@ type anthropicModel struct {
 			Xhigh     levelCap `json:"xhigh"`
 			Max       levelCap `json:"max"`
 		} `json:"effort"`
-		Thinking levelCap `json:"thinking"`
+		Thinking   levelCap `json:"thinking"`
+		ImageInput levelCap `json:"image_input"`
 	} `json:"capabilities"`
 }
 
@@ -181,6 +294,10 @@ func anthropicToModel(m anthropicModel) Model {
 			}
 		}
 	}
+	var sees *bool
+	if img := m.Capabilities.ImageInput; img.known {
+		sees = &img.Supported
+	}
 	return Model{
 		ID:        m.ID,
 		Name:      m.DisplayName,
@@ -188,6 +305,7 @@ func anthropicToModel(m anthropicModel) Model {
 		Output:    int(m.MaxTokens),
 		Reasoning: m.Capabilities.Thinking.Supported,
 		Efforts:   efforts,
+		Vision:    sees,
 	}
 }
 

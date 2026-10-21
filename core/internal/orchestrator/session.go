@@ -795,7 +795,7 @@ func (c *Coord) applyTurn(primary agent.Agent, turn Turn) {
 	}
 	for _, spec := range turn.Tasks {
 		role := parseRole(spec.Role)
-		t := c.Graph.Add(taskgraph.Task{Title: spec.Title, Description: spec.Description, Acceptance: spec.Acceptance, Creator: primary.ID, Priority: spec.Priority, Role: string(role), Workspace: s.Workspace, Difficulty: spec.Difficulty, MaxAttempts: settings.MaxRetries, Model: c.modelForDifficulty(role, spec.Difficulty), Paths: spec.Paths})
+		t := c.Graph.Add(taskgraph.Task{Title: spec.Title, Description: spec.Description, Acceptance: spec.Acceptance, Creator: primary.ID, Priority: spec.Priority, Role: string(role), Workspace: s.Workspace, Difficulty: spec.Difficulty, Vision: spec.Vision, MaxAttempts: settings.MaxRetries, Model: c.modelForTask(role, spec.Difficulty, spec.Vision), Paths: spec.Paths})
 		idmap[spec.ID] = t.ID
 		c.emit("task.created", t)
 	}
@@ -1099,8 +1099,12 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 
 func (c *Coord) nextAttempt(t taskgraph.Task, a agent.Agent) (string, bool) {
 	model := a.Model
-	if c.settings().Escalate && t.Attempt >= 2 {
-		if next, ok := c.routeConfig().Escalate(a.Model); ok {
+	if settings := c.settings(); settings.Escalate && t.Attempt >= 2 {
+		escalate := c.routeConfig().Escalate
+		if t.Vision {
+			escalate = func(current string) (string, bool) { return c.routeConfig().EscalateSeeing(current, settings.Sees) }
+		}
+		if next, ok := escalate(a.Model); ok {
 			model = next
 		}
 	}
@@ -1195,7 +1199,7 @@ func (c *Coord) scheduleReview(t taskgraph.Task, a agent.Agent) {
 			return
 		}
 	}
-	r := c.Graph.Add(taskgraph.Task{Title: "Review: " + t.Title, Description: "Independently review completed changes for correctness and acceptance.", Creator: a.ID, Priority: t.Priority, Role: string(agent.Reviewer), Workspace: t.Workspace, Depends: []string{t.ID}, MaxAttempts: c.scheduler().Limits.MaxRetry})
+	r := c.Graph.Add(taskgraph.Task{Title: "Review: " + t.Title, Description: "Independently review completed changes for correctness and acceptance.", Creator: a.ID, Priority: t.Priority, Role: string(agent.Reviewer), Workspace: t.Workspace, Depends: []string{t.ID}, Vision: t.Vision, MaxAttempts: c.scheduler().Limits.MaxRetry})
 	c.emit("task.created", r)
 }
 

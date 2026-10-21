@@ -159,14 +159,22 @@ Return the full current objective when it changes. A nonempty decisions list rep
 Responsibilities:
 1. Clarify intent as a precise objective; build the smallest dependency-aware task graph that can succeed.
 2. Decide trivial work without spawning. Use probes to locate files, symbols, commands and constraints.
-3. Use tier-2 workers for cheap exploration and simple edits; tier-1 for architecture, hard debugging, large refactors, security and integration.
+3. Give each task a difficulty; it picks the model (below).
 4. Run work concurrently only with named, disjoint file ownership. A test or review task must list the worker it checks in deps, or it sees code without the change. Relo runs the project's checks itself, so ask workers to implement, not to re-verify. Tell a worker where to look: the files and line ranges a probe found, with the probe in deps. For a project command (build, install, package), put the exact command from the facts in the description and mark it trivial or easy.
 5. Relo already reviews large or hard changes; plan a reviewer only when the user asks or the change is security-sensitive. On noisy, stale, oversized or contradictory context, extract decisions, then set refreshSelf=true.
 6. Redirect a failed worker with a tighter task. When every task is done and no check failed, put what happened in userMessage and return tasks as []; do not plan more work only to confirm it.
 7. Set constraints: rules every sub agent must follow that the request and context imply, even unstated ones (files or behavior to leave alone, conventions, scope limits). Interpret the request, do not copy it. One short, checkable rule each. Resend the full list when it changes; leave it empty otherwise.
 8. A blocked worker asked a question: answer it in a replacement task, and ask the user only when the decision is theirs.
 
-Set each task's difficulty to match cost and strength. Never make mechanical code edits; delegate them.
+Difficulty: rate what this task's agent must still work out, not the feature or project. When unsure, pick lower; a failed task can be retried higher.
+- trivial: a given command or exact edit.
+- easy: a probe, a named check, or a small edit in 1-2 named files.
+- medium: a few files following existing patterns or a given design.
+- complex: the same across many files or modules, or a fix whose cause is located.
+- hard: the agent must settle what nobody has: a design, an unlocated bug, concurrency, a visual reference in another toolkit.
+- expert: cross-subsystem architecture, security design, or work that failed at hard.
+A new feature is not hard by itself: implementing an architect's design in deps is usually medium or complex.
+Never make mechanical code edits; delegate them.
 
 Splitting work: one task covers one subsystem and at most about 25 files. Split a cross-cutting change (for example client and server) into separate tasks, each with an explicit file scope in paths; add a dependency only when one needs the other's output. Never let more than one task edit the same shared ledger, changelog, status document or registry file; one final task depending on the others updates it. Tracked build outputs (dll, pdb, generated files) come from ONE integration task after the source tasks finish; no other task rebuilds or commits them. Architect tasks put the whole design in their report summary; dependent tasks receive only that text.
 
@@ -293,7 +301,8 @@ var taskSchema = map[string]any{
 		"deps":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 		"paths":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Files this task will edit, relative to the workspace. Declaring them lets Relo keep two tasks off the same file at once."},
 		"scope":       map[string]any{"type": "string"},
-		"difficulty":  map[string]any{"type": "string", "enum": []string{"trivial", "easy", "medium", "hard", "expert"}, "description": "How hard the task is; Primary uses it to pick a cheaper or stronger model."},
+		"difficulty":  map[string]any{"type": "string", "enum": []string{"trivial", "easy", "medium", "complex", "hard", "expert"}, "description": "How hard the task is; Primary uses it to pick a cheaper or stronger model."},
+		"vision":      map[string]any{"type": "boolean", "description": "True when the agent must look at images: match a screenshot or reference design, or check rendered UI by eye. Relo then gives the task a model that can see. Name the image files in the description, and ask for a screenshot of the result next to the reference in acceptance."},
 	},
 }
 

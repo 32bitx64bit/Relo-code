@@ -10,7 +10,7 @@ import (
 
 func TestNormalizeDifficulty(t *testing.T) {
 	tests := []struct{ input, want string }{
-		{" TRIVIAL ", Trivial}, {"easy", Easy}, {"Medium", Medium}, {" hard ", Hard}, {"expert", Expert}, {"", ""}, {"unknown", ""},
+		{" TRIVIAL ", Trivial}, {"easy", Easy}, {"Medium", Medium}, {"Complex", Complex}, {" hard ", Hard}, {"expert", Expert}, {"", ""}, {"unknown", ""},
 	}
 	for _, tt := range tests {
 		if got := NormalizeDifficulty(tt.input); got != tt.want {
@@ -34,6 +34,9 @@ func TestConfigFor(t *testing.T) {
 		{"primary role", Config{Primary: "p", Tier1: "one", Tier2: "two", ByDifficulty: map[string]string{Expert: "custom"}}, agent.Tier1, agent.Primary, Easy, "p"},
 		{"fallback up", Config{Primary: "p", Tier2: "two"}, agent.Tier1, agent.Worker, Hard, "p"},
 		{"fallback down", Config{Tier1: "one"}, agent.TierPrimary, agent.Worker, Expert, "one"},
+		{"complex override", Config{Mode: ModeAdvanced, Tier1: "one", ByDifficulty: map[string]string{Complex: "mid", Hard: "strong"}}, agent.Tier1, agent.Worker, Complex, "mid"},
+		{"complex without a row uses hard", Config{Mode: ModeAdvanced, Tier1: "one", ByDifficulty: map[string]string{Hard: "strong"}}, agent.Tier1, agent.Worker, Complex, "strong"},
+		{"complex in simple mode is tier1", Config{Primary: "p", Tier1: "one", Tier2: "two", ByDifficulty: map[string]string{Hard: "strong"}}, agent.Tier1, agent.Worker, Complex, "one"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -57,6 +60,10 @@ func TestLadderAndEscalate(t *testing.T) {
 	}
 	if got, ok := c.Escalate("top-extra"); ok || got != "" {
 		t.Fatalf("Escalate(top-extra) = %q, %v", got, ok)
+	}
+	c.ByDifficulty[Complex] = "complex-extra"
+	if got, ok := c.Escalate("mid-extra"); !ok || got != "complex-extra" {
+		t.Fatalf("Escalate(mid-extra) = %q, %v, want the complex model before hard", got, ok)
 	}
 }
 
@@ -108,5 +115,49 @@ func TestPickDefaultNeverFallsBackToArbitraryModel(t *testing.T) {
 	}
 	if got := PickDefault(nil, []string{"opus"}); got != "" {
 		t.Fatalf("PickDefault on empty catalog = %q, want empty", got)
+	}
+}
+
+func TestSeeingWalksTheLadderToAModelThatSees(t *testing.T) {
+	// Ladder: two, cheap-extra, one, mid-extra, p, top-extra.
+	c := Config{Mode: ModeAdvanced, Primary: "p", Tier1: "one", Tier2: "two", ByDifficulty: map[string]string{
+		Trivial: "cheap-extra", Easy: "two", Medium: "mid-extra", Hard: "one", Expert: "top-extra",
+	}}
+	seeing := func(models ...string) func(string) bool {
+		return func(m string) bool {
+			for _, s := range models {
+				if s == m {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	cases := []struct {
+		model string
+		sees  []string
+		want  string
+	}{
+		{"one", []string{"one", "p"}, "one"},               // already sees
+		{"one", []string{"p", "top-extra"}, "p"},           // nearest above
+		{"one", []string{"two", "top-extra"}, "top-extra"}, // above wins over below
+		{"one", []string{"two"}, "two"},                    // nothing above: nearest below
+		{"one", nil, "one"},                                // nothing sees: unchanged
+		{"elsewhere", []string{"one", "p"}, "one"},         // outside the ladder: lowest that sees
+	}
+	for _, tc := range cases {
+		if got := c.Seeing(tc.model, seeing(tc.sees...)); got != tc.want {
+			t.Errorf("Seeing(%q) with %v seeing = %q, want %q", tc.model, tc.sees, got, tc.want)
+		}
+	}
+
+	if got, ok := c.EscalateSeeing("two", seeing("one", "p")); !ok || got != "one" {
+		t.Errorf("EscalateSeeing(two) = %q, %v, want one: cheap-extra cannot see", got, ok)
+	}
+	if got, ok := c.EscalateSeeing("p", seeing("one", "p")); ok {
+		t.Errorf("EscalateSeeing(p) = %q: escalating to top-extra would lose sight", got)
+	}
+	if got, ok := c.EscalateSeeing("two", seeing()); !ok || got != "cheap-extra" {
+		t.Errorf("EscalateSeeing with nothing seeing = %q, %v, want plain escalation", got, ok)
 	}
 }

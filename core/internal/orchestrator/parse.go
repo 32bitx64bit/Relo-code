@@ -59,6 +59,7 @@ type TurnTask struct {
 	Paths       []string `json:"paths"`
 	Scope       string   `json:"scope"`
 	Difficulty  string   `json:"difficulty"`
+	Vision      bool     `json:"vision"`
 }
 
 type RawReport struct {
