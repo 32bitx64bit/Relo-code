@@ -2,7 +2,9 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -203,4 +205,38 @@ func TestADeferredRestartIsAppliedOnceNothingIsRunning(t *testing.T) {
 	if core.isRestartPending() {
 		t.Fatal("the deferred restart was never applied")
 	}
+}
+
+// Turning Claude Code on or pointing it at another CLI restarts the backends, like a provider change does. A CLI that
+// cannot be found leaves Claude Code off with the reason in backend.status, and the backend start goes on.
+func TestClaudeCodeSettingRestartsTheBackendAndReportsWhyItIsOff(t *testing.T) {
+	core, _ := newMockApp(t)
+	core.markProviderRunning()
+	missing := filepath.Join(t.TempDir(), "claude")
+	payload, _ := json.Marshal(map[string]any{"claudeCode": map[string]any{"enabled": true, "path": missing}})
+	core.applyProviders(decode(t, payload))
+	if !core.providersChanged() {
+		t.Fatal("enabling Claude Code did not change the runtime fingerprint")
+	}
+	if cc := core.startClaudeCode(context.Background()); cc != nil {
+		t.Fatal("a Claude Code runtime started without a CLI")
+	}
+	st := core.claudeCodeStatus()
+	if st["enabled"] != true || st["ready"] != false || !strings.Contains(fmt.Sprint(st["error"]), missing) {
+		t.Fatalf("status = %v, want enabled, not ready, and the missing path in the error", st)
+	}
+	core.markProviderRunning()
+	core.applyProviders(map[string]any{"routing": map[string]any{}})
+	if core.providersChanged() {
+		t.Fatal("a payload without claudeCode turned it off")
+	}
+}
+
+func decode(t *testing.T, b []byte) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
 }

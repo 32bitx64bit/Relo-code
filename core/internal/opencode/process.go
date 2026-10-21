@@ -203,8 +203,9 @@ type Adapter struct {
 }
 
 var (
-	_ runtime.Compactor      = (*Adapter)(nil)
-	_ runtime.MessageRuntime = (*Adapter)(nil)
+	_ runtime.Compactor         = (*Adapter)(nil)
+	_ runtime.MessageRuntime    = (*Adapter)(nil)
+	_ runtime.PermissionReplier = (*Adapter)(nil)
 )
 
 func (a *Adapter) ConfigureMessages(ctx context.Context, directory string, tools runtime.MessageTools) error {
@@ -228,6 +229,9 @@ func (a *Adapter) Cancel(ctx context.Context, session runtime.SessionID) error {
 }
 func (a *Adapter) Compact(ctx context.Context, session runtime.SessionID) error {
 	return a.Client.Compact(ctx, session)
+}
+func (a *Adapter) ReplyPermission(ctx context.Context, session, permID, response string) error {
+	return a.Client.ReplyPermission(ctx, session, permID, response)
 }
 func (a *Adapter) CloseSession(ctx context.Context, session runtime.SessionID) error {
 	return a.Client.CloseSession(ctx, session)

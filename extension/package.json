@@ -711,6 +711,18 @@
           "default": "",
           "description": "Path to the OpenCode binary."
         },
+        "relo.claudeCode.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "Run agents on the Claude Code CLI (claude) with its own sign-in. Its models are listed as claude-code/... and can be picked for any role. Relo starts one CLI process per agent with Relo's prompt and tools in place of Claude Code's, in safe mode (no CLAUDE.md, hooks, plugins or other MCP servers). The CLI keeps Claude's thinking between tool steps and caches the prompt. Usage counts against the signed-in account's plan limits, and what that account may be used for is set by its terms with Anthropic. Relo never reads the CLI's credentials."
+        },
+        "relo.claudeCode.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Path to the Claude Code CLI. Empty looks on PATH, then ~/.local/bin/claude, then the copy the Claude Code editor extension ships."
+        },
         "relo.logLevel": {
           "type": "string",
           "enum": [

@@ -39,7 +39,7 @@ let postedRepository = "";
 let canvas: CanvasManager;
 
 // Settings that core consumes; a change to any of them re-applies to the running core.
-const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context", "relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics", "relo.changes.ignorePaths", "relo.changes.unionPaths", "relo.changes.takeLatestPaths", "relo.scheduler.pathLeases", "relo.workspace"];
+const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context", "relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics", "relo.changes.ignorePaths", "relo.changes.unionPaths", "relo.changes.takeLatestPaths", "relo.scheduler.pathLeases", "relo.workspace", "relo.claudeCode"];
 
 export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   output = vscode.window.createOutputChannel("Relo");
@@ -401,12 +401,23 @@ async function applyCoreSettings(): Promise<void> {
     const res = await client.request<{ backend?: unknown; restartPending?: boolean }>("settings.apply", await settingsPayload(workspacePath()));
     if (res?.backend) state = reduce(state, "backend.status", res.backend);
     if (res?.restartPending) log("settings applied; backend restart pending until agents are idle");
+    warnClaudeCode();
     updateStatus();
     chat.post();
     syncModels();
   } catch (err) {
     log(`settings.apply failed: ${errorText(err)}`);
   }
+}
+
+// warnClaudeCode says once why Claude Code's models are missing when relo.claudeCode.enabled is on but the CLI could
+// not be used (not found, or signed out). The same reason is not repeated on every settings change.
+let claudeCodeWarned = "";
+function warnClaudeCode(): void {
+  const cc = state.backend.claudeCode;
+  const problem = cc?.enabled && !cc.ready && cc.error ? cc.error : "";
+  if (problem && problem !== claudeCodeWarned) void vscode.window.showWarningMessage(`Claude Code is not available to Relo: ${problem}`);
+  claudeCodeWarned = problem;
 }
 
 function scheduleCoreApply(): void {
@@ -653,6 +664,7 @@ async function startCoreNow(ctx: vscode.ExtensionContext, maxAttempts = 5, showF
     if (state.backend.error) {
       void vscode.window.showWarningMessage(String(state.backend.error));
     }
+    warnClaudeCode();
    } catch (err) {
     if (attempt < maxAttempts - 1) {
       await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
@@ -747,6 +759,7 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
     modelEfforts: c.get<Record<string, string>>("models.efforts", {}),
     runtime: c.get("runtime"),
     openCodePath: c.get("openCode.path"),
+    claudeCode: { enabled: c.get<boolean>("claudeCode.enabled", false), path: c.get<string>("claudeCode.path", "") },
     primaryModel: c.get("primaryModel"),
     tier1Model: c.get("tier1Model"),
     tier2Model: c.get("tier2Model"),

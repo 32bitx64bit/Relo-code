@@ -9,6 +9,9 @@ type SessionConfig struct {
 	Directory string
 	Parent    string
 	ReadOnly  bool
+	// Provider is the provider of the model the session will run, known before the session starts. A Mux uses it to
+	// pick the backend that serves that provider.
+	Provider string
 }
 
 type AgentTask struct {
@@ -153,6 +156,12 @@ type MessageTools struct {
 type MessageRuntime interface {
 	ConfigureMessages(ctx context.Context, directory string, tools MessageTools) error
 	DeliverMessage(ctx context.Context, session SessionID, id, text string) error
+}
+
+// PermissionReplier is implemented by runtimes whose sessions ask before a tool call (events with Permission set).
+// The response is once, always or reject.
+type PermissionReplier interface {
+	ReplyPermission(ctx context.Context, session, permID, response string) error
 }
 
 // RolePrimary must match agent.Primary. Duplicated as a string because this package

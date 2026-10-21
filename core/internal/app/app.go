@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/relocode/relo/internal/agent"
+	"github.com/relocode/relo/internal/claudecode"
 	ctxeng "github.com/relocode/relo/internal/context"
 	"github.com/relocode/relo/internal/id"
 	"github.com/relocode/relo/internal/integration"
@@ -59,16 +60,20 @@ type App struct {
 	// orphaned OpenCode child behind.
 	procMu sync.Mutex
 	proc   *opencode.Process
+	claude *claudecode.Runtime // Claude Code behind the runtime Mux; nil when it is off or unavailable
 
 	provMu          sync.Mutex
 	providers       []provider.Provider
 	providerKeys    map[string]string // id -> API key; memory only, never logged, persisted or emitted
-	runningProvider string            // provider.Fingerprint of the config the running OpenCode was started with
+	runningProvider string            // runtimeFingerprint of the config the running backends were started with
+	claudeOn        bool              // relo.claudeCode.enabled
+	claudePath      string            // relo.claudeCode.path; empty = look it up
 	restartPending  bool
 	restarting      atomic.Bool // a deferred restart is under way
 
-	statusMu sync.RWMutex
-	status   runtime.Health
+	statusMu     sync.RWMutex
+	status       runtime.Health
+	claudeStatus map[string]any // what backend.status says about Claude Code
 
 	// sessMu serialises writes of the session to the database with switching sessions, so one session's agents are
 	// never saved under another's id.
@@ -765,7 +770,7 @@ func (a *App) startRuntime(ctx context.Context) (runtime.Health, error) {
 	}
 	fallback := func(err error) (runtime.Health, error) {
 		a.Coord.SetRuntime(runtime.NewMock())
-		a.swapProcLocked(nil)
+		a.swapProcLocked(nil, nil)
 		h := a.setStatus(runtime.Health{Healthy: true, Kind: "mock", Version: "mock-fallback",
 			Error: err.Error() + " — using mock runtime so Relo still starts."})
 		a.emit("backend.status", a.backendStatus())
@@ -773,7 +778,7 @@ func (a *App) startRuntime(ctx context.Context) (runtime.Health, error) {
 	}
 	if kind == "mock" {
 		a.Coord.SetRuntime(runtime.NewMock())
-		a.swapProcLocked(nil)
+		a.swapProcLocked(nil, nil)
 		h := a.setStatus(runtime.Health{Healthy: true, Version: "mock-1", Kind: "mock"})
 		a.emit("backend.status", a.backendStatus())
 		return h, nil
@@ -792,8 +797,14 @@ func (a *App) startRuntime(ctx context.Context) (runtime.Health, error) {
 		return fallback(err)
 	}
 	a.markProviderRunning()
-	a.Coord.SetRuntime(proc.Runtime())
-	a.swapProcLocked(proc)
+	rt := proc.Runtime()
+	cc := a.startClaudeCode(ctx)
+	if cc != nil {
+		// Claude Code's models run on the CLI; every other provider stays on OpenCode.
+		rt = runtime.NewMux(rt, runtime.Route{Provider: claudecode.ProviderID, Prefix: claudecode.SessionPrefix, Runtime: cc})
+	}
+	a.Coord.SetRuntime(rt)
+	a.swapProcLocked(proc, cc)
 	h := a.setStatus(proc.Client().Health(ctx))
 	a.emit("backend.status", a.backendStatus())
 	return h, nil
@@ -817,8 +828,13 @@ func (a *App) stateRoot() string {
 
 func shareOpenCode() bool { return os.Getenv("RELO_SHARE_OPENCODE") == "1" }
 
-// swapProcLocked makes next the current child and stops the one it replaces. procMu must be held.
-func (a *App) swapProcLocked(next *opencode.Process) {
+// swapProcLocked makes next the current child and stops the one it replaces, and does the same for the Claude Code
+// runtime. procMu must be held.
+func (a *App) swapProcLocked(next *opencode.Process, cc *claudecode.Runtime) {
+	if old := a.claude; old != nil && old != cc {
+		_ = old.Close()
+	}
+	a.claude = cc
 	old := a.proc
 	a.proc = next
 	if old == nil || old == next {
@@ -855,6 +871,7 @@ func (a *App) backendStatus() map[string]any {
 		"tier2":        cfg.Tier2Model,
 		"routingMode":  routing.NormalizeMode(cfg.RoutingMode),
 		"contextLimit": cfg.ContextLimit,
+		"claudeCode":   a.claudeCodeStatus(),
 	}
 }
 
@@ -1103,7 +1120,7 @@ func (a *App) Close() {
 			_ = ws.Close()
 		}
 		a.procMu.Lock()
-		a.swapProcLocked(nil)
+		a.swapProcLocked(nil, nil)
 		a.procMu.Unlock()
 		if rt := a.Coord.RuntimeSnapshot(); rt != nil {
 			if err := rt.Close(); err != nil {

@@ -221,6 +221,8 @@ export interface ReloState {
     tier2?: string;
     routingMode?: RoutingState["mode"];
     contextLimit?: number;
+    // relo.claudeCode: whether the CLI was found and signed in. The plan is the kind of sign-in, never the account.
+    claudeCode?: { enabled?: boolean; ready?: boolean; error?: string; version?: string; plan?: string; path?: string };
   };
   routing?: RoutingState;
   session?: { id: string; objective: string; mode: string; status: string; running?: boolean };

@@ -1,6 +1,8 @@
 # Hybrid runtime
 
-Status: design agreed, nothing built. The decisions at the end are settled: official Go SDKs for the model clients, hybrid as the only mode (no OpenCode-only setting), OpenCode stays a required dependency.
+Status: design agreed. The decisions at the end are settled: official Go SDKs for the model clients, hybrid as the only mode (no OpenCode-only setting), OpenCode stays a required dependency.
+
+Built so far: `runtime.Mux` (`core/internal/runtime/mux.go`) with one routed backend, Claude Code ([claude-code.md](claude-code.md)), behind `relo.claudeCode.enabled`. It differs from the plan below in three ways. It routes by the model's provider (`SessionConfig.Provider`), not by a turn's capabilities. OpenCode's session ids keep their form and only the routed backend's carry a prefix (`claude_…`). And `ReplyPermission` is now a named interface (`runtime.PermissionReplier`), which the OpenCode adapter implements too. The native runtime is not built.
 
 Relo keeps OpenCode where it earns its place and adds a native runtime where OpenCode is in the way. Both sit behind the `AgentRuntime` interface that already exists, behind a small multiplexer, so the orchestrator, context engine, integration engine and UI do not learn that there are two. `relo.runtime` keeps its two values: `opencode` means the real runtime stack (which from now on is the hybrid), `mock` is the in-process stand-in.
 
@@ -24,7 +26,7 @@ Relo keeps OpenCode where it earns its place and adds a native runtime where Ope
 
 - **Most turns are already read-only.** `StartSession` denies `edit`, `write`, `bash` and `shell` for any session with `ReadOnly` set, and the orchestrator sets it for every non-mutating role (Primary, Head, Probe, Reviewer) and for every role outside build mode. So the effective tools of those turns are `read`, `grep`, `glob`, `list` and the two Relo MCP tools. Setting `bash: true` in `DefaultTools` for a non-mutating role has no effect on them.
 - **The Primary has every tool off** (`ToolsFor`), reasons over a curated context, and returns JSON. It is the most expensive model in a run and needs the least from a runtime.
-- **There is one runtime.** `Coord.Runtime` is set once (`SetRuntime`) and `runAgent` uses it for everything. Optional abilities are found by type assertion: `Compactor`, `MessageRuntime`, and an unnamed `ReplyPermission` interface in `askPerm`. Sessions are cached per agent in `runtimeSessions` and replaced when the agent's context generation or model changes.
+- **There is one runtime.** `Coord.Runtime` is set once (`SetRuntime`) and `runAgent` uses it for everything. Optional abilities are found by type assertion: `Compactor`, `MessageRuntime` and `PermissionReplier` (in `askPerm`). Sessions are cached per agent in `runtimeSessions` and replaced when the agent's context generation or model changes.
 - **Agents already restart their runtime session at a generation boundary.** Relo's context engine rebuilds the prompt per generation, and on refresh it closes the runtime session and starts a new one. A backend that is fixed for a generation therefore needs no history to move between backends.
 - **A runtime session does not have to survive a restart.** `restoreSession` marks agents that were running, starting or waiting as `Interrupted`. A native session can live in memory.
 - **Only `Compactor` runtimes summarize in place.** `watchContext` compacts mid-turn only when the runtime implements `Compactor`. Any runtime that reports a context-limit error (`isContextLimit`) gets the other path: the turn is aborted with that error and `MaybeRefresh` starts a new generation. That is the whole story for a runtime without `Compactor`, which matters below.

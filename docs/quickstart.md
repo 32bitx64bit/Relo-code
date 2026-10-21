@@ -34,6 +34,7 @@ Settings (Ctrl+,, search `relo.`):
 - `relo.routing.byDifficulty` (advanced mode: one model per level `trivial|easy|medium|complex|hard|expert`; `complex` falls back to the `hard` model when unset), `relo.routing.escalate`
 - Token saving: `relo.efficiency.preset` (Saving level: `off|auto|max`), `relo.efficiency.voice` (Reply brevity), `relo.efficiency.craft` (Minimal code)
 - `relo.runtime` (`opencode` or `mock`), `relo.openCode.path`
+- `relo.claudeCode.enabled`, `relo.claudeCode.path`: run agents on your installed Claude Code CLI (below)
 
 Pick models with **Relo: Select Primary Model** / **Select Tier 1 Model** / **Select Tier 2 Model**, or in Settings, Models.
 
@@ -47,11 +48,22 @@ endpoint reports, or a guess from the model id, which the model pickers mark as 
 for the models you use for UI work. Agents on a model that sees can view screenshots and reference images with
 `relo_image`, and tasks the Primary marks as visual go to such a model. See [vision.md](vision.md).
 
-Each model also has an API setting, for a router that serves both APIs at one URL (9router, for example). Set
-Claude models behind an OpenAI-compatible router to **Anthropic API** (`"kind": "anthropic"` on the model in
-`relo.providers`). The OpenAI format cannot carry the signature on Claude's thinking, so the router drops that
-thinking on every tool step and Claude works its plan out again from nothing each time: at high effort that was
-40-60k output tokens and 4-7 minutes per step. In the Anthropic format the thinking goes back with its signature.
+Each model also has an API setting, for a router that serves both APIs at one URL. Claude reached in the OpenAI
+format loses its thinking between tool steps: the format cannot carry the thinking's signature, so the router drops
+it and Claude works its plan out again from nothing on every step (40-60k output tokens and 4-7 minutes per step at
+xhigh). Setting the model to **Anthropic API** (`"kind": "anthropic"` on the model in `relo.providers`) keeps the
+thinking, where the router passes Anthropic's format through unchanged, as it does for an Anthropic API key.
+
+Not with 9router on a Claude subscription login: 9router renames every tool there (`shell` to `shell_ide`) and,
+in 9router 0.5.104, does not rename them back when it streams Anthropic's format, so every tool call fails. Keep
+such models on the OpenAI format and give them efforts (`"efforts": ["low", "medium", "high"]`) and a level in
+`relo.models.efforts`: the router's own default (9router's thinking setting, often xhigh) applies only when a
+request names no effort. OpenCode does not send a `none` level, so thinking can be lowered this way, not turned off.
+
+To run Claude with its thinking kept, use Claude Code instead: install and sign in to the `claude` CLI, turn on
+`relo.claudeCode.enabled` (Settings, Claude Code), and pick `claude-code/...` models for any role. Relo runs one
+CLI per agent with Relo's prompt and only the role's tools, on the CLI's own sign-in and plan limits. On a test
+task that was half the tokens of Claude Code's own defaults. See [claude-code.md](claude-code.md).
 
 ## 5. Zero-cost smoke test
 

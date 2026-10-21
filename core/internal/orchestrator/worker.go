@@ -1274,7 +1274,7 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 		session = nil
 	}
 	if session == nil {
-		sid, err := rt.StartSession(ctx, runtime.SessionConfig{Title: a.Title, Directory: a.Workspace, ReadOnly: !agent.Mutating(a.Role) || sess.Mode != ModeBuild})
+		sid, err := rt.StartSession(ctx, runtime.SessionConfig{Title: a.Title, Directory: a.Workspace, ReadOnly: !agent.Mutating(a.Role) || sess.Mode != ModeBuild, Provider: prov})
 		if err != nil {
 			c.runtimeMu.Unlock()
 			return "", err
@@ -1898,12 +1898,14 @@ func (c *Coord) askPerm(ctx context.Context, a agent.Agent, ev runtime.Event) {
 	}
 	title := fmt.Sprint(ev.Permission["title"])
 	cmd := fmt.Sprint(ev.Permission["pattern"])
+	// A runtime that names the file a request touches (Claude Code does) lets the outside-the-workspace rule apply.
+	path, _ := ev.Permission["path"].(string)
 	sess := c.Current()
 	workspace := ""
 	if sess != nil {
 		workspace = sess.Workspace
 	}
-	act := permission.Classify(title, cmd, "", workspace)
+	act := permission.Classify(title, cmd, path, workspace)
 	dec := policy.Get(act)
 	reply := permission.MapReply(dec)
 	if dec == permission.Ask {
@@ -1938,9 +1940,7 @@ func (c *Coord) askPerm(ctx context.Context, a agent.Agent, ev runtime.Event) {
 			reply = "reject"
 		}
 	}
-	if oc, ok := c.RuntimeSnapshot().(interface {
-		ReplyPermission(ctx context.Context, session, permID, response string) error
-	}); ok {
+	if oc, ok := c.RuntimeSnapshot().(runtime.PermissionReplier); ok {
 		if err := oc.ReplyPermission(ctx, ev.Session, fmt.Sprint(ev.Permission["id"]), reply); err != nil {
 			c.logWarn("reply permission", err)
 		}

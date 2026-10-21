@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -91,6 +92,11 @@ func (c *Coord) watchContext(ctx context.Context, a agent.Agent, rt runtime.Agen
 	defer cancel()
 	if err := cp.Compact(cctx, sid); err != nil {
 		w.compacting, w.before = false, 0
+		if errors.Is(err, runtime.ErrUnsupported) {
+			// The session's backend (Claude Code) compacts on its own and reports it through Compaction events.
+			w.givenUp = true
+			return
+		}
 		if w.refused++; w.refused >= refusalsMax {
 			w.givenUp = true
 		}

@@ -36,6 +36,10 @@ func (a *App) applyProviders(p map[string]any) {
 		}
 		a.providerKeys = keys
 	}
+	if raw, ok := p["claudeCode"].(map[string]any); ok {
+		a.claudeOn, _ = raw["enabled"].(bool)
+		a.claudePath, _ = raw["path"].(string)
+	}
 }
 
 // providerEnv is the extra environment for the OpenCode child.
@@ -48,7 +52,7 @@ func (a *App) providerEnv() ([]string, error) {
 // markProviderRunning records which provider config the live OpenCode child was started with.
 func (a *App) markProviderRunning() {
 	a.provMu.Lock()
-	a.runningProvider = provider.Fingerprint(a.providers, a.providerKeys)
+	a.runningProvider = a.runtimeFingerprintLocked()
 	a.restartPending = false
 	a.provMu.Unlock()
 }
@@ -57,7 +61,13 @@ func (a *App) markProviderRunning() {
 func (a *App) providersChanged() bool {
 	a.provMu.Lock()
 	defer a.provMu.Unlock()
-	return provider.Fingerprint(a.providers, a.providerKeys) != a.runningProvider
+	return a.runtimeFingerprintLocked() != a.runningProvider
+}
+
+// runtimeFingerprintLocked covers everything the backends are started with: the providers and keys OpenCode gets,
+// and whether and where Claude Code runs. provMu must be held.
+func (a *App) runtimeFingerprintLocked() string {
+	return provider.Fingerprint(a.providers, a.providerKeys) + fmt.Sprintf("\x00claude=%t:%s", a.claudeOn, a.claudePath)
 }
 
 func (a *App) setRestartPending(v bool) {

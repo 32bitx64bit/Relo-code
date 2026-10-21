@@ -219,3 +219,77 @@ func writeOpenAIStep(w http.ResponseWriter, model string, followUp bool) {
 	}
 	fmt.Fprint(w, "data: [DONE]\n\n")
 }
+
+// On an OpenAI-compatible route the router fills its own default effort (9router: xhigh) whenever a request names
+// none, so a model's chosen effort must reach the wire as reasoning_effort. OpenCode drops a "none" variant, so
+// thinking cannot be switched off this way, only lowered. Needs RELO_E2E_OPENCODE=1.
+func TestChosenEffortReachesAnOpenAIFormatRequest(t *testing.T) {
+	if os.Getenv("RELO_E2E_OPENCODE") == "" {
+		t.Skip("set RELO_E2E_OPENCODE=1 to run against the installed opencode")
+	}
+	bin, err := exec.LookPath("opencode")
+	if err != nil {
+		t.Skip("opencode is not installed")
+	}
+	var mu sync.Mutex
+	efforts := map[string]any{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(b, &req)
+		model, _ := req["model"].(string)
+		mu.Lock()
+		if _, seen := efforts[model]; !seen && strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			efforts[model] = req["reasoning_effort"]
+		}
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeOpenAIStep(w, model, true)
+	}))
+	defer srv.Close()
+	levels := []string{"low", "medium", "high"}
+	ps := []provider.Provider{{ID: "fake", Kind: provider.KindOpenAI, BaseURL: srv.URL + "/v1", Models: []provider.Model{
+		{ID: "claude-low", Reasoning: true, Efforts: levels}, {ID: "claude-default", Reasoning: true, Efforts: levels}}}}
+	penv, err := provider.Env(ps, map[string]string{"fake": "k"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	proc, err := Start(ctx, bin, work, append(Isolation(t.TempDir()), penv...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proc.Stop()
+	rt := proc.Runtime()
+	want := map[string]string{"claude-low": "low", "claude-default": ""}
+	for model, effort := range want {
+		sid, err := rt.StartSession(ctx, runtime.SessionConfig{Title: model, Directory: work, ReadOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		evs, err := rt.Events(ctx, sid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		task := runtime.AgentTask{AgentID: model, Role: "probe", Model: model, Provider: "fake", Effort: effort, System: "SYSTEM", Prompt: "hi", Tools: runtime.ToolsFor("probe", "build", false), Directory: work}
+		if err := rt.SendTask(ctx, sid, task); err != nil {
+			t.Fatal(err)
+		}
+		for ev := range evs {
+			if ev.Done {
+				break
+			}
+		}
+		_ = rt.CloseSession(ctx, sid)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for model, effort := range want {
+		t.Logf("%s: chose %q, request carried reasoning_effort %v", model, effort, efforts[model])
+		if effort == "" && efforts[model] != nil || effort != "" && efforts[model] != effort {
+			t.Errorf("%s: request carried reasoning_effort %v, want %q (none when unset)", model, efforts[model], effort)
+		}
+	}
+}
