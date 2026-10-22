@@ -23,6 +23,18 @@ function jsonLength(value: unknown): number {
   }
 }
 
+// Settings that core consumes. A change to any of them re-applies to the running core; one that is missing here only
+// reaches the core when it next starts, so the Settings page appears to save it and the core goes on with the old value.
+export const CORE_SETTING_SECTIONS = [
+  "relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model",
+  "relo.context", "relo.efficiency", "relo.permissions", "relo.report", "relo.logLevel",
+  "relo.maxConcurrentAgents", "relo.maxTier1Agents", "relo.maxTier2Agents", "relo.maxHierarchyDepth", "relo.maxRetries",
+  "relo.autoVerify", "relo.autoReview",
+  "relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics", "relo.changes.ignorePaths",
+  "relo.changes.unionPaths", "relo.changes.takeLatestPaths", "relo.scheduler.pathLeases",
+  "relo.workspace", "relo.claudeCode", "relo.runtime", "relo.openCode",
+];
+
 // Commands the webview may trigger. Anything else is dropped.
 export const COMMAND_ALLOWLIST = new Set<string>([
   "relo.newSession",
@@ -42,7 +54,10 @@ export const COMMAND_ALLOWLIST = new Set<string>([
   "relo.agent.inspect",
   "relo.agent.openWorktree",
   "relo.changes.accept",
+  "relo.changes.acceptWithParents",
   "relo.changes.reject",
+  "relo.changes.rejectWithDependents",
+  "relo.changes.rebaseWithoutParent",
   "relo.changes.diff",
   "relo.changes.resolveAgent",
   "relo.changes.resolveMine",
@@ -59,7 +74,10 @@ export const ID_COMMANDS = new Set<string>([
   "relo.agent.inspect",
   "relo.agent.openWorktree",
   "relo.changes.accept",
+  "relo.changes.acceptWithParents",
   "relo.changes.reject",
+  "relo.changes.rejectWithDependents",
+  "relo.changes.rebaseWithoutParent",
   "relo.changes.diff",
   "relo.changes.resolveAgent",
   "relo.changes.resolveMine",

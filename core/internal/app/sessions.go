@@ -441,13 +441,37 @@ func (a *App) acceptChangeLocked(id, expect string) (any, error, string, string)
 	}
 	outcome, err := a.mergeChange(ch)
 	if err != nil {
-		return nil, err, "", ""
+		return nil, a.stackedHint(ch, err), "", ""
 	}
 	updated, _ := a.Coord.UpdateChange(id, func(c *orchestrator.Change) {
 		c.Status, c.Conflict, c.Resolving, c.Landed = "accepted", "", false, outcome.Action
 	})
 	a.persist()
 	return map[string]any{"change": updated, "integration": outcome}, nil, ch.Path, ch.AgentID
+}
+
+// stackedHint explains an overlap that is not the user's doing. A change stacked on a parent was written on top of the
+// parent's edit, so landing it before the parent reads as an overlap with a workspace that simply lacks that edit.
+// Accepting with its parents is the way through; the message says so instead of telling the user to resolve by hand.
+func (a *App) stackedHint(ch orchestrator.Change, err error) error {
+	var fail ipc.Fail
+	if !errors.As(err, &fail) || fail.C != "integration_conflict" {
+		return err
+	}
+	pending := a.unmetNeeds(ch)
+	if len(pending) == 0 {
+		return err
+	}
+	names := make([]string, 0, len(pending))
+	for _, id := range pending {
+		if parent, ok := a.Coord.FindChange(id); ok && parent.Path != "" {
+			names = append(names, parent.Path)
+		} else {
+			names = append(names, id)
+		}
+	}
+	fail.M += fmt.Sprintf(" This change builds on %s, which is not accepted yet; use Accept with parents to take them together.", strings.Join(names, ", "))
+	return fail
 }
 
 // resolveChange is the explicit resolution action for one change. head sends it to the head agent, mine rejects it

@@ -2,13 +2,13 @@
 
 Agents do not need their own physical copy of the repository. They need their own consistent view of it, and a real directory only at the moments a tool needs real files. The Virtual Workspace Engine (VWE) gives each mutating agent a logical workspace held in Git's object database, and lays files out on disk only for execution. Cognitive state (what the agent knows), repository state (what the agent has) and execution state (the directory a tool runs in) are kept apart and linked by stable revision ids.
 
-It is off by default. Relo cuts worktrees exactly as described in [worktrees.md](worktrees.md) unless `relo.workspace.mode` says otherwise.
+It is on by default. Relo cuts virtual workspaces for every isolated agent whose repository allows it; worktrees, the opt-in alternative, are described in [worktrees.md](worktrees.md) and are used when `relo.workspace.mode` says otherwise or when a virtual workspace cannot be used.
 
 ## Settings
 
 | Setting | Values | Default | Meaning |
 |---|---|---|---|
-| `relo.workspace.mode` | `worktree`, `virtual`, `auto` | `worktree` | `worktree`: one Git worktree per agent, unchanged. `virtual`: a virtual workspace for every isolated agent whose repository allows it. `auto`: virtual where the repository allows it, a worktree otherwise. |
+| `relo.workspace.mode` | `worktree`, `virtual`, `auto` | `virtual` | `worktree`: one Git worktree per agent, unchanged, opt-in. `virtual`: a virtual workspace for every isolated agent whose repository allows it. The default. `auto`: virtual where the repository allows it, a worktree otherwise. |
 | `relo.workspace.materialization` | `automatic`, `worktree` | `automatic` | How a directory is made when tools need real files. Both values use a detached Git worktree today; the setting exists so a cheaper backend can be added without a migration. |
 | `relo.workspace.virtualReads` | boolean | `false` | Serve the model's file reads from the overlay instead of a directory. It only takes effect where the runtime guarantees every file tool is routed through Relo. OpenCode 2.x does not, so the setting is ignored with one notice. |
 
@@ -86,7 +86,7 @@ Workspaces are released with their last decided change, and swept at start when 
 
 - **Mode B, materialized** (what runs today): a tool that needs real files gets a directory, and its edits are imported by the next reader or at settle. Shell, build and test output is captured like any other edit.
 - **Mode A, virtual tools** (`virtualReads`): the model's file tools read and write the overlay with no directory. This needs a runtime in which every file tool is routed through Relo, with no bypass. OpenCode 2.x runs its own file tools, so the setting is gated off for it; the code path and its tests exist.
-- **Fallback**: worktrees, always available, and the default.
+- **Fallback**: worktrees, always available, and the fallback when a virtual workspace cannot be used.
 
 ## What is tested
 

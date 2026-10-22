@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
-import { checkCommand, checkSessionId, checkSetting, isAllowedCommand, modelsSignature, settingsReply, type SettingsSchema } from "./settingsBridge";
+import { CORE_SETTING_SECTIONS, checkCommand, checkSessionId, checkSetting, isAllowedCommand, modelsSignature, settingsReply, type SettingsSchema } from "./settingsBridge";
 
 const schema: SettingsSchema = {
   "relo.primaryModel": { type: "string", default: "" },
@@ -12,6 +12,16 @@ const schema: SettingsSchema = {
   "relo.providers": { type: "array", default: [] },
   "other.key": { type: "string", default: "" },
 };
+
+test("workspace mode: the manifest default is virtual, and the extension fallback matches it", () => {
+  const manifest = JSON.parse(readFileSync("package.json", "utf8"));
+  const actual: SettingsSchema = manifest.contributes.configuration.properties;
+  assert.equal(actual["relo.workspace.mode"].default, "virtual");
+  assert.deepEqual(actual["relo.workspace.mode"].enum, ["worktree", "virtual", "auto"]);
+  // extension.ts sends this mode to the core; it must not drift from the manifest default.
+  const source = readFileSync("src/extension.ts", "utf8");
+  assert.match(source, /workspaceMode: c\.get<string>\("workspace\.mode", "virtual"\)/);
+});
 
 test("settings: unknown key rejected", () => {
   assert.equal(checkSetting("relo.nope", "x", schema).ok, false);
@@ -161,4 +171,38 @@ test("models signature: changes when a model is added, or its limits or efforts 
   assert.notEqual(modelsSignature([{ ...a[0], vision: "yes", visionSource: "name" }]), modelsSignature([{ ...a[0], vision: "yes", visionSource: "configured" }]));
   assert.equal(modelsSignature(undefined), "");
   assert.equal(modelsSignature([null, 3]).length > 0, true); // junk entries do not throw
+});
+
+// A button the webview draws but the bridge drops does nothing and says nothing. Every command the webview can post
+// must pass the check, an id command with the id the button carries and any other without one.
+test("every command the webview posts passes the bridge", () => {
+  const source = readFileSync("../webview/src/main.js", "utf8");
+  const registered = new Set<string>([...readFileSync("src/extension.ts", "utf8").matchAll(/\bcmd\("(relo\.[\w.]+)"/g)].map((m) => m[1]));
+  const withId = new Set<string>();
+  for (const m of source.matchAll(/rowBtn\("command",\s*"(relo\.[\w.]+)"/g)) withId.add(m[1]);
+  for (const m of source.matchAll(/data-command="(relo\.[\w.]+)"/g)) withId.add(m[1]);
+  const plain = new Set<string>();
+  for (const m of source.matchAll(/data-(?:cmd|menu-cmd)="(relo\.[\w.]+)"/g)) plain.add(m[1]);
+  assert.ok(withId.has("relo.changes.accept") && withId.has("relo.changes.acceptWithParents"), "the scan found the Changes buttons");
+  for (const command of withId) {
+    assert.deepEqual(checkCommand({ command, id: "chg_1" }), { ok: true, command, args: [{ id: "chg_1" }] }, command);
+    assert.ok(registered.has(command), `${command} is not registered in extension.ts`);
+  }
+  for (const command of plain) {
+    assert.deepEqual(checkCommand({ command }), { ok: true, command, args: [] }, command);
+    assert.ok(registered.has(command), `${command} is not registered in extension.ts`);
+  }
+});
+
+// A setting the core reads but the extension does not watch is saved and then ignored until the core restarts: that is
+// how permissions set to allow kept asking in a running window. Every key in the payload must re-apply when it changes.
+test("every setting sent to the core re-applies when it changes", () => {
+  const source = readFileSync("src/extension.ts", "utf8");
+  const start = source.indexOf("async function settingsPayload");
+  const body = source.slice(start, source.indexOf("\n}\n", start));
+  const keys = [...body.matchAll(/\bc\.get(?:<.*?>)?\(\s*"([\w.]+)"/g)].map((m) => `relo.${m[1]}`);
+  assert.ok(keys.includes("relo.permissions.destructive") && keys.includes("relo.permissions.yolo"), "the scan found the permission settings");
+  assert.ok(keys.length > 50, `the scan found only ${keys.length} settings`);
+  const covered = (key: string) => CORE_SETTING_SECTIONS.some((section) => key === section || key.startsWith(`${section}.`));
+  assert.deepEqual(keys.filter((key) => !covered(key)), []);
 });

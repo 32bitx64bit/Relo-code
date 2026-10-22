@@ -663,11 +663,11 @@
             "auto"
           ],
           "enumDescriptions": [
-            "Every agent gets its own Git worktree: a full checkout of the repository. The default, and the fallback for everything below.",
-            "Agents share one immutable base snapshot and each keeps its own edits as Git objects. A folder is checked out only while a tool needs real files. Falls back to a worktree, with a notice, in a repository whose Git settings rewrite file content on checkout.",
+            "Every agent gets its own Git worktree: a full checkout of the repository. Opt-in, and the fallback for everything below.",
+            "Agents share one immutable base snapshot and each keeps its own edits as Git objects. A folder is checked out only while a tool needs real files. The default. Falls back to a worktree, with a notice, in a repository whose Git settings rewrite file content on checkout.",
             "Virtual workspaces where the repository supports them, worktrees everywhere else."
           ],
-          "default": "worktree",
+          "default": "virtual",
           "scope": "window",
           "description": "How Relo isolates each agent's edits. Applies to agents created after the change; an agent already working keeps what it has. Your own folder is never written by either mode, and neither mode stages, commits or pushes."
         },

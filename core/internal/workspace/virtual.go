@@ -16,7 +16,7 @@ import (
 type Mode string
 
 const (
-	// ModeWorktree gives every isolated agent a Git worktree. It is the default and the fallback.
+	// ModeWorktree gives every isolated agent a Git worktree. It is the fallback for a mode the core does not know.
 	ModeWorktree Mode = "worktree"
 	// ModeVirtual holds the agent's state as Git objects and refs, and lays out a directory only while its tools run.
 	ModeVirtual Mode = "virtual"
@@ -35,14 +35,15 @@ type Config struct {
 	VirtualReads bool `json:"virtualReads"`
 }
 
-// DefaultConfig is the setting every Manager starts with. Production leaves it empty, which means worktrees; a test
-// run sets it to put a whole suite through another mode and compare.
+// DefaultConfig is the setting every Manager starts with. Production leaves it empty, which means virtual workspaces;
+// a test run sets it to put a whole suite through another mode and compare.
 var DefaultConfig Config
 
-// Normalized fills defaults and replaces values it does not know with the safe ones.
+// Normalized fills defaults and replaces values it does not know with the safe ones. An empty mode means virtual; a
+// mode the core does not know means worktrees, so a bad value can never turn virtual workspaces on.
 func (c Config) Normalized() Config {
 	switch Mode(strings.ToLower(strings.TrimSpace(string(c.Mode)))) {
-	case ModeVirtual:
+	case "", ModeVirtual:
 		c.Mode = ModeVirtual
 	case ModeAuto:
 		c.Mode = ModeAuto

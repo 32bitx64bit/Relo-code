@@ -15,6 +15,9 @@ import (
 func TestWorkspaceSettingsReachTheWorkspaceLayer(t *testing.T) {
 	core, dir := newGitCore(t, map[string]string{"a.txt": "one\n"})
 	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
+	if got := core.Coord.WS.Config().Mode; got != workspace.ModeVirtual {
+		t.Fatalf("unset mode = %s, want virtual", got)
+	}
 
 	core.applySettings(map[string]any{"workspaceMode": "worktree"})
 	if got := core.Coord.WS.Config(); got.Mode != workspace.ModeWorktree || got.Materialization != "automatic" || got.VirtualReads {

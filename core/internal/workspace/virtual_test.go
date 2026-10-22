@@ -240,7 +240,7 @@ func TestWorktreeModeNeverOpensTheVirtualEngine(t *testing.T) {
 	if _, opened := m.VirtualMetrics(); opened {
 		t.Fatal("the virtual engine was opened in worktree mode")
 	}
-	if got := (Config{}).Normalized(); got.Mode != ModeWorktree || got.Materialization != "automatic" || got.VirtualReads {
+	if got := (Config{}).Normalized(); got.Mode != ModeVirtual || got.Materialization != "automatic" || got.VirtualReads {
 		t.Fatalf("defaults = %+v", got)
 	}
 	if got := (Config{Mode: "nonsense", Materialization: "x"}).Normalized(); got.Mode != ModeWorktree || got.Materialization != "automatic" {

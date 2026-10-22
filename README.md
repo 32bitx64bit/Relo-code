@@ -32,7 +32,7 @@ Visual Studio Code  --stdio JSON-RPC-->  Relo Core (Go)
                                         OpenCode serve
 ```
 
-See [docs/architecture.md](docs/architecture.md) and [docs/context-engine.md](docs/context-engine.md). Agents work in Git worktrees by default; virtual workspaces, an opt-in alternative that lays files out only when a tool needs them, are described in [docs/virtual-workspaces.md](docs/virtual-workspaces.md). A proposal for running part of the work on a native runtime next to OpenCode is in [docs/hybrid-runtime.md](docs/hybrid-runtime.md). How Relo tells which models can see images, and how agents view screenshots, is in [docs/vision.md](docs/vision.md). Running agents on your installed Claude Code CLI, with its own sign-in, is in [docs/claude-code.md](docs/claude-code.md).
+See [docs/architecture.md](docs/architecture.md) and [docs/context-engine.md](docs/context-engine.md). Agents work in virtual workspaces by default, which lay files out on disk only when a tool needs real files; Git worktrees, the opt-in alternative, are described in [docs/worktrees.md](docs/worktrees.md), and virtual workspaces in [docs/virtual-workspaces.md](docs/virtual-workspaces.md). A proposal for running part of the work on a native runtime next to OpenCode is in [docs/hybrid-runtime.md](docs/hybrid-runtime.md). How Relo tells which models can see images, and how agents view screenshots, is in [docs/vision.md](docs/vision.md). Running agents on your installed Claude Code CLI, with its own sign-in, is in [docs/claude-code.md](docs/claude-code.md).
 
 ## Quick start
 

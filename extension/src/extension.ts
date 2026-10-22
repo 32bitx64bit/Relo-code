@@ -5,7 +5,7 @@ import { repositoryInfo, snapRepository } from "./repository";
 import { CoreClient } from "./client";
 import { emptyState, reduce, routingFrom, type ReloState, type AgentInfo, type CacheInfo, type ChangeDiff, type SessionSummary, normalizeCache } from "./protocol";
 import { ChatView, openDashboard, openInspector } from "./webview";
-import { checkCommand, checkSessionId, checkSetting, modelsSignature, settingsReply, type SettingsSchema } from "./settingsBridge";
+import { CORE_SETTING_SECTIONS, checkCommand, checkSessionId, checkSetting, modelsSignature, settingsReply, type SettingsSchema } from "./settingsBridge";
 import { applyCollapse, cleanCollapsed, type Collapsed } from "./uiState";
 import { CrashBreaker } from "./crashBreaker";
 import { PROVIDER_ID_RE, sanitizeDiscovered, sanitizeProviderList, secretKey, validateBaseURL, validateProvider, MAX_PROVIDERS, type ProviderConfig } from "./providers";
@@ -38,8 +38,6 @@ let coreLifecycle: Promise<void> = Promise.resolve();
 let postedRepository = "";
 let canvas: CanvasManager;
 
-// Settings that core consumes; a change to any of them re-applies to the running core.
-const CORE_SETTING_SECTIONS = ["relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.context", "relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics", "relo.changes.ignorePaths", "relo.changes.unionPaths", "relo.changes.takeLatestPaths", "relo.scheduler.pathLeases", "relo.workspace", "relo.claudeCode"];
 
 export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   output = vscode.window.createOutputChannel("Relo");
@@ -749,7 +747,7 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
     unionPaths: c.get<string[]>("changes.unionPaths", ["*.md", "*.txt"]),
     takeLatestPaths: c.get<string[]>("changes.takeLatestPaths", []),
     pathLeases: c.get<boolean>("scheduler.pathLeases", false),
-    workspaceMode: c.get<string>("workspace.mode", "worktree"),
+    workspaceMode: c.get<string>("workspace.mode", "virtual"),
     workspaceMaterialization: c.get<string>("workspace.materialization", "automatic"),
     workspaceVirtualReads: c.get<boolean>("workspace.virtualReads", false),
     routingMode: c.get<string>("routing.mode", "simple"),
@@ -952,8 +950,19 @@ async function decideChange(kind: "accept" | "reject", id: string | undefined): 
     await client.request(kind === "accept" ? "changes.accept" : "changes.reject", expect ? { id, expect } : { id });
   } catch (err) {
     // The core's message says which file and why (for example "a.ts: your edits and the agent's edits overlap").
-    void vscode.window.showErrorMessage(`Relo: could not ${kind} the change. ${errorText(err)}`);
+    // A stacked change refused for want of its parents gets the one action that takes them together.
+    const stacked = kind === "accept" && unmetParents(state.changes.find((c) => c.id === id)).length > 0;
+    void vscode.window.showErrorMessage(`Relo: could not ${kind} the change. ${errorText(err)}`, ...(stacked ? [ACCEPT_WITH_PARENTS] : [])).then((picked) => {
+      if (picked === ACCEPT_WITH_PARENTS) void acceptWithParents(id);
+    });
   }
+}
+
+const ACCEPT_WITH_PARENTS = "Accept with parents";
+
+// The parents a stacked change was written on top of that are not accepted yet.
+function unmetParents(chg: (typeof state.changes)[number] | undefined): string[] {
+  return (chg?.needs ?? []).filter((need) => state.changes.find((c) => c.id === need)?.status !== "accepted");
 }
 
 async function acceptWithParents(id: string | undefined): Promise<void> {
