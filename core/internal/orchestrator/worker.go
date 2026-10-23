@@ -461,7 +461,7 @@ func (c *Coord) workerReport(ctx context.Context, a agent.Agent, parts prompt.Pa
 		}
 		if strings.HasPrefix(text, "{") && !deliversChanges(a.Role) {
 			c.logWarn("worker report was not valid JSON; keeping it as text", ferr)
-			return RawReport{Status: "completed", Summary: text, Risks: []string{"The agent's report was not valid JSON; this summary is its raw reply."}}, nil
+			return proseReport(text, "The agent's report was not valid JSON; this summary is its raw reply."), nil
 		}
 		if strings.HasPrefix(text, "{") {
 			// A broken report object is not a summary worth showing. If git saw no change either, there is no
@@ -473,7 +473,7 @@ func (c *Coord) workerReport(ctx context.Context, a agent.Agent, parts prompt.Pa
 			return RawReport{Status: "completed", Summary: "The agent changed files but did not write a valid summary.", Risks: []string{"The agent's report was not valid: " + ferr.Error()}}, nil
 		}
 		c.logWarn("worker report was not structured JSON; keeping it as text", ferr)
-		return RawReport{Status: "completed", Summary: text, Risks: []string{"The agent did not return a structured report; this summary is its raw reply."}}, nil
+		return proseReport(text, "The agent did not return a structured report; this summary is its raw reply."), nil
 	}
 	rep, perr := ParseJSON[RawReport](body)
 	if perr != nil {
@@ -489,6 +489,20 @@ func (c *Coord) workerReport(ctx context.Context, a agent.Agent, parts prompt.Pa
 		}
 	}
 	return rep, nil
+}
+
+// proseStatusLine finds a "Status: blocked" or "Status: failed" line, with optional markdown around it.
+var proseStatusLine = regexp.MustCompile(`(?im)^[\s*#>_-]*status\s*[:*]+\s*\**\s*(blocked|failed)\b`)
+
+// proseReport turns a reply that is not a structured report into a report. Its own "Status: blocked" or
+// "Status: failed" line is kept as that verdict; only a reply that says nothing about status is completed.
+// unstructured marks it so acceptReport does not treat it as a valid negative verdict.
+func proseReport(text, risk string) RawReport {
+	rep := RawReport{Status: "completed", Summary: text, Risks: []string{risk}, unstructured: true}
+	if m := proseStatusLine.FindStringSubmatch(text); m != nil {
+		rep.Status = strings.ToLower(m[1])
+	}
+	return rep
 }
 
 // verifyOutcome is what the project's checks said about a worker's result.
@@ -867,6 +881,10 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		short, _ = clipText(text, c.summaryLimit(""))
 	}
 	checksFailed := outcome.ran && !outcome.passed
+	// A valid structured failed report from a read-only reviewer or probe is its verdict, delivered to the Primary
+	// and not retried. Invalid or prose replies still go through the retry path.
+	negativeVerdict := st == agent.Failed && !blocked && !rep.unstructured && rep.ValidationError == "" &&
+		(a.Role == agent.Reviewer || a.Role == agent.Probe)
 	if checksFailed {
 		rep.Risks = append([]string{"Checks still failing after " + plural(outcome.repairs, "repair attempt") + ": " + firstLine(outcome.failure)}, rep.Risks...)
 	}
@@ -969,6 +987,10 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		c.chat("system", fmt.Sprintf("%q finished, but the project's checks still fail (%s). Its changes are in the Changes tab for you to review.", t.Title, firstLine(outcome.failure)), "")
 	case rep.ValidationError != "":
 		c.chat("system", fmt.Sprintf("%q did not return a usable report (%s).", t.Title, firstLine(rep.Summary)), "")
+	case negativeVerdict:
+		// A read-only reader that read the work and said no has answered. A retry would re-read the same work and
+		// may return a different verdict; the Primary gets this one and decides what to do with it.
+		c.chat("system", fmt.Sprintf("%q returned a negative verdict: %s.", t.Title, firstLine(rep.Summary)), "")
 	default:
 		c.rememberFailure(t.ID, "the agent reported: "+tailText(firstLine(rep.Summary), 300))
 		c.retryTask(updated, a)

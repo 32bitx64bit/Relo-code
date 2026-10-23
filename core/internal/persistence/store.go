@@ -148,6 +148,16 @@ CREATE TABLE IF NOT EXISTS events (
   payload TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+-- event_latest holds only the newest snapshot of each full-state event kind (session.updated, changes.updated,
+-- cache.updated) per session, so the log stops growing one row per emit. It is additive like vworkspaces: no
+-- schema-version bump, older builds ignore it, and existing events rows are never rewritten or deleted.
+CREATE TABLE IF NOT EXISTS event_latest (
+  session_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (session_id, name)
+);
 -- vworkspaces mirrors the virtual workspaces Git holds (refs/relo/vws/*), for the UI, diagnostics and for noticing
 -- when Git and Relo disagree after a restart. Git is the source of truth: a row is rebuilt from refs, never trusted
 -- over them. The table is additive, so it needs no schema version and older builds ignore it.
@@ -259,12 +269,29 @@ func (s *Store) PutUsage(session string, v any) error {
 	return err
 }
 
+// snapshotEventKinds are the full-state payloads whose current state is also persisted in the dedicated tables
+// (sessions, changes, usage/agents). They are high-frequency, so the event log keeps only the newest snapshot
+// per session in event_latest instead of appending a row for every emit. Every other event still appends to the
+// events table exactly as before. Live IPC delivery is decided by the caller and is unaffected by where a row
+// is stored; the readers below merge event_latest back in so the newest snapshot is still visible.
+var snapshotEventKinds = map[string]bool{
+	"session.updated": true,
+	"changes.updated": true,
+	"cache.updated":   true,
+}
+
 func (s *Store) LogEvent(session, name string, v any) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO events(session_id, name, payload, created_at) VALUES(?,?,?,?)`, session, name, string(b), time.Now().Unix())
+	now := time.Now().Unix()
+	if snapshotEventKinds[name] {
+		_, err = s.db.Exec(`INSERT INTO event_latest(session_id, name, payload, created_at) VALUES(?,?,?,?)
+			ON CONFLICT(session_id, name) DO UPDATE SET payload=excluded.payload, created_at=excluded.created_at`, session, name, string(b), now)
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO events(session_id, name, payload, created_at) VALUES(?,?,?,?)`, session, name, string(b), now)
 	return err
 }
 
@@ -326,7 +353,12 @@ func (s *Store) EventRows(session string, limit int) ([]EventRow, error) {
 	if limit <= 0 {
 		limit = 200
 	}
-	rows, err := s.db.Query(`SELECT name, payload FROM events WHERE session_id=? ORDER BY id DESC LIMIT ?`, session, limit)
+	rows, err := s.db.Query(`
+		SELECT name, payload FROM (
+			SELECT name, payload, created_at FROM event_latest WHERE session_id=?
+			UNION ALL
+			SELECT name, payload, created_at FROM events WHERE session_id=? AND name NOT IN ('session.updated','changes.updated','cache.updated')
+		) ORDER BY created_at DESC LIMIT ?`, session, session, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +383,7 @@ func (s *Store) DeleteSession(id string) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"agents", "tasks", "generations", "findings", "reports", "usage", "changes", "verification", "events"} {
+	for _, table := range []string{"agents", "tasks", "generations", "findings", "reports", "usage", "changes", "verification", "events", "event_latest"} {
 		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE session_id=?`, id); err != nil {
 			return err
 		}
@@ -395,7 +427,15 @@ func (s *Store) Events(session string, limit int) ([]json.RawMessage, error) {
 	if limit <= 0 {
 		limit = 200
 	}
-	rows, err := s.db.Query(`SELECT payload FROM events WHERE session_id=? ORDER BY id DESC LIMIT ?`, session, limit)
+	// Merge the newest snapshots (event_latest) with the appended events, newest first, so the operator log
+	// still shows the latest snapshot of each kind. The three snapshot kinds are excluded from events to avoid
+	// showing both a stored snapshot and any historical append-only rows left by an older build.
+	rows, err := s.db.Query(`
+		SELECT payload FROM (
+			SELECT payload, created_at FROM event_latest WHERE session_id=?
+			UNION ALL
+			SELECT payload, created_at FROM events WHERE session_id=? AND name NOT IN ('session.updated','changes.updated','cache.updated')
+		) ORDER BY created_at DESC LIMIT ?`, session, session, limit)
 	if err != nil {
 		return nil, err
 	}

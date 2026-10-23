@@ -743,13 +743,7 @@ func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text strin
 	if len(turn.Tasks) > 0 {
 		c.primaryWaits()
 	}
-	if turn.RefreshSelf {
-		if _, err := c.Engine.Refresh(primary.ID, "primary requested refresh"); err != nil {
-			c.logWarn("refresh primary context", err)
-		} else {
-			c.emit("context.refreshed", map[string]any{"agentId": primary.ID, "reason": "primary requested refresh"})
-		}
-	}
+	c.honorRefreshSelf(primary.ID, turn)
 	if err := c.drive(ctx); err != nil {
 		return err
 	}
@@ -763,6 +757,19 @@ func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text strin
 		c.emit("session.updated", s)
 	}
 	return nil
+}
+
+// honorRefreshSelf rebuilds the head's context when its turn set refreshSelf. Every head path calls it after applyTurn
+// so the request works on any turn, not only the first. Pinned items survive: Engine.Refresh keeps them in gcPool.
+func (c *Coord) honorRefreshSelf(agentID string, turn Turn) {
+	if !turn.RefreshSelf {
+		return
+	}
+	if _, err := c.Engine.Refresh(agentID, "primary requested refresh"); err != nil {
+		c.logWarn("refresh primary context", err)
+		return
+	}
+	c.emit("context.refreshed", map[string]any{"agentId": agentID, "reason": "primary requested refresh"})
 }
 
 // primaryWaits shows Primary as waiting on its sub-agents rather than as a model that is still thinking.
@@ -1095,6 +1102,7 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 		c.chat("assistant", turn.UserMessage, p.ID)
 	}
 	c.applyTurn(p, turn)
+	c.honorRefreshSelf(p.ID, turn)
 }
 
 func (c *Coord) nextAttempt(t taskgraph.Task, a agent.Agent) (string, bool) {

@@ -75,6 +75,7 @@ type RawReport struct {
 	Question        string       `json:"question"`
 	Structured      []RawFinding `json:"structuredFindings"`
 	ValidationError string       `json:"-"`
+	unstructured    bool         // a prose reply, not a valid report object; never a valid negative verdict
 }
 
 type RawVerify struct {
