@@ -2,8 +2,10 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/relocode/relo/internal/agent"
 	"github.com/relocode/relo/internal/logging"
@@ -152,6 +154,175 @@ func TestBlockedWorkerAsksTheQuestionAndIsNotRetried(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("the question never reached the Primary's context")
+	}
+}
+
+// The question has to live somewhere a later plan cannot overwrite. It is recorded on the task itself, with the
+// family key the guard uses, so a re-plan under a new id still finds it.
+func TestBlockedWorkerLeavesTheQuestionOnItsTask(t *testing.T) {
+	c, r, s := briefFixture(t, `{"status":"blocked","summary":"Both files define Load.","question":"Which Load should the CLI call, config.Load or settings.Load?"}`)
+	task := c.Graph.Add(taskgraph.Task{
+		Title: "SPT stage 2 per spt-impl-plan contract", Role: string(agent.Worker), Workspace: s.Workspace,
+		Model: "mock/t1", Difficulty: "medium", Paths: []string{"pax_game_ai.c"}, Scope: "ai",
+	})
+	a := c.spawn(task, agent.Worker)
+	if err := c.execWorker(context.Background(), task, a); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := c.Graph.Get(task.ID)
+	if got.Status != taskgraph.Failed {
+		t.Fatalf("task = %s; a blocked worker is not done, but it must not stay runnable either", got.Status)
+	}
+	if got.BlockedOn == nil || !got.BlockedOn.Unresolved() {
+		t.Fatalf("blockedOn = %+v, want an open question", got.BlockedOn)
+	}
+	if got.BlockedOn.Question != "Which Load should the CLI call, config.Load or settings.Load?" {
+		t.Fatalf("question = %q", got.BlockedOn.Question)
+	}
+	if want := taskgraph.FamilyKey(got); got.BlockedOn.Family != want {
+		t.Fatalf("family = %q, want %q", got.BlockedOn.Family, want)
+	}
+	if got.BlockedOn.BlockedAt.IsZero() {
+		t.Fatal("the block was not timestamped")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.tasks) != 1 {
+		t.Fatalf("model calls = %d, want 1: a blocked worker is not retried", len(r.tasks))
+	}
+}
+
+// Sixteen copies of one worker task were spawned because every re-plan arrived under a new id and a reworded title.
+// The open question, not the id or the wording, is what closes the family.
+// "SPT stage 2 per spt-impl-plan contract" is the incident's verified task title.
+func TestABlockedFamilyRefusesEveryReplanUntilItIsAnswered(t *testing.T) {
+	c, _, _ := briefFixture(t)
+	verified := "SPT stage 2 per spt-impl-plan contract" // the incident's verified task title
+	blocked := c.Graph.Add(taskgraph.Task{
+		ID: "task-blocked", Title: verified, Role: string(agent.Worker), Status: taskgraph.Failed,
+		Paths: []string{"pax_game_ai.c"}, Scope: "ai",
+	})
+	if _, err := c.Graph.Update(blocked.ID, func(x *taskgraph.Task) {
+		x.BlockedOn = &taskgraph.BlockedOn{
+			Question: "Which contract governs stage 2?", Family: taskgraph.FamilyKey(blocked), BlockedAt: time.Now().UTC(),
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	specs := []TurnTask{
+		{ID: "s1", Title: verified, Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"},
+		// HYPOTHETICAL: reworded fragments of the same stage, reconstructed to show the guard does not depend on the
+		// exact title the incident happened to use.
+		{ID: "s2", Title: "SPT stage 2", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"},
+		{ID: "s3", Title: "spt  stage   2 per the spt-impl-plan contract!", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"},
+		{ID: "s4", Title: "SPT stage 2 per spt-staged-plan.md lines 67-78", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"},
+		// Other families: another declared scope, and another stage. Neither is the work that is waiting.
+		{ID: "s5", Title: "SPT stage 2", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ui"},
+		{ID: "s6", Title: "SPT stage 3", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"},
+	}
+	got := c.admitTasks(specs)
+	if len(got) != 2 || got[0].ID != "s5" || got[1].ID != "s6" {
+		t.Fatalf("admitted = %+v, want only the tasks outside the blocked family", got)
+	}
+	if open := c.openQuestions(); len(open) != 1 || open[0].ID != blocked.ID {
+		t.Fatalf("open questions = %+v, want the one blocked task", open)
+	}
+}
+
+// The cap counts launches, not task records: three runs of one family, whether one record retried three times or
+// three records under different ids and titles, is the whole budget. The fourth launch never reaches an agent.
+// "SPT stage 2 per spt-impl-plan contract" is the incident's verified task title; "SPT stage 2" is a HYPOTHETICAL
+// reworded fragment of the same family, reconstructed for the test.
+func TestTheFamilyCapCountsLaunchesAcrossIdsAndRetries(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		launches []int // Attempts already spent by the family's earlier task records
+		wantCap  bool
+	}{
+		{"two launches across two ids", []int{1, 1}, false},
+		{"three launches across three ids", []int{1, 1, 1}, true},
+		{"one record retried to its third launch", []int{3}, true},
+		{"two records, one of them retried", []int{1, 2}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, r, _ := briefFixture(t, `{"status":"completed","summary":"done"}`)
+			for i, n := range tc.launches {
+				c.Graph.Add(taskgraph.Task{
+					ID: fmt.Sprintf("task-run-%d", i), Title: "SPT stage 2 per spt-impl-plan contract",
+					Role: string(agent.Worker), Paths: []string{"pax_game_ai.c"}, Scope: "ai",
+					Status: taskgraph.Failed, Attempts: n,
+				})
+			}
+			next := c.Graph.Add(taskgraph.Task{
+				ID: "task-next", Title: "SPT stage 2", Role: string(agent.Worker),
+				Paths: []string{"pax_game_ai.c"}, Scope: "ai", Model: "mock/t1", MaxAttempts: 3,
+			})
+			if started := c.dispatch(context.Background(), c.scheduler()); tc.wantCap && started != 0 {
+				t.Fatalf("dispatch started %d workers for a family at its cap", started)
+			}
+			got, _ := c.Graph.Get(next.ID)
+			if capped := got.BlockedOn.Unresolved(); capped != tc.wantCap {
+				t.Fatalf("capped = %v, want %v (status %s after %d attempts)", capped, tc.wantCap, got.Status, got.Attempts)
+			}
+			if !tc.wantCap {
+				if got.Status != taskgraph.Done {
+					t.Fatalf("a launch inside the cap ended %s", got.Status)
+				}
+				return
+			}
+			if got.Status != taskgraph.Failed {
+				t.Fatalf("a capped launch is %s, want failed", got.Status)
+			}
+			if !strings.Contains(got.BlockedOn.Question, "limit 3") {
+				t.Fatalf("the cap did not say what the limit is: %q", got.BlockedOn.Question)
+			}
+			if want := taskgraph.FamilyKey(next); got.BlockedOn.Family != want {
+				t.Fatalf("family = %q, want %q", got.BlockedOn.Family, want)
+			}
+			for _, a := range c.Agents.List() {
+				if a.TaskID == next.ID {
+					t.Fatalf("agent %s was spawned for a capped task", a.ID)
+				}
+			}
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if len(r.tasks) != 0 {
+				t.Fatalf("a capped task cost %d model calls", len(r.tasks))
+			}
+		})
+	}
+}
+
+// A Primary that says "completed" while a question is unanswered has not finished: the session stays blocked, and
+// may only complete once the answer is on the task.
+// "SPT stage 2 per spt-impl-plan contract" is the incident's verified task title.
+func TestAnUnansweredQuestionKeepsTheSessionFromCompleting(t *testing.T) {
+	c, _, _ := briefFixture(t,
+		`{"status":"completed","userMessage":"done","tasks":[]}`,
+		`{"status":"completed","userMessage":"done","tasks":[]}`)
+	primary, _ := c.Agents.Primary()
+	task := c.Graph.Add(taskgraph.Task{
+		ID: "task-q", Title: "SPT stage 2 per spt-impl-plan contract", Role: string(agent.Worker), Status: taskgraph.Failed,
+	})
+	if _, err := c.Graph.Update(task.ID, func(x *taskgraph.Task) {
+		x.BlockedOn = &taskgraph.BlockedOn{
+			Question: "Which contract governs stage 2?", Family: taskgraph.FamilyKey(task), BlockedAt: time.Now().UTC(),
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.loopPrimary(context.Background(), primary, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Current().Status; got != "blocked" {
+		t.Fatalf("session = %q, want blocked while the question is open", got)
+	}
+	c.applyResolvedBlocks([]ResolvedBlock{{TaskID: task.ID, Answer: "Follow spt-staged-plan.md lines 67-78."}})
+	if err := c.loopPrimary(context.Background(), primary, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Current().Status; got != "completed" {
+		t.Fatalf("session = %q, want completed once the question is answered", got)
 	}
 }
 

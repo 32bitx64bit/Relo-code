@@ -25,6 +25,44 @@ import (
 // wait as tasks and get their agent when a place in the queue opens.
 const maxQueued = 4
 
+// maxFamilyAttempts is how many launches one family of tasks may take before the family is blocked for the user.
+const maxFamilyAttempts = 3
+
+// familyAttempts sums the launches of every task in t's family, across ids and titles, made since the family's last
+// answered block. A block that the user answered starts the count again.
+func (c *Coord) familyAttempts(t taskgraph.Task) int {
+	key := taskgraph.FamilyKey(t)
+	all := c.Graph.List()
+	var since time.Time
+	for _, o := range all {
+		if o.BlockedOn != nil && !o.BlockedOn.Unresolved() && taskgraph.FamilyKey(o) == key && o.BlockedOn.ResolvedAt.After(since) {
+			since = o.BlockedOn.ResolvedAt
+		}
+	}
+	n := 0
+	for _, o := range all {
+		if taskgraph.FamilyKey(o) == key && !o.Created.Before(since) {
+			n += o.Attempts
+		}
+	}
+	return n
+}
+
+// capBlock fails a queued task whose family has used up its launches. The family stays blocked until the user answers.
+func (c *Coord) capBlock(t taskgraph.Task, launches int) {
+	question := fmt.Sprintf("This work has already run %d times (limit %d). Answer whether to allow more runs, or change the plan.", launches, maxFamilyAttempts)
+	updated, err := c.Graph.Update(t.ID, func(x *taskgraph.Task) {
+		x.Status = taskgraph.Failed
+		x.Finished = time.Now().UTC()
+		x.BlockedOn = &taskgraph.BlockedOn{Question: question, Family: taskgraph.FamilyKey(*x), BlockedAt: time.Now().UTC()}
+	})
+	if err != nil {
+		c.logWarn("cap task family", err)
+		return
+	}
+	c.emit("task.failed", updated)
+}
+
 // dispatchTick is how often a dispatcher looks again when nothing woke it. Workers wake it as they finish; this
 // covers a change it could not have been told about.
 var dispatchTick = time.Second
@@ -141,6 +179,15 @@ func (d *dispatcher) admit() (held bool) {
 		}
 		role := parseRole(task.Role)
 		wait, queued := d.queued[task.ID]
+		// The family cap is checked before any agent is spawned for the task; a waiting agent is retired instead.
+		if launches := c.familyAttempts(task); launches >= maxFamilyAttempts {
+			if queued {
+				delete(d.queued, task.ID)
+				d.discard(wait.agent, "Not started: family run limit reached")
+			}
+			c.capBlock(task, launches)
+			continue
+		}
 		a := wait.agent
 		if !queued {
 			if ok, why := d.sched.CanReserve(c.Agents, agent.Agent{Role: role, Tier: agent.TierFor(role), Depth: 1}); !ok && (!scheduler.Full(why) || len(d.queued) >= maxQueued) {

@@ -168,6 +168,7 @@ func (c *Coord) stepQueued(ctx context.Context) {
 	}
 	c.syncPeerContext(c.SessionID(), p.ID)
 	settings := c.settings()
+	c.pinBlocks(p.ID)
 	gen, err := c.Engine.Refresh(p.ID, reason)
 	if err != nil {
 		c.logWarn("refresh primary for guidance", err)

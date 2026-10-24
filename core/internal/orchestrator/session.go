@@ -721,6 +721,7 @@ func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text strin
 		primaryBudget = resolvedPrimary.Scope.Budget
 	}
 	primaryBudget = settings.BudgetFor(primary.Model, primaryBudget)
+	c.pinBlocks(primary.ID)
 	gen, err := c.Engine.Build(ctxeng.BuildRequest{AgentID: primary.ID, Role: string(agent.Primary), Phase: ctxeng.PhaseDesign, Budget: primaryBudget, Reason: "primary turn", Query: ctxeng.Query{Task: s.Objective, Keywords: strings.Fields(s.Objective)}})
 	if err != nil {
 		return err
@@ -747,7 +748,7 @@ func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text strin
 	if err := c.drive(ctx); err != nil {
 		return err
 	}
-	if turn.Status == "completed" && len(c.Graph.Runnable()) == 0 {
+	if turn.Status == "completed" && len(c.Graph.Runnable()) == 0 && len(c.openQuestions()) == 0 {
 		c.mu.Lock()
 		if c.sess != nil {
 			c.sess.Status = "completed"
@@ -792,6 +793,9 @@ func (c *Coord) applyTurn(primary agent.Agent, turn Turn) {
 	if len(turn.ResolvedChanges) > 0 && c.ResolveChanges != nil {
 		c.ResolveChanges(turn.ResolvedChanges)
 	}
+	// Answers come before admission, so a family whose question is answered here can be planned in this same turn.
+	c.applyResolvedBlocks(turn.ResolvedBlocks)
+	c.pinBlocks(primary.ID)
 	c.setConstraints(turn.Constraints)
 	idmap := map[string]string{}
 	var existing, inTurn map[string]string
@@ -802,7 +806,7 @@ func (c *Coord) applyTurn(primary agent.Agent, turn Turn) {
 	}
 	for _, spec := range turn.Tasks {
 		role := parseRole(spec.Role)
-		t := c.Graph.Add(taskgraph.Task{Title: spec.Title, Description: spec.Description, Acceptance: spec.Acceptance, Creator: primary.ID, Priority: spec.Priority, Role: string(role), Workspace: s.Workspace, Difficulty: spec.Difficulty, Vision: spec.Vision, MaxAttempts: settings.MaxRetries, Model: c.modelForTask(role, spec.Difficulty, spec.Vision), Paths: spec.Paths})
+		t := c.Graph.Add(taskgraph.Task{Title: spec.Title, Description: spec.Description, Acceptance: spec.Acceptance, Creator: primary.ID, Priority: spec.Priority, Role: string(role), Workspace: s.Workspace, Difficulty: spec.Difficulty, Vision: spec.Vision, MaxAttempts: settings.MaxRetries, Model: c.modelForTask(role, spec.Difficulty, spec.Vision), Paths: spec.Paths, Scope: spec.Scope})
 		idmap[spec.ID] = t.ID
 		c.emit("task.created", t)
 	}
@@ -920,8 +924,14 @@ func (c *Coord) admitTaskAliases(specs []TurnTask) (kept []TurnTask, existing, i
 	}
 	turnKept := map[string]string{} // taskKey -> kept spec ID of this turn
 	existing, inTurn = map[string]string{}, map[string]string{}
-	dupes := 0
+	blocked := c.unresolvedFamilies()
+	dupes, refused := 0, 0
 	for _, spec := range specs {
+		// A family waiting on the user is refused under any id or title until its question is answered.
+		if blocked[specFamily(spec)] {
+			refused++
+			continue
+		}
 		key := taskKey(spec.Title, string(parseRole(spec.Role)))
 		if id, ok := seen[key]; ok {
 			existing[spec.ID] = id
@@ -939,11 +949,101 @@ func (c *Coord) admitTaskAliases(specs []TurnTask) (kept []TurnTask, existing, i
 	if dupes > 0 {
 		c.logWarn("planner repeated tasks", fmt.Errorf("dropped %d duplicate task(s)", dupes))
 	}
+	if refused > 0 {
+		c.logWarn("planner re-planned a blocked task", fmt.Errorf("dropped %d task(s) in a family waiting for an answer", refused))
+	}
 	return kept, existing, inTurn
 }
 
 func taskKey(title, role string) string {
 	return strings.ToLower(strings.Join(strings.Fields(title), " ")) + "|" + strings.ToLower(role)
+}
+
+// specFamily is the family key the task spec would get once admitted.
+func specFamily(spec TurnTask) string {
+	return taskgraph.FamilyKey(taskgraph.Task{Title: spec.Title, Role: string(parseRole(spec.Role)), Paths: spec.Paths, Scope: spec.Scope})
+}
+
+// openQuestions returns the tasks still waiting on an answer to a blocked question.
+func (c *Coord) openQuestions() []taskgraph.Task {
+	var open []taskgraph.Task
+	for _, t := range c.Graph.List() {
+		if t.BlockedOn.Unresolved() {
+			open = append(open, t)
+		}
+	}
+	return open
+}
+
+// unresolvedFamilies returns the family keys of the open questions.
+func (c *Coord) unresolvedFamilies() map[string]bool {
+	families := map[string]bool{}
+	for _, t := range c.openQuestions() {
+		families[t.BlockedOn.Family] = true
+	}
+	return families
+}
+
+// applyResolvedBlocks records the user's answers on the tasks waiting for them. Unknown ids, empty answers and tasks
+// already answered are ignored.
+func (c *Coord) applyResolvedBlocks(answers []ResolvedBlock) {
+	for _, r := range answers {
+		answer := strings.TrimSpace(r.Answer)
+		if answer == "" {
+			continue
+		}
+		if t, ok := c.Graph.Get(r.TaskID); !ok || !t.BlockedOn.Unresolved() {
+			continue
+		}
+		updated, err := c.Graph.Update(r.TaskID, func(x *taskgraph.Task) {
+			if !x.BlockedOn.Unresolved() {
+				return
+			}
+			b := *x.BlockedOn // copy, so readers holding the old pointer never see a change
+			b.Resolution, b.ResolvedAt = answer, time.Now().UTC()
+			x.BlockedOn = &b
+		})
+		if err != nil {
+			c.logWarn("record answer", err)
+			continue
+		}
+		c.emit("task.updated", updated)
+	}
+}
+
+// pinBlocks pins each open question to the Primary's state, so every Primary turn shows it until it is answered.
+func (c *Coord) pinBlocks(primaryID string) {
+	var items []ctxeng.Item
+	for _, t := range c.openQuestions() {
+		items = append(items, ctxeng.Item{Source: ctxeng.SourceSystem, Kind: ctxeng.KindConstraint, Content: fmt.Sprintf("Task %s (%q) is blocked, unanswered: %s. When the user answers, return resolvedBlocks [{taskId,answer}].", t.ID, t.Title, t.BlockedOn.Question), Durability: 1, Relevance: 1, Pinned: true})
+	}
+	c.Engine.SetTaskState(primaryID, "Unresolved questions", items)
+}
+
+// surfaceBlocks shows the user each open question once per drive exit and marks the session blocked while any remain.
+func (c *Coord) surfaceBlocks() {
+	open := c.openQuestions()
+	c.mu.Lock()
+	changed := false
+	if c.sess != nil {
+		switch {
+		case len(open) > 0 && c.sess.Status == "active":
+			c.sess.Status, changed = "blocked", true
+		case len(open) == 0 && c.sess.Status == "blocked":
+			c.sess.Status, changed = "active", true
+		}
+	}
+	var s *Session
+	if changed {
+		s = cloneSession(c.sess)
+	}
+	c.mu.Unlock()
+	if s != nil {
+		c.emit("session.updated", s)
+	}
+	for _, t := range open {
+		c.chat("system", fmt.Sprintf("%q is blocked, needs a decision: %s", t.Title, t.BlockedOn.Question), "")
+	}
 }
 
 func (c *Coord) primaryTurn(ctx context.Context, primary agent.Agent, parts prompt.Parts, ask string) (Turn, error) {
@@ -1030,6 +1130,7 @@ func (c *Coord) drive(ctx context.Context) error {
 		}
 		if len(sched.Next(c.Graph, 1)) == 0 {
 			c.cancelOrphans()
+			c.surfaceBlocks()
 			return nil
 		}
 		c.refreshSnapshot()
@@ -1039,6 +1140,7 @@ func (c *Coord) drive(ctx context.Context) error {
 				continue
 			}
 			c.cancelOrphans()
+			c.surfaceBlocks()
 			return nil
 		}
 		c.cancelOrphans()
@@ -1079,6 +1181,7 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 	if hasQueued {
 		c.ingestGuidance(p.ID, queued, refs)
 	}
+	c.pinBlocks(p.ID)
 	gen, err := c.Engine.Refresh(p.ID, "collapse completed worker reports")
 	if err != nil {
 		c.logWarn("refresh primary after workers", err)

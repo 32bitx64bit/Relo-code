@@ -46,6 +46,14 @@ type Turn struct {
 	Tasks       []TurnTask `json:"tasks"`
 	// ResolvedChanges names conflicted changes the head has replaced. Core discards them through the reject path.
 	ResolvedChanges []string `json:"resolvedChanges"`
+	// ResolvedBlocks answers tasks waiting on a question. Core records each answer on its task before admission;
+	// an unknown or already answered taskId is ignored.
+	ResolvedBlocks []ResolvedBlock `json:"resolvedBlocks"`
+}
+
+type ResolvedBlock struct {
+	TaskID string `json:"taskId"`
+	Answer string `json:"answer"`
 }
 
 type TurnTask struct {

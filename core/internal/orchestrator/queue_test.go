@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,11 +30,12 @@ type gatedRuntime struct {
 	begun  chan string // a worker's title, once its prompt has been sent
 	active int
 	peak   int
-	fails  map[string]int // how many more attempts of a title end in an error
+	fails  map[string]int    // how many more attempts of a title end in an error
+	asked  map[string]string // title -> the question a worker of that title asks instead of finishing
 }
 
 func newGatedRuntime() *gatedRuntime {
-	return &gatedRuntime{titles: map[rt.SessionID]string{}, events: map[rt.SessionID]chan rt.Event{}, gates: map[string]chan struct{}{}, begun: make(chan string, 64), fails: map[string]int{}}
+	return &gatedRuntime{titles: map[rt.SessionID]string{}, events: map[rt.SessionID]chan rt.Event{}, gates: map[string]chan struct{}{}, begun: make(chan string, 64), fails: map[string]int{}, asked: map[string]string{}}
 }
 
 func (r *gatedRuntime) gate(title string) chan struct{} {
@@ -73,6 +75,7 @@ func (r *gatedRuntime) SendTask(ctx context.Context, sid rt.SessionID, task rt.A
 	if failing {
 		r.fails[title]--
 	}
+	question, asking := r.asked[title]
 	r.mu.Unlock()
 	r.begun <- title
 	if failing {
@@ -87,6 +90,10 @@ func (r *gatedRuntime) SendTask(ctx context.Context, sid rt.SessionID, task rt.A
 		}()
 		return nil
 	}
+	answer := directReport
+	if asking {
+		answer = blockedReport(question)
+	}
 	go func() {
 		defer func() { r.mu.Lock(); r.active--; r.mu.Unlock() }()
 		select {
@@ -94,9 +101,14 @@ func (r *gatedRuntime) SendTask(ctx context.Context, sid rt.SessionID, task rt.A
 		case <-ctx.Done():
 			return
 		}
-		ch <- rt.Event{Type: "session.idle", Idle: true, Done: true, JSON: directReport, Text: directReport}
+		ch <- rt.Event{Type: "session.idle", Idle: true, Done: true, JSON: answer, Text: answer}
 	}()
 	return nil
+}
+
+// blockedReport is what a worker answers when it stops to ask a question instead of finishing.
+func blockedReport(question string) string {
+	return fmt.Sprintf(`{"status":"blocked","summary":"%s","question":"%s"}`, question, question)
 }
 
 func (r *gatedRuntime) Events(_ context.Context, sid rt.SessionID) (<-chan rt.Event, error) {
@@ -521,4 +533,64 @@ func TestCancellingAQueuedTaskRetiresItsAgent(t *testing.T) {
 	}
 	r.release(first)
 	driveEnds(t, done)
+}
+
+// A worker that stopped to ask leaves nothing to run. The drive then goes quiet, and what the user is shown is the
+// question: once per question, with the session marked blocked until it is answered.
+// The questions are HYPOTHETICAL reconstructions of the two-part conflict the incident's workers reported.
+func TestAQuestionIsSurfacedOnceWhenTheRunGoesQuiet(t *testing.T) {
+	c, r := newQueueCoord(t, scheduler.Limits{}, agent.Worker, "w1", "w2")
+	r.asked["w1"] = "Which contract governs stage 2?"
+	r.asked["w2"] = "Which files may stage 2 touch?"
+	done := make(chan error, 1)
+	go func() { done <- c.drive(context.Background()) }()
+
+	// The workers share the folder, so they take turns: each one is released as it asks its question.
+	for i := 0; i < 2; i++ {
+		title := nextBegun(t, r)
+		if title != "w1" && title != "w2" {
+			t.Fatalf("%s began, want one of the two workers", title)
+		}
+		r.release(title)
+	}
+	driveEnds(t, done)
+
+	s := c.Current()
+	if s.Status != "blocked" {
+		t.Fatalf("session = %q, want blocked while a question is open", s.Status)
+	}
+	for _, question := range []string{"Which contract governs stage 2?", "Which files may stage 2 touch?"} {
+		shown := 0
+		for _, m := range s.Messages {
+			if m.Role == "system" && strings.Contains(m.Text, question) {
+				shown++
+			}
+		}
+		if shown != 1 {
+			t.Fatalf("%q was shown %d times, want once", question, shown)
+		}
+	}
+	for _, id := range []string{"w1", "w2"} {
+		task, _ := c.Graph.Get(id)
+		if !task.BlockedOn.Unresolved() {
+			t.Fatalf("task %s kept no open question: %+v", id, task.BlockedOn)
+		}
+		if task.Status != taskgraph.Failed {
+			t.Errorf("task %s = %s, want failed", id, task.Status)
+		}
+	}
+	// The questions were pinned to the Primary while the workers ran, so the wrap-up turn sees them too.
+	if !strings.Contains(c.Engine.Render(c.primaryID(t)), "Which contract governs stage 2?") {
+		t.Fatal("the question never reached the Primary's context")
+	}
+
+	// Answering both releases the session.
+	c.applyResolvedBlocks([]ResolvedBlock{
+		{TaskID: "w1", Answer: "Follow spt-staged-plan.md lines 67-78."},
+		{TaskID: "w2", Answer: "the three files the task allows"},
+	})
+	c.surfaceBlocks()
+	if got := c.Current().Status; got != "active" {
+		t.Fatalf("session = %q after the answers, want active", got)
+	}
 }

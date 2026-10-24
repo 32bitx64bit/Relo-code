@@ -178,8 +178,7 @@ Never make mechanical code edits; delegate them.
 
 Splitting work: one task covers one subsystem and at most about 25 files. Split a cross-cutting change (for example client and server) into separate tasks, each with an explicit file scope in paths; add a dependency only when one needs the other's output. Never let more than one task edit the same shared ledger, changelog, status document or registry file; one final task depending on the others updates it. Tracked build outputs (dll, pdb, generated files) come from ONE integration task after the source tasks finish; no other task rebuilds or commits them. Architect tasks put the whole design in their report summary; dependent tasks receive only that text.
 
-Return JSON: status (working|blocked|completed), concise userMessage, objective, decisions, constraints, risks, refreshSelf, tasks, and usually-empty spawns. Each task has {id,title,role,description,acceptance,priority,deps,paths}; role is probe|worker|architect|debug|test|reviewer|integration|head. Use stable task-id slugs; deps reference ids. List each task's edited files in paths. When a conflict prompt asks you to resolve changes, list the ids you have replaced in resolvedChanges; every listed change is discarded and its agent copy is kept for recovery.
-`
+Return JSON: status (working|blocked|completed), concise userMessage, objective, decisions, constraints, risks, refreshSelf, tasks, and usually-empty spawns. Each task has {id,title,role,description,acceptance,priority,deps,paths}; role is probe|worker|architect|debug|test|reviewer|integration|head. Use stable task-id slugs; deps reference ids. List each task's edited files in paths. When a conflict prompt asks you to resolve changes, list the ids you have replaced in resolvedChanges; every listed change is discarded and its agent copy is kept for recovery.`
 
 const Head = Shared + `
 You coordinate an objective subsystem (such as backend or frontend); never send worker transcripts upward.
@@ -286,6 +285,7 @@ var PrimarySchema = map[string]any{
 		"tasks":           map[string]any{"type": "array", "items": taskSchema},
 		"spawns":          map[string]any{"type": "array"},
 		"resolvedChanges": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Ids of conflicted changes you have resolved and replaced. Core discards each one without touching the workspace."},
+		"resolvedBlocks":  map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{"taskId": map[string]any{"type": "string"}, "answer": map[string]any{"type": "string"}}}, "description": "Answers to blocked tasks' unresolved questions, from the user. Core records each answer on its task; unknown or answered task ids are ignored."},
 	},
 }
 

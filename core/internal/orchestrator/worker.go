@@ -962,6 +962,10 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		x.Status = gst
 		x.Finished = time.Now().UTC()
 		x.Report = report
+		if blocked {
+			// The question stays on the task until the Primary records an answer; its family cannot be re-planned meanwhile.
+			x.BlockedOn = &taskgraph.BlockedOn{Question: rep.Question, Family: taskgraph.FamilyKey(*x), BlockedAt: time.Now().UTC()}
+		}
 	})
 	if err != nil {
 		c.logWarn("finish task", err)

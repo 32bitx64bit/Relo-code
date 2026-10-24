@@ -21,30 +21,47 @@ const (
 	Review   Status = "review_required"
 )
 
+// BlockedOn records why a task is parked waiting on a human answer. A task is
+// unresolved while Resolution is empty; clearing Resolution releases it.
+type BlockedOn struct {
+	Question   string    `json:"question,omitempty"` // the pinned question awaiting an answer
+	Family     string    `json:"family,omitempty"`   // family key of the respawn loop this question belongs to
+	Resolution string    `json:"resolution,omitempty"`
+	BlockedAt  time.Time `json:"blockedAt,omitempty"`
+	ResolvedAt time.Time `json:"resolvedAt,omitempty"`
+}
+
+// Unresolved reports whether the block is still open. A nil block is not unresolved.
+func (b *BlockedOn) Unresolved() bool {
+	return b != nil && strings.TrimSpace(b.Resolution) == ""
+}
+
 type Task struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
-	Acceptance  []string  `json:"acceptance"`
-	Creator     string    `json:"creator"`
-	AgentID     string    `json:"agentId,omitempty"`
-	Status      Status    `json:"status"`
-	Priority    int       `json:"priority"`
-	Depends     []string  `json:"dependencies"`
-	Paths       []string  `json:"paths,omitempty"` // files this task will edit; used by advisory path leases
-	Children    []string  `json:"children"`
-	Workspace   string    `json:"workspace"`
-	Difficulty  string    `json:"difficulty"`
-	Vision      bool      `json:"vision,omitempty"` // the agent must look at images; routing prefers a model that sees
-	Attempts    int       `json:"attempts"`
-	Model       string    `json:"model"`
-	Role        string    `json:"role"`
-	Attempt     int       `json:"attempt"`
-	Created     time.Time `json:"createdAt"`
-	Started     time.Time `json:"startedAt,omitempty"`
-	Finished    time.Time `json:"finishedAt,omitempty"`
-	Report      any       `json:"report,omitempty"`
-	MaxAttempts int       `json:"maxAttempts"`
+	ID          string     `json:"id"`
+	Title       string     `json:"title"`
+	Description string     `json:"description"`
+	Acceptance  []string   `json:"acceptance"`
+	Creator     string     `json:"creator"`
+	AgentID     string     `json:"agentId,omitempty"`
+	Status      Status     `json:"status"`
+	Priority    int        `json:"priority"`
+	Depends     []string   `json:"dependencies"`
+	Paths       []string   `json:"paths,omitempty"` // files this task will edit; used by advisory path leases
+	Children    []string   `json:"children"`
+	Workspace   string     `json:"workspace"`
+	Difficulty  string     `json:"difficulty"`
+	Vision      bool       `json:"vision,omitempty"` // the agent must look at images; routing prefers a model that sees
+	Attempts    int        `json:"attempts"`
+	Model       string     `json:"model"`
+	Role        string     `json:"role"`
+	Attempt     int        `json:"attempt"`
+	Created     time.Time  `json:"createdAt"`
+	Started     time.Time  `json:"startedAt,omitempty"`
+	Finished    time.Time  `json:"finishedAt,omitempty"`
+	Report      any        `json:"report,omitempty"`
+	MaxAttempts int        `json:"maxAttempts"`
+	Scope       string     `json:"scope,omitempty"`     // declared work area; part of the family key
+	BlockedOn   *BlockedOn `json:"blockedOn,omitempty"` // pending question gating completion
 }
 
 type Graph struct {
