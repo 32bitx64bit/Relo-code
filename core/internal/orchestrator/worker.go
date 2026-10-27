@@ -190,6 +190,85 @@ func (c *Coord) directSlot() chan struct{} {
 	return c.directSem
 }
 
+// directHold is the agent that holds the direct-mode slot.
+type directHold struct {
+	id, title string
+	since     time.Time
+}
+
+var (
+	directWaitLimit = 20 * time.Minute // longest an agent queues for the slot before it fails with a reason
+	directWaitTick  = 15 * time.Second // how often a queued agent refreshes who it is waiting for
+)
+
+// workspaceBusyError is an agent that gave up waiting for the direct-mode slot.
+type workspaceBusyError struct{ msg string }
+
+func (e *workspaceBusyError) Error() string { return e.msg }
+
+// directWaitNote says why an agent is queued: who holds the workspace and for how long. A bare "Waiting for the
+// workspace" read as a freeze, because nothing told the user another agent was still editing.
+func (c *Coord) directWaitNote(began time.Time) string {
+	c.mu.Lock()
+	h := c.directHolder
+	c.mu.Unlock()
+	waited := time.Since(began).Round(time.Second)
+	if h.id == "" {
+		return fmt.Sprintf("Waiting for the workspace (%s)", span(waited))
+	}
+	return fmt.Sprintf("Waiting for the workspace: %q has been editing it for %s (queued %s)", h.title, span(time.Since(h.since).Round(time.Second)), span(waited))
+}
+
+// acquireDirect takes the direct-mode slot, so one mutating agent edits the shared folder at a time. While it queues
+// it keeps saying who it waits for, and it gives up after directWaitLimit with an error that names the holder, so an
+// agent behind a holder that never lets go does not wait for ever. release frees the slot.
+func (c *Coord) acquireDirect(ctx context.Context, a agent.Agent) (release func(), err error) {
+	slot := c.directSlot()
+	take := func() func() {
+		c.mu.Lock()
+		c.directHolder = directHold{id: a.ID, title: a.Title, since: time.Now()}
+		c.mu.Unlock()
+		return func() {
+			c.mu.Lock()
+			if c.directHolder.id == a.ID {
+				c.directHolder = directHold{}
+			}
+			c.mu.Unlock()
+			<-slot
+		}
+	}
+	select {
+	case slot <- struct{}{}:
+		return take(), nil
+	default:
+	}
+	began := time.Now()
+	limit := time.NewTimer(directWaitLimit)
+	defer limit.Stop()
+	tick := time.NewTicker(directWaitTick)
+	defer tick.Stop()
+	for {
+		note := c.directWaitNote(began)
+		c.Agents.Update(a.ID, func(x *agent.Agent) { x.Phase, x.Activity = "waiting", note })
+		select {
+		case slot <- struct{}{}:
+			return take(), nil
+		case <-tick.C:
+		case <-limit.C:
+			c.mu.Lock()
+			h := c.directHolder
+			c.mu.Unlock()
+			who := "another agent"
+			if h.id != "" {
+				who = fmt.Sprintf("%q", h.title)
+			}
+			return nil, &workspaceBusyError{fmt.Sprintf("workspace busy: waited %s for %s to finish editing it. This folder is not a Git repository, so agents edit it one at a time; run `git init` to let them work in parallel", span(time.Since(began).Round(time.Second)), who)}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
 // noticeDirectMode posts the direct-mode warning once per session.
 func (c *Coord) noticeDirectMode() {
 	c.mu.Lock()
@@ -293,14 +372,14 @@ func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent)
 	}()
 	if c.directMutating(a) {
 		// Direct mode writes into the shared workspace: one mutating agent at a time.
-		slot := c.directSlot()
-		c.Agents.Update(a.ID, func(x *agent.Agent) { x.Phase, x.Activity = "waiting", "Waiting for the workspace" })
-		select {
-		case slot <- struct{}{}:
-		case <-ctx.Done():
-			return ctx.Err()
+		release, err := c.acquireDirect(ctx, a)
+		if err != nil {
+			// The agent never started, but its task is Running: close both, or the task stays Running for ever.
+			c.fail(a.ID, err)
+			c.failTask(t, a, err)
+			return err
 		}
-		defer func() { <-slot }()
+		defer release()
 	}
 	settings := c.settings()
 	resolved := style.Resolve(settings.Efficiency, a.Role, t.Difficulty, a.Attempt, a.Budget)
@@ -468,9 +547,9 @@ func (c *Coord) workerReport(ctx context.Context, a agent.Agent, parts prompt.Pa
 			// evidence the task was done, so it fails; otherwise the work stands and only the write-up is missing.
 			if len(c.changesFor(a, RawReport{})) == 0 {
 				c.logWarn("parse worker report", ferr)
-				return RawReport{Status: "failed", Summary: "Invalid structured worker report: " + ferr.Error(), ValidationError: ferr.Error()}, nil
+				return RawReport{Status: "failed", Summary: "Invalid structured worker report: " + ferr.Error() + ownWords(text), ValidationError: ferr.Error()}, nil
 			}
-			return RawReport{Status: "completed", Summary: "The agent changed files but did not write a valid summary.", Risks: []string{"The agent's report was not valid: " + ferr.Error()}}, nil
+			return RawReport{Status: "completed", Summary: "The agent changed files but did not write a valid summary." + ownWords(text), Risks: []string{"The agent's report was not valid: " + ferr.Error()}}, nil
 		}
 		c.logWarn("worker report was not structured JSON; keeping it as text", ferr)
 		return proseReport(text, "The agent did not return a structured report; this summary is its raw reply."), nil
@@ -489,6 +568,13 @@ func (c *Coord) workerReport(ctx context.Context, a agent.Agent, parts prompt.Pa
 		}
 	}
 	return rep, nil
+}
+
+// ownWords is what a report that could not be read said, kept after the parse error so the agent's message is not
+// lost to its formatting. It starts on a new line because the chat notice shows only the first line of a summary.
+func ownWords(text string) string {
+	clipped, _ := clipText(text, 1500)
+	return "\nThe agent's reply was:\n" + clipped
 }
 
 // proseStatusLine finds a "Status: blocked" or "Status: failed" line, with optional markdown around it.
@@ -1337,7 +1423,7 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 		dynamic += "\n\n"
 	}
 	promptText := dynamic + ask
-	canvasTools, imageTools := false, false
+	canvasTools, imageTools, spriteTools, artTools := false, false, false, false
 	// The canvas tool is scoped to the role: the policy names the actions this agent may use, and the core refuses
 	// any action outside it (core/internal/orchestrator/canvas.go), so the turn never offers more than it may use.
 	canvasActions := agent.CanvasActionsForRole(a.Role)
@@ -1360,6 +1446,13 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 			text, offered := imageGuidance(c.settings().VisionFor(a.Model))
 			imageTools = offered
 			promptText += "\n\n" + text
+			// relo_sprite goes only to a builder on a task that makes art, on a model that can see what it makes.
+			if t, ok := c.Graph.Get(a.TaskID); ok && t.Art && c.artOn() && agent.Mutating(a.Role) && sess.Mode == ModeBuild && imageTools {
+				spriteTools = true
+				promptText += "\n\n" + spriteGuidance
+				artTools = true
+				promptText += "\n\n" + artGuidance
+			}
 		}
 		if c.canvasOn() && len(canvasActions) > 0 {
 			canvasTools = true
@@ -1374,6 +1467,8 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 	}
 	tools := runtime.WithCanvas(runtime.ToolsFor(string(a.Role), string(sess.Mode), agent.Mutating(a.Role) && sess.Mode == ModeBuild), canvasTools, canvasActions)
 	tools = runtime.WithImages(tools, string(a.Role), imageTools)
+	tools = runtime.WithSprite(tools, string(a.Role), spriteTools)
+	tools = runtime.WithArt(tools, string(a.Role), artTools)
 	send := func(text string) error {
 		return rt.SendTask(ctx, sid, runtime.AgentTask{
 			AgentID: a.ID, Role: string(a.Role), Model: model, Provider: prov,

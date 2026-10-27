@@ -4,9 +4,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -184,7 +188,7 @@ func TestATurnRunsWithReloPromptToolsAndModel(t *testing.T) {
 		t.Errorf("system prompt = %q", e.System)
 	}
 	want := map[string]string{"--model": "claude-sonnet-5-5", "--effort": "high", "--tools": "Bash,Edit,Glob,Grep,Read,Write",
-		"--allowedTools": "Edit,Glob,Grep,Read,Write,mcp__relo__agents", "--disallowedTools": "mcp__relo__canvas,mcp__relo__image",
+		"--allowedTools": "Edit,Glob,Grep,Read,Write,mcp__relo__agents", "--disallowedTools": "mcp__relo__art,mcp__relo__canvas,mcp__relo__image,mcp__relo__sprite",
 		"--input-format": "stream-json", "--permission-prompt-tool": "stdio"}
 	for name, value := range want {
 		if got, _ := flag(e.Args, name); got != value {
@@ -354,8 +358,8 @@ func TestAPeerMessageReachesTheRunningTurn(t *testing.T) {
 	}
 }
 
-// The hub's secret goes to the CLI in a file only this user can read, never on the command line, and the file is
-// gone once the session closes.
+// The hub's secret never reaches the CLI: the config file names an SDK-hosted server, only this user can read it, and
+// it is gone once the session closes.
 func TestTheMessagingSecretStaysOutOfTheCommandLine(t *testing.T) {
 	rt, log := fakeRuntime(t, "ok")
 	dir := t.TempDir()
@@ -373,16 +377,17 @@ func TestTheMessagingSecretStaysOutOfTheCommandLine(t *testing.T) {
 	}
 	var cfg struct {
 		MCPServers map[string]struct {
-			Type    string            `json:"type"`
-			URL     string            `json:"url"`
-			Headers map[string]string `json:"headers"`
+			Type string `json:"type"`
+			Name string `json:"name"`
 		} `json:"mcpServers"`
 	}
 	if err := json.Unmarshal([]byte(e.MCP), &cfg); err != nil {
 		t.Fatalf("mcp config %q: %v", e.MCP, err)
 	}
-	if s := cfg.MCPServers["relo"]; s.Type != "http" || s.URL != "http://127.0.0.1:9/mcp" || s.Headers["Authorization"] != "Bearer s3cret-token" {
-		t.Fatalf("mcp config = %+v", cfg)
+	// Safe mode drops every MCP server in --mcp-config but SDK-hosted ones, so the hub must be one: an "http" entry
+	// left canvas agents without relo_canvas. The hub's address and secret stay in Relo.
+	if s := cfg.MCPServers["relo"]; s.Type != "sdk" || s.Name != "relo" || strings.Contains(e.MCP, "s3cret-token") || strings.Contains(e.MCP, "127.0.0.1") {
+		t.Fatalf("mcp config = %q", e.MCP)
 	}
 	if e.MCPMode != "-rw-------" {
 		t.Fatalf("mcp config file mode %s, want -rw-------", e.MCPMode)
@@ -472,5 +477,61 @@ func TestTranslatorOnRecordedLines(t *testing.T) {
 	_, end = tr.feed([]byte(`{"type":"result","subtype":"error_max_turns","is_error":true,"result":null,"usage":{}}`))
 	if end == nil || end.aborted || end.err != "Claude Code ended the turn: error max turns" {
 		t.Fatalf("max-turns result = %+v", end)
+	}
+}
+
+// Safe mode keeps no MCP server from --mcp-config but SDK-hosted ones, so the hub is one and Relo relays the CLI's
+// JSON-RPC to it with the secret. A request gets the hub's reply, a notification an empty result, and a hub that
+// refuses the call becomes a JSON-RPC error rather than a stall.
+func TestTheHubIsRelayedForTheCLI(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		seen = append(seen, r.Header.Get("Authorization")+" "+string(body))
+		mu.Unlock()
+		switch {
+		case strings.Contains(string(body), `"tools/list"`):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"canvas"}]}}`))
+		case !strings.Contains(string(body), `"id"`):
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			http.Error(w, "nope", http.StatusForbidden)
+		}
+	}))
+	defer hub.Close()
+	rt, log := fakeRuntime(t, "ok")
+	dir := t.TempDir()
+	if err := rt.ConfigureMessages(context.Background(), dir, runtime.MessageTools{URL: hub.URL, Secret: "s3cret-token"}); err != nil {
+		t.Fatal(err)
+	}
+	sid, evs := start(t, rt, runtime.SessionConfig{Directory: dir})
+	if err := rt.SendTask(context.Background(), sid, task("hub")); err != nil {
+		t.Fatal(err)
+	}
+	got := collect(t, evs, nil)
+	if end := got[len(got)-1]; end.Error != "" || end.Text != "hub done" {
+		t.Fatalf("turn end = %+v", end)
+	}
+	var bridged []string
+	for _, e := range readLog(t, log) {
+		if e.Bridge != "" {
+			bridged = append(bridged, e.Bridge)
+		}
+	}
+	want := []string{
+		`{"id":1,"jsonrpc":"2.0","result":{"tools":[{"name":"canvas"}]}}`,
+		`{"jsonrpc":"2.0","result":{}}`,
+		`{"error":{"code":-32603,"message":"Relo's agent hub refused the call (HTTP 403)"},"id":2,"jsonrpc":"2.0"}`,
+	}
+	if strings.Join(bridged, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("bridged replies:\n%s\nwant:\n%s", strings.Join(bridged, "\n"), strings.Join(want, "\n"))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 3 || !strings.HasPrefix(seen[0], "Bearer s3cret-token ") {
+		t.Fatalf("the hub saw %q, want three calls with the secret", seen)
 	}
 }

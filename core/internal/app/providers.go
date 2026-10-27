@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/relocode/relo/internal/art"
 	"github.com/relocode/relo/internal/orchestrator"
 	"github.com/relocode/relo/internal/provider"
 	"github.com/relocode/relo/internal/runtime"
@@ -165,4 +166,36 @@ func (a *App) providersDiscover(ctx context.Context, p map[string]any) (any, err
 		models = []provider.Model{}
 	}
 	return map[string]any{"models": models, "error": ""}, nil
+}
+
+// artEndpoint says where picture generation calls go: the base URL and key of the named provider, or of the first
+// OpenAI-style one. Only the OpenAI kind qualifies, because Anthropic's API does not generate images. The key is read
+// here, when a job runs, and handed straight to the art package; it is not copied anywhere else, logged or put in an
+// error.
+func (a *App) artEndpoint(providerID string) (art.Endpoint, error) {
+	a.provMu.Lock()
+	defer a.provMu.Unlock()
+	var chosen *provider.Provider
+	for i := range a.providers {
+		p := &a.providers[i]
+		if providerID != "" {
+			if p.ID == providerID {
+				chosen = p
+			}
+			continue
+		}
+		if p.Kind == provider.KindOpenAI {
+			chosen = p
+			break
+		}
+	}
+	switch {
+	case chosen == nil && providerID != "":
+		return art.Endpoint{}, fmt.Errorf("the provider %q chosen for pictures is not configured: the user has to pick one in the art settings or add it under Relo: Providers", providerID)
+	case chosen == nil:
+		return art.Endpoint{}, fmt.Errorf("no OpenAI-style provider is configured, so there is nothing to generate pictures with: the user has to add one with an API key under Relo: Providers")
+	case chosen.Kind != provider.KindOpenAI:
+		return art.Endpoint{}, fmt.Errorf("the provider %q speaks the Anthropic API, which cannot generate images: the user has to choose an OpenAI-style provider for pictures", chosen.ID)
+	}
+	return art.Endpoint{BaseURL: chosen.BaseURL, Key: a.providerKeys[chosen.ID]}, nil
 }

@@ -149,6 +149,8 @@ type Server struct {
 	handler   Handler
 	canvas    CanvasHandler
 	images    ImageHandler
+	sprite    SpriteHandler
+	art       ArtHandler
 	listener  net.Listener
 	httpSrv   *http.Server
 	closeOnce sync.Once
@@ -368,6 +370,12 @@ func (s *Server) route(ctx context.Context, req rpcRequest) (any, *rpcError) {
 		if s.images != nil {
 			tools = append(tools, imageToolDescriptor())
 		}
+		if s.sprite != nil {
+			tools = append(tools, spriteToolDescriptor())
+		}
+		if s.art != nil {
+			tools = append(tools, artToolDescriptor())
+		}
 		return map[string]any{"tools": tools}, nil
 	case "tools/call":
 		return s.callTool(ctx, req.Params)
@@ -480,6 +488,12 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	}
 	if p.Name == imageToolName && s.images != nil {
 		return s.callImage(ctx, p.Arguments)
+	}
+	if p.Name == spriteToolName && s.sprite != nil {
+		return s.callSprite(ctx, p.Arguments)
+	}
+	if p.Name == artToolName && s.art != nil {
+		return s.callArt(ctx, p.Arguments)
 	}
 	if p.Name != toolName {
 		return nil, invalidParams("unknown tool")

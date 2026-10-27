@@ -65,6 +65,14 @@ To run Claude with its thinking kept, use Claude Code instead: install and sign 
 CLI per agent with Relo's prompt and only the role's tools, on the CLI's own sign-in and plan limits. On a test
 task that was half the tokens of Claude Code's own defaults. See [claude-code.md](claude-code.md).
 
+For game art, turn on `relo.art.enabled` (Settings, Sprites). Tasks the Primary marks as art then go to a model
+that sees, and their agents get `relo_sprite`, which turns a picture in the workspace into a transparent, sized,
+checked PNG and writes it as a proposed change. It runs locally and calls no service. See [sprites.md](sprites.md).
+They also get `relo_art`, which makes the pictures through an OpenAI-compatible image API using an `openai` provider
+and key you added under Relo: Providers. You pay per picture; Relo estimates each job before it runs, asks before it
+spends, and stops at a per-session budget and job count you choose (`relo.art.sessionBudgetUSD`, `relo.art.sessionJobLimit`; 0 turns a limit off). Anthropic's API cannot generate images.
+See [image-generation.md](image-generation.md).
+
 ## 5. Zero-cost smoke test
 
 Add a provider that costs nothing (a local server such as Ollama or LM Studio works), pick its model for

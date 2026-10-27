@@ -20,7 +20,9 @@ var fence = regexp.MustCompile("(?s)```(?:json)?\\s*(.*?)\\s*```")
 func ParseJSON[T any](s string) (T, error) {
 	var zero T
 	s = strings.TrimSpace(s)
-	if m := fence.FindStringSubmatch(s); len(m) > 1 {
+	if obj, ok := wholeObject(s); ok {
+		s = obj
+	} else if m := fence.FindStringSubmatch(s); len(m) > 1 {
 		s = m[1]
 	} else {
 		start := strings.IndexByte(s, '{')
@@ -68,6 +70,7 @@ type TurnTask struct {
 	Scope       string   `json:"scope"`
 	Difficulty  string   `json:"difficulty"`
 	Vision      bool     `json:"vision"`
+	Art         bool     `json:"art"`
 }
 
 type RawReport struct {
@@ -357,8 +360,25 @@ func ParseReport(body string) (agent.Report, error) {
 	}, nil
 }
 
+// wholeObject finds the JSON object in a reply that is one, bare or after a lead-in sentence. It is tried before any
+// ``` fence is looked for: a summary or userMessage may quote a code block, and that fence sits inside the object's
+// string. Taking the block instead cut the real message out and left "invalid character 'm'" (from ```mermaid).
+func wholeObject(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "{") && json.Valid([]byte(s)) {
+		return s, true
+	}
+	if start, end := strings.IndexByte(s, '{'), strings.LastIndexByte(s, '}'); start >= 0 && end > start && json.Valid([]byte(s[start:end+1])) {
+		return s[start : end+1], true
+	}
+	return "", false
+}
+
 func strictJSONBody(body string) string {
 	body = strings.TrimSpace(body)
+	if obj, ok := wholeObject(body); ok {
+		return obj
+	}
 	if match := fence.FindStringSubmatch(body); len(match) > 1 {
 		return match[1]
 	}

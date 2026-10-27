@@ -160,8 +160,9 @@ func (r *Runtime) Close() error {
 	return nil
 }
 
-// ConfigureMessages records Relo's hub endpoint for a directory. A session started there passes it to the CLI as its
-// one MCP server, so the agent gets relo_agents (and relo_image or relo_canvas when its role may use them).
+// ConfigureMessages records Relo's hub endpoint for a directory. A session started there registers the hub with the CLI
+// as its one MCP server, hosted by Relo (session.bridge relays it, because safe mode drops any other kind), so the
+// agent gets relo_agents (and relo_image or relo_canvas when its role may use them).
 func (r *Runtime) ConfigureMessages(_ context.Context, directory string, tools runtime.MessageTools) error {
 	r.mu.Lock()
 	r.messaging[directory] = tools

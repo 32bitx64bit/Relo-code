@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -353,6 +354,84 @@ func TestStrictWorkerReportRetriesOnceThenFailsWithoutChanges(t *testing.T) {
 	defer r.mu.Unlock()
 	if len(r.tasks) != 2 || !strings.Contains(r.tasks[1].Prompt, "Previous report failed validation") || r.starts != 1 {
 		t.Fatalf("worker repair sessions=%d tasks=%+v", r.starts, r.tasks)
+	}
+}
+
+// runWorkerReplies runs one worker whose model answers with the given replies, and returns its task and runtime.
+func runWorkerReplies(t *testing.T, replies ...string) (*Coord, agent.Agent, taskgraph.Task, *dispatchRuntime) {
+	t.Helper()
+	c := New(logging.New(nil, logging.Error))
+	r := newDispatchRuntime(replies...)
+	c.SetRuntime(r)
+	s := c.CreateSession(t.TempDir(), "final message", ModeBuild)
+	c.Settings.AutoVerify, c.Settings.AutoReview = false, false
+	c.Agents.Create(agent.Agent{Role: agent.Primary, Workspace: s.Workspace})
+	c.Sched = scheduler.New(scheduler.Limits{MaxRetry: 1})
+	task := c.Graph.Add(taskgraph.Task{ID: "final-message", Title: "task", Role: string(agent.Worker), Workspace: s.Workspace, Model: "mock/t1", Attempt: 2, MaxAttempts: 1})
+	a := c.spawn(task, agent.Worker)
+	if err := c.execWorker(context.Background(), task, a); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := c.Graph.Get(task.ID)
+	return c, a, got, r
+}
+
+// A worker that quoted a code block in its summary lost its whole message to "invalid character 'm'" (from
+// ```mermaid): the parser took the fenced block instead of the report, and the repair round met the same fate.
+func TestWorkerReportKeepsCodeBlockInItsSummary(t *testing.T) {
+	report := `{"status":"completed","summary":"Saved the diagram:\n` + "```mermaid" + `\ngraph TD; A-->B\n` + "```" + `\nDone."}`
+	_, _, task, r := runWorkerReplies(t, report)
+	rep, _ := task.Report.(agent.Report)
+	if task.Status != taskgraph.Done || !strings.Contains(rep.Summary, "graph TD; A-->B") || !strings.HasSuffix(rep.Summary, "Done.") {
+		t.Fatalf("task = %s, report = %+v; want Done with the whole summary", task.Status, rep)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.tasks) != 1 {
+		t.Fatalf("model was asked %d times, want 1: a valid report needs no repair round", len(r.tasks))
+	}
+}
+
+// A report that is not valid JSON still said something. The user was shown only the parse error.
+func TestUnreadableWorkerReportKeepsTheAgentsWords(t *testing.T) {
+	reply := `{"status": 'completed', "summary": 'Saved the diagram to docs/diagrams.md'}`
+	_, _, task, _ := runWorkerReplies(t, reply, reply)
+	rep, _ := task.Report.(agent.Report)
+	if task.Status != taskgraph.Failed || !strings.Contains(rep.Summary, "Invalid structured worker report") || !strings.Contains(rep.Summary, "Saved the diagram to docs/diagrams.md") {
+		t.Fatalf("task = %s, report = %+v; want the parse error and the agent's own words", task.Status, rep)
+	}
+	if line := firstLine(rep.Summary); strings.Contains(line, "Saved the diagram") {
+		t.Fatalf("first line = %q, want only the parse error so the chat notice stays short", line)
+	}
+}
+
+// A stopped or failed agent reaches no report path. It must still leave a final message, and never replace one it wrote.
+func TestEndedAgentAlwaysLeavesAFinalMessage(t *testing.T) {
+	c := New(logging.New(nil, logging.Error))
+	c.CreateSession(t.TempDir(), "ended", ModeBuild)
+	for _, tc := range []struct {
+		name   string
+		status taskgraph.Status
+		cause  error
+		want   string
+		state  agent.Status
+	}{
+		{"stopped", taskgraph.Canceled, context.Canceled, "Stopped before it finished", agent.Cancelled},
+		{"failed", taskgraph.Failed, errors.New("workspace busy: waited 20m0s"), "workspace busy", agent.Failed},
+		{"no cause", taskgraph.Failed, nil, "stopped before it wrote a report", agent.Failed},
+	} {
+		a := c.Agents.Create(agent.Agent{Role: agent.Worker, Title: tc.name})
+		c.endReport(a, tc.status, tc.cause)
+		rep, ok := c.Agents.Report(a.ID)
+		if !ok || !strings.Contains(rep.Summary, tc.want) || rep.Status != tc.state {
+			t.Fatalf("%s: report = %+v ok=%v, want %q with status %s", tc.name, rep, ok, tc.want, tc.state)
+		}
+	}
+	wrote := c.Agents.Create(agent.Agent{Role: agent.Worker, Title: "wrote"})
+	c.Agents.SetReport(wrote.ID, agent.Report{Status: agent.Completed, Summary: "Done my way."})
+	c.endReport(wrote, taskgraph.Canceled, context.Canceled)
+	if rep, _ := c.Agents.Report(wrote.ID); rep.Summary != "Done my way." {
+		t.Fatalf("report = %+v, want the agent's own report kept", rep)
 	}
 }
 

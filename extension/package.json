@@ -723,6 +723,86 @@
           "scope": "machine",
           "description": "Path to the Claude Code CLI. Empty looks on PATH, then ~/.local/bin/claude, then the copy the Claude Code editor extension ships."
         },
+        "relo.art.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "Let art tasks generate pictures through an OpenAI-compatible image API. You pay per image. Needs an OpenAI provider with an API key in Relo: Providers. Also turns on relo_sprite, which turns a picture into a game-ready sprite on this machine (background removal, trim, fit, resize, outline, slice, contact sheets, rule checks). Needs a model that can see images."
+        },
+        "relo.art.provider": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Id of the Relo provider (kind openai) that generates the pictures. Empty uses the first OpenAI provider. Anthropic models cannot generate images."
+        },
+        "relo.art.model": {
+          "type": "string",
+          "default": "gpt-image-2.5-flare",
+          "scope": "application",
+          "description": "Image model to ask the provider for, such as gpt-image-2.5-flare (fast) or gpt-image-2.5-sunburst (editing precision)."
+        },
+        "relo.art.quality": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "auto"
+          ],
+          "default": "medium",
+          "scope": "application",
+          "description": "Image quality. Higher quality costs more per picture."
+        },
+        "relo.art.size": {
+          "type": "string",
+          "enum": [
+            "1024x1024",
+            "1536x1024",
+            "1024x1536",
+            "auto"
+          ],
+          "default": "1024x1024",
+          "scope": "application",
+          "description": "Size of each generated picture, in pixels."
+        },
+        "relo.art.candidates": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4,
+          "default": 2,
+          "scope": "application",
+          "description": "Pictures per job. Each one costs."
+        },
+        "relo.art.sessionBudgetUSD": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100000,
+          "default": 10,
+          "scope": "application",
+          "description": "Most the agents may spend on pictures in one session, in US dollars. Set 0 for no limit. Relo checks estimates, which are conservative, before every job, and still shows what a session has spent when the limit is off."
+        },
+        "relo.art.sessionJobLimit": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000,
+          "default": 25,
+          "scope": "application",
+          "description": "Most generation jobs agents may start in one session. Set 0 for no limit."
+        },
+        "relo.art.approval": {
+          "type": "string",
+          "enum": [
+            "session",
+            "each"
+          ],
+          "enumDescriptions": [
+            "Ask once per session, before the first job.",
+            "Ask before every job."
+          ],
+          "default": "session",
+          "scope": "application",
+          "description": "When Relo asks you before an agent spends money on pictures. YOLO mode skips the question but never the budget."
+        },
         "relo.logLevel": {
           "type": "string",
           "enum": [

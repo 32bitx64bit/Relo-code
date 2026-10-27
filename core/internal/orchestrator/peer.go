@@ -56,6 +56,10 @@ func (c *Coord) StartMessages() error {
 	if c.CanvasEnabled {
 		opts = append(opts, agentmsg.WithCanvas(c.canvasRequest))
 	}
+	if c.artOn() {
+		opts = append(opts, agentmsg.WithSprite(c.spriteRequest))
+		opts = append(opts, agentmsg.WithArt(c.artRequest))
+	}
 	s, err := agentmsg.Start(c.peerRequest, opts...)
 	if err != nil {
 		return err
@@ -151,7 +155,7 @@ func (c *Coord) peerRequest(ctx context.Context, req agentmsg.Request) (any, err
 			peers = append(peers, map[string]any{"id": peer.ID, "role": peer.Role, "title": peer.Title, "taskId": peer.TaskID, "status": peer.Status})
 		}
 		sort.Slice(peers, func(i, j int) bool { return peers[i]["id"].(string) < peers[j]["id"].(string) })
-		return map[string]any{"self": a.ID, "peers": peers}, nil
+		return map[string]any{"self": a.ID, "peers": peers, "canvas": c.canvasStatus(a.Role)}, nil
 	case "send":
 		return c.sendPeer(ctx, identity, req.To, req.Text, req.Paths)
 	case "import":

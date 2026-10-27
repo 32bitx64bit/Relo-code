@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/relocode/relo/internal/agent"
+	"github.com/relocode/relo/internal/art"
 	"github.com/relocode/relo/internal/claudecode"
 	ctxeng "github.com/relocode/relo/internal/context"
 	"github.com/relocode/relo/internal/id"
@@ -205,6 +206,7 @@ func New(cfg Config, log *logging.Logger) (*App, error) {
 	a.Coord.ResolveChanges = a.resolveHeadChanges
 	// Canvas calls are audited in the event log with metadata only: the raw payloads stay out of the log.
 	a.Coord.SetCanvasAudit(a.logCanvasAudit)
+	a.Coord.SetArtEndpoint(a.artEndpoint)
 	ws := workspace.New(cfg.Workspace)
 	ws.SetNotifier(a.workspaceNotice)
 	ws.SetObserver(a.workspaceEvent)
@@ -541,6 +543,7 @@ func (a *App) initialize(ctx context.Context, p map[string]any) (any, error) {
 		a.Coord.CreateSession(a.Cfg.Workspace, "", orchestrator.ModeBuild)
 	}
 	go a.safely("sweep", a.sweepWorktrees) // worktrees left by earlier runs that no change refers to
+	a.Coord.ResumeArt()                    // picture jobs an earlier run left waiting for approval
 	{
 		if models, err := a.models(ctx); err == nil && len(models) > 0 {
 			a.Coord.UpdateSettings(func(s *orchestrator.Settings) {
@@ -601,6 +604,10 @@ func (a *App) applySettings(p map[string]any) {
 		if enabled {
 			a.scheduleAutoApply()
 		}
+	}
+	// The art tools only change which hub tools are offered, so they apply to a running backend without a restart.
+	if raw, ok := p["art"].(map[string]any); ok {
+		a.Coord.SetArtSettings(artSettings(raw))
 	}
 	if enabled, ok := p["lazyConflicts"].(bool); ok {
 		a.lazy.Store(enabled)
@@ -1119,6 +1126,7 @@ func (a *App) Close() {
 		a.persist()
 		a.Coord.StopAll(context.Background())
 		a.Coord.CloseMessages()
+		a.Coord.CloseArt()
 		if ws := a.Coord.WS; ws != nil {
 			_ = ws.Close()
 		}
@@ -1186,6 +1194,23 @@ func canvasFlag(p map[string]any) bool {
 		return v
 	}
 	return false
+}
+
+// artSettings reads the art section of the settings payload. Out-of-range values are clamped by the art package. A limit
+// that is absent gets the default; one that is present as 0 is the user turning the limit off.
+func artSettings(raw map[string]any) art.Settings {
+	on, _ := raw["enabled"].(bool)
+	return art.Settings{
+		Enabled:         on,
+		Provider:        str(raw, "provider", ""),
+		Model:           str(raw, "model", ""),
+		Quality:         strings.ToLower(str(raw, "quality", "")),
+		Size:            strings.ToLower(str(raw, "size", "")),
+		Count:           int(num(raw, "candidates", 0)),
+		BudgetUSD:       num(raw, "sessionBudgetUSD", art.DefaultBudgetUSD),
+		SessionJobLimit: int(num(raw, "sessionJobLimit", art.DefaultJobLimit)),
+		Approval:        str(raw, "approval", "session"),
+	}
 }
 
 func str(m map[string]any, k, def string) string {

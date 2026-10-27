@@ -32,7 +32,7 @@ export const CORE_SETTING_SECTIONS = [
   "relo.autoVerify", "relo.autoReview",
   "relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics", "relo.changes.ignorePaths",
   "relo.changes.unionPaths", "relo.changes.takeLatestPaths", "relo.scheduler.pathLeases",
-  "relo.workspace", "relo.claudeCode", "relo.runtime", "relo.openCode",
+  "relo.workspace", "relo.claudeCode", "relo.art", "relo.runtime", "relo.openCode",
 ];
 
 // Commands the webview may trigger. Anything else is dropped.

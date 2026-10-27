@@ -207,3 +207,16 @@ func TestImageToolIsNeverGrantedToThePrimary(t *testing.T) {
 		t.Fatalf("a worker on a text-only model was given %s", ReloImageTool)
 	}
 }
+
+func TestSpriteToolIsNeverGrantedToThePrimary(t *testing.T) {
+	primary := WithSprite(ToolsFor(RolePrimary, "build", false), RolePrimary, true)
+	if primary[ReloSpriteTool] {
+		t.Fatalf("the Primary was given %s: %v", ReloSpriteTool, primary)
+	}
+	if worker := WithSprite(ToolsFor("worker", "build", true), "worker", true); !worker[ReloSpriteTool] {
+		t.Fatalf("a worker on an art task was not given %s", ReloSpriteTool)
+	}
+	if off := WithSprite(ToolsFor("worker", "build", true), "worker", false); off[ReloSpriteTool] {
+		t.Fatalf("a worker not offered the tool was given %s", ReloSpriteTool)
+	}
+}

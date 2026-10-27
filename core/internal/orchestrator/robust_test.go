@@ -337,6 +337,42 @@ func TestCancelOrphansRetiresTasksBehindAFailure(t *testing.T) {
 	}
 }
 
+// A failed phase can leave a chain of dependents. Every orphan must be retired before the head is asked to integrate
+// the finished work; one dependency left Blocked would otherwise suppress that turn and end the request silently.
+func TestDriveResumesPrimaryAfterNestedOrphans(t *testing.T) {
+	c, r, _ := newGuidanceCoord(t, headWrap)
+	s := c.Current()
+	c.Agents.Create(agent.Agent{Role: agent.Primary, Workspace: s.Workspace, Model: "mock/p"})
+	c.Graph.Add(taskgraph.Task{ID: "worker", Title: "w1", Role: "worker", Workspace: s.Workspace, Model: "mock/t1"})
+	c.Graph.Add(taskgraph.Task{ID: "failed", Title: "failed", Role: "worker", Status: taskgraph.Failed})
+	parent := "failed"
+	for i := 0; i < 24; i++ {
+		id := fmt.Sprintf("orphan-%02d", i)
+		c.Graph.Add(taskgraph.Task{ID: id, Title: id, Role: "worker", Status: taskgraph.Blocked, Depends: []string{parent}})
+		parent = id
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- c.drive(context.Background()) }()
+	if title := nextBegun(t, r.gatedRuntime); title != "w1" {
+		t.Fatalf("%s began, want w1", title)
+	}
+	r.release("w1")
+	driveEnds(t, done)
+
+	r.hmu.Lock()
+	seen := append([]string(nil), r.headSeen...)
+	r.hmu.Unlock()
+	if len(seen) != 1 || !strings.Contains(seen[0], "All scheduled workers finished") {
+		t.Fatalf("head calls = %d, want the integration turn after the phase; orphaned tail = %s", len(seen), parent)
+	}
+	for _, task := range c.Graph.List() {
+		if strings.HasPrefix(task.ID, "orphan-") && task.Status != taskgraph.Canceled {
+			t.Fatalf("%s = %s, want cancelled before the integration turn", task.ID, task.Status)
+		}
+	}
+}
+
 func TestGuardTurnsPanicIntoError(t *testing.T) {
 	c := New(logging.New(nil, logging.Error))
 	err := c.guard("unit", func() error {

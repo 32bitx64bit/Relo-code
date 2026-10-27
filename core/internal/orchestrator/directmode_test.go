@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -280,6 +281,137 @@ func TestStopAllTwiceCancelsAndClosesOnce(t *testing.T) {
 	if rtm.cancels[sid] > 1 || rtm.closes[sid] > 1 {
 		t.Fatalf("cancels=%d closes=%d, want at most 1 each", rtm.cancels[sid], rtm.closes[sid])
 	}
+}
+
+// queuedDirectWorker spawns a worker for a held direct-mode slot and runs execWorker for it in the background.
+func queuedDirectWorker(t *testing.T, c *Coord, dir string, ctx context.Context) (taskgraph.Task, agent.Agent, <-chan error) {
+	t.Helper()
+	task := c.Graph.Add(taskgraph.Task{ID: "queued", Title: "queued", Role: string(agent.Worker), Workspace: dir, Difficulty: routing.Medium, Model: "mock/t1"})
+	a := c.spawn(task, agent.Worker)
+	c.Graph.Update(task.ID, func(x *taskgraph.Task) { x.Status = taskgraph.Running; x.AgentID = a.ID })
+	done := make(chan error, 1)
+	go func() { done <- c.execWorker(ctx, task, a) }()
+	return task, a, done
+}
+
+// A mutating agent queued behind the direct-mode slot used to show a bare "Waiting for the workspace" with no limit,
+// so a long holder looked like a freeze for the agents behind it (workspace stall in a non-Git project).
+func TestDirectModeQueuedAgentNamesHolderAndFailsInsteadOfWaitingForever(t *testing.T) {
+	oldLimit, oldTick := directWaitLimit, directWaitTick
+	directWaitLimit, directWaitTick = 300*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { directWaitLimit, directWaitTick = oldLimit, oldTick })
+	dir := t.TempDir()
+	c, _ := newDirectCoord(t, dir, newOverlapRuntime(0))
+	holder := c.Agents.Create(agent.Agent{Role: agent.Architect, Title: "Write ARCHITECTURE.md", Workspace: dir})
+	release, err := c.acquireDirect(context.Background(), holder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	task, a, done := queuedDirectWorker(t, c, dir, context.Background())
+	waitFor(t, "the queued agent to name the holder", func() bool {
+		got, _ := c.Agents.Get(a.ID)
+		return got.Phase == "waiting" && strings.Contains(got.Activity, "Waiting for the workspace") && strings.Contains(got.Activity, "Write ARCHITECTURE.md")
+	})
+	var err2 error
+	select {
+	case err2 = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued agent still waiting long after directWaitLimit")
+	}
+	var busy *workspaceBusyError
+	if !errors.As(err2, &busy) || !strings.Contains(err2.Error(), "Write ARCHITECTURE.md") {
+		t.Fatalf("err = %v, want a workspaceBusyError naming the holder", err2)
+	}
+	if got, _ := c.Agents.Get(a.ID); got.Status != agent.Failed || !strings.Contains(got.Activity, "workspace busy") {
+		t.Fatalf("agent = %s %q, want failed with the busy reason", got.Status, got.Activity)
+	}
+	if got, _ := c.Graph.Get(task.ID); got.Status == taskgraph.Running {
+		t.Fatalf("task is still %s after its agent gave up", got.Status)
+	}
+	if rep, ok := c.Agents.Report(a.ID); !ok || !strings.Contains(rep.Summary, "workspace busy") {
+		t.Fatalf("report = %+v ok=%v, want a final message naming why the agent gave up", rep, ok)
+	}
+	// The holder may still be busy, so a retry would only queue behind it for another full wait.
+	if got, _ := c.Graph.Get(task.ID); got.Status != taskgraph.Failed {
+		t.Fatalf("task = %s, want failed once and not re-queued", got.Status)
+	}
+	if !chatMentions(c, "will not be retried") {
+		t.Fatal("no chat notice said the busy workspace failure would not be retried")
+	}
+}
+
+// A workspace-busy failure is decided by type, not by its wording: the message says "busy" rather than any marker
+// retryable() knows, so it used to be re-queued behind an unchanged holder for another full wait.
+func TestDirectModeWorkspaceBusyIsNotRetried(t *testing.T) {
+	c, s := newDirectCoord(t, t.TempDir(), newOverlapRuntime(0))
+	c.Sched = scheduler.New(scheduler.Limits{MaxRetry: 3})
+	a := c.Agents.Create(agent.Agent{Role: agent.Worker, Workspace: s.Workspace, Model: "mock/t1"})
+	task := c.Graph.Add(taskgraph.Task{ID: "busy", Title: "busy", Role: "worker", Workspace: s.Workspace, Model: "mock/t1", Attempt: 1, MaxAttempts: 3})
+	c.failTask(task, a, &workspaceBusyError{msg: "workspace busy: waited 20m0s for Write ARCHITECTURE.md to finish editing it"})
+	if got, _ := c.Graph.Get(task.ID); got.Status != taskgraph.Failed {
+		t.Fatalf("task status = %s, want failed", got.Status)
+	}
+	if !chatMentions(c, "Write ARCHITECTURE.md") {
+		t.Fatal("the no-retry notice dropped the holder's name")
+	}
+	// A retryable failure still retries, so the early return did not disable retries in general.
+	task2 := c.Graph.Add(taskgraph.Task{ID: "flaky", Title: "flaky", Role: "worker", Workspace: s.Workspace, Model: "mock/t1", Attempt: 1, MaxAttempts: 3})
+	c.failTask(task2, a, errors.New("stream closed unexpectedly"))
+	if got, _ := c.Graph.Get(task2.ID); got.Status != taskgraph.Queued {
+		t.Fatalf("flaky task status = %s, want queued for a retry", got.Status)
+	}
+}
+
+func chatMentions(c *Coord, want string) bool {
+	for _, m := range c.Current().Messages {
+		if m.Role == "system" && strings.Contains(m.Text, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// Stopping a run while an agent queued for the workspace used to leave its task Running for ever, because the wait
+// returned before the task was closed.
+func TestDirectModeStopWhileQueuedClosesTaskAndAgent(t *testing.T) {
+	dir := t.TempDir()
+	c, _ := newDirectCoord(t, dir, newOverlapRuntime(0))
+	holder := c.Agents.Create(agent.Agent{Role: agent.Architect, Title: "holder", Workspace: dir})
+	release, err := c.acquireDirect(context.Background(), holder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	task, a, done := queuedDirectWorker(t, c, dir, ctx)
+	waitFor(t, "the agent to queue", func() bool {
+		got, _ := c.Agents.Get(a.ID)
+		return got.Phase == "waiting"
+	})
+	stop()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if got, _ := c.Graph.Get(task.ID); got.Status != taskgraph.Canceled {
+		t.Fatalf("task status = %s, want canceled", got.Status)
+	}
+	if got, _ := c.Agents.Get(a.ID); got.Status != agent.Cancelled {
+		t.Fatalf("agent status = %s, want cancelled", got.Status)
+	}
+	if rep, ok := c.Agents.Report(a.ID); !ok || strings.TrimSpace(rep.Summary) == "" {
+		t.Fatalf("report = %+v ok=%v, want a final message for the stopped agent", rep, ok)
+	}
+	// The holder's release frees the slot and clears the name, so the next agent is not told to wait for it.
+	release()
+	if h := func() directHold { c.mu.Lock(); defer c.mu.Unlock(); return c.directHolder }(); h.id != "" {
+		t.Fatalf("holder = %+v after release, want none", h)
+	}
+	next, err := c.acquireDirect(context.Background(), holder)
+	if err != nil {
+		t.Fatalf("slot not free after release: %v", err)
+	}
+	next()
 }
 
 func gitRun(t *testing.T, dir string, args ...string) {

@@ -175,6 +175,19 @@ func (c *Coord) canvasOn() bool {
 	return c.CanvasEnabled
 }
 
+// canvasUnsupported is the refusal every canvas call gets while the connected editor cannot answer one.
+const canvasUnsupported = "Canvas is not supported by the connected editor"
+
+// canvasStatus tells an agent whether Canvas is usable for its role, and why not when it is not. The relo_agents
+// list returns it, so a builder or the planner learns that relo_canvas will never be offered in this session
+// instead of searching for a tool that does not exist and failing without a reason.
+func (c *Coord) canvasStatus(role agent.Role) map[string]any {
+	if !c.canvasOn() {
+		return map[string]any{"available": false, "reason": canvasUnsupported + ", so relo_canvas is not offered to any agent in this session; do not wait for it or plan canvas work"}
+	}
+	return map[string]any{"available": true, "authoring": agent.CanvasAuthoringRole(role), "actions": agent.CanvasActionsForRole(role)}
+}
+
 // SetCanvasAudit installs the audit sink for canvas calls. The sink receives one metadata-only record for
 // every canvas request and every canvas reply, so a later claim about who used canvas can be checked
 // against the event log. The records never carry artifact source.
@@ -206,7 +219,7 @@ func (c *Coord) auditCanvas(rec CanvasAudit) {
 // the live session and the agent's live runtime, and the agent must still be active.
 func (c *Coord) canvasRequest(ctx context.Context, req agentmsg.CanvasRequest) (any, error) {
 	if !c.canvasOn() {
-		return nil, errors.New("Canvas is not supported by the connected editor")
+		return nil, errors.New(canvasUnsupported)
 	}
 	identity, workspace, mode, role, err := c.canvasIdentity(req.Key)
 	if err != nil {

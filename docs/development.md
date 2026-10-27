@@ -9,6 +9,8 @@ core/                 Relo Core (Go)
   internal/orchestrator
   internal/opencode   documented HTTP/SSE adapter + process manager
   internal/runtime    AgentRuntime interface + mock
+  internal/art        picture jobs behind relo_art (OpenAI-style image client, cost, store, manager, playbook)
+  internal/sprite     local picture pipeline behind relo_sprite (matte, fit, outline, slice, sheet, check)
   internal/vws        Virtual Workspace Engine (standalone, Git-object-backed)
   internal/workspace  worktree and virtual workspaces behind one Manager and WorkspaceView
 extension/            VS Code extension

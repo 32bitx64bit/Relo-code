@@ -51,6 +51,7 @@ type Task struct {
 	Workspace   string     `json:"workspace"`
 	Difficulty  string     `json:"difficulty"`
 	Vision      bool       `json:"vision,omitempty"` // the agent must look at images; routing prefers a model that sees
+	Art         bool       `json:"art,omitempty"`    // the agent makes image assets and is offered the sprite tools; implies Vision
 	Attempts    int        `json:"attempts"`
 	Model       string     `json:"model"`
 	Role        string     `json:"role"`

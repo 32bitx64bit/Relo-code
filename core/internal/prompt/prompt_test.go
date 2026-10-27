@@ -233,3 +233,31 @@ func TestPrimarySchemaCanAskForAModelThatSees(t *testing.T) {
 		t.Fatalf("vision field does not say when to set it: %q", d)
 	}
 }
+
+func TestPrimarySchemaOffersTheArtFlagOnlyWhenArtIsOn(t *testing.T) {
+	taskProps := func(schema map[string]any) map[string]any {
+		return schema["properties"].(map[string]any)["tasks"].(map[string]any)["items"].(map[string]any)["properties"].(map[string]any)
+	}
+	if _, ok := taskProps(PrimarySchemaFor(false))["art"]; ok {
+		t.Fatal("the art flag is offered while art is off")
+	}
+	on := PrimarySchemaFor(true)
+	field, ok := taskProps(on)["art"].(map[string]any)
+	if !ok || field["type"] != "boolean" {
+		t.Fatalf("task schema has no boolean art field: %v", taskProps(on)["art"])
+	}
+	if _, ok := taskProps(on)["vision"]; !ok {
+		t.Fatal("the art schema lost the other task fields")
+	}
+	if _, ok := taskProps(PrimarySchema)["art"]; ok {
+		t.Fatal("building the art schema changed the base schema")
+	}
+	if again := PrimarySchemaFor(true); len(again) != len(on) {
+		t.Fatal("the art schema is not stable between calls")
+	}
+	for _, k := range []string{"required", "type", "additionalProperties"} {
+		if (PrimarySchema[k] == nil) != (on[k] == nil) {
+			t.Fatalf("the art schema dropped %q", k)
+		}
+	}
+}

@@ -778,6 +778,7 @@
     { id: "verification", title: "Verification", keys: ["relo.autoVerify", "relo.autoReview", "relo.report.maxChars"] },
     { id: "permissions", title: "Permissions", keys: ["relo.permissions.read", "relo.permissions.write", "relo.permissions.test", "relo.permissions.build", "relo.permissions.install", "relo.permissions.delete", "relo.permissions.gitCommit", "relo.permissions.gitPush", "relo.permissions.network", "relo.permissions.outside", "relo.permissions.destructive", "relo.permissions.yolo"] },
     { id: "claudeCode", title: "Claude Code", keys: ["relo.claudeCode.enabled", "relo.claudeCode.path"] },
+    { id: "art", title: "Sprites", keys: ["relo.art.enabled", "relo.art.provider", "relo.art.model", "relo.art.quality", "relo.art.size", "relo.art.candidates", "relo.art.sessionBudgetUSD", "relo.art.sessionJobLimit", "relo.art.approval"] },
     { id: "advanced", title: "Advanced", keys: ["relo.runtime", "relo.openCode.path", "relo.logLevel"] },
   ];
 
@@ -803,6 +804,15 @@
     "relo.openCode.path": "OpenCode path",
     "relo.claudeCode.enabled": "Run agents on Claude Code",
     "relo.claudeCode.path": "Claude Code path",
+    "relo.art.enabled": "Image generation",
+    "relo.art.provider": "Provider",
+    "relo.art.model": "Model",
+    "relo.art.quality": "Quality",
+    "relo.art.size": "Size",
+    "relo.art.candidates": "Pictures per job",
+    "relo.art.sessionBudgetUSD": "Session budget (USD, 0 = unlimited)",
+    "relo.art.sessionJobLimit": "Jobs per session (0 = unlimited)",
+    "relo.art.approval": "Ask before spending",
     "relo.permissions.yolo": "YOLO mode",
     "relo.logLevel": "Log level",
     "relo.primaryModel": "Primary model",

@@ -214,6 +214,34 @@ func WithImages(tools map[string]bool, role string, enabled bool) map[string]boo
 	return tools
 }
 
+// ReloSpriteTool is the MCP tool that turns a picture into a game-ready sprite and writes it into the agent's
+// workspace. It is offered only to builder roles on a task that makes art; see WithSprite.
+const ReloSpriteTool = "relo_sprite"
+
+// WithSprite adds the relo_sprite allow rule to a tool policy when enabled. The Primary never gets it: it plans from
+// curated context and writes no files, and the core refuses its calls as well.
+func WithSprite(tools map[string]bool, role string, enabled bool) map[string]bool {
+	if !enabled || role == RolePrimary {
+		return tools
+	}
+	tools[ReloSpriteTool] = true
+	return tools
+}
+
+// ReloArtTool is the MCP tool that makes pictures through an image API the user pays for. It is offered to the same agents
+// as relo_sprite; see WithArt.
+const ReloArtTool = "relo_art"
+
+// WithArt adds the relo_art allow rule to a tool policy when enabled. The Primary never gets it: it plans from curated
+// context and spends nothing, and the core refuses its calls as well.
+func WithArt(tools map[string]bool, role string, enabled bool) map[string]bool {
+	if !enabled || role == RolePrimary {
+		return tools
+	}
+	tools[ReloArtTool] = true
+	return tools
+}
+
 // ReloCanvasTool is the optional MCP tool that drives Relo Canvas artifacts through the extension. It is enabled
 // only when the connected extension advertises Canvas support.
 const ReloCanvasTool = "relo_canvas"

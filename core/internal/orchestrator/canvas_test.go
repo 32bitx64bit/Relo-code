@@ -303,6 +303,50 @@ func TestCanvasDisabledCoordRegistersNoTool(t *testing.T) {
 	}
 }
 
+// The relo_agents roster carries the canvas status for the caller's role, so a builder or the planner learns whether
+// relo_canvas can be used, or why it never will be, instead of failing without a reason.
+func TestRosterReportsCanvasStatusAndReason(t *testing.T) {
+	status := func(c *Coord, key string) map[string]any {
+		t.Helper()
+		v, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "list"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, _ := v.(map[string]any)["canvas"].(map[string]any)
+		if st == nil {
+			t.Fatalf("the roster has no canvas status: %v", v)
+		}
+		return st
+	}
+	hasCreate := func(st map[string]any) bool {
+		for _, a := range st["actions"].([]string) {
+			if a == "create" {
+				return true
+			}
+		}
+		return false
+	}
+	for _, role := range []agent.Role{agent.Worker, agent.Architect, agent.Debug, agent.Test, agent.Integration} {
+		c, _, _, key := newCanvasRoleCoord(t, ModeBuild, role)
+		if st := status(c, key); st["available"] != true || st["authoring"] != true || !hasCreate(st) {
+			t.Errorf("%s: status = %v, want a builder that may create", role, st)
+		}
+	}
+	for _, role := range []agent.Role{agent.Primary, agent.Head, agent.Probe, agent.Reviewer} {
+		c, _, _, key := newCanvasRoleCoord(t, ModeBuild, role)
+		if st := status(c, key); st["available"] != true || st["authoring"] != false || hasCreate(st) {
+			t.Errorf("%s: status = %v, want read-only canvas", role, st)
+		}
+	}
+	c, _, _, key := newCanvasCoord(t, ModeBuild)
+	c.SetCanvasEnabled(false)
+	st := status(c, key)
+	reason, _ := st["reason"].(string)
+	if st["available"] != false || !strings.Contains(reason, "not supported by the connected editor") || !strings.Contains(reason, "relo_canvas") {
+		t.Fatalf("canvas off: status = %v, want unavailable with a reason", st)
+	}
+}
+
 // Authoring is refused for every role that is not a builder, and the error names the refused role.
 func TestCanvasAuthoringDeniedForEveryRestrictedRole(t *testing.T) {
 	for _, role := range []agent.Role{agent.Primary, agent.Head, agent.Probe, agent.Reviewer, agent.Role("designer"), agent.Role("")} {

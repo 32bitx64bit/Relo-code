@@ -273,9 +273,11 @@ type Coord struct {
 	imageMu         sync.Mutex
 	imageRate       map[string][]time.Time // agent ID -> recent relo_image call times; guarded by imageMu
 	imageSlots      chan struct{}          // bounds images decoded at once; created lazily under imageMu
+	art             artState               // the art tools: whether they are on, and the relo_sprite call rate
 	escalations     map[string]string
 	failures        map[string]string // task ID -> why its last attempt failed, for the attempt that replaces it; guarded by mu
 	directSem       chan struct{}     // guarded by mu; one mutating agent at a time in direct mode
+	directHolder    directHold        // who holds directSem now, so a queued agent can say what it waits for; guarded by mu
 	directNotified  string            // session ID that already received the direct-mode notice; guarded by mu
 	snapshotNoticed map[string]bool   // session ID -> the snapshot notice was already shown; guarded by mu
 	baseline        map[string]bool   // "baseline dir\x00command" -> command already fails without the agent's change; guarded by mu

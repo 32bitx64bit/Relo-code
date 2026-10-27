@@ -151,3 +151,24 @@ func TestParseReportUsesFindingsWhenSummaryIsMissing(t *testing.T) {
 		t.Fatal("a report with nothing in it was accepted")
 	}
 }
+
+// A final message that quotes a code block holds ``` inside a JSON string. The parsers took that block instead of the
+// object, so the real message was thrown away and a worker's task failed with "invalid character 'm'" (from ```mermaid).
+func TestParseKeepsCodeFenceInsideJSONString(t *testing.T) {
+	report := `{"status":"completed","summary":"Diagram:\n` + "```mermaid" + `\ngraph TD; A-->B\n` + "```" + `\nDone."}`
+	turn := `{"status":"completed","userMessage":"Run:\n` + "```bash" + `\ngo test ./...\n` + "```" + `","tasks":[]}`
+	for _, body := range []string{report, "Here it is:\n" + report} {
+		got, err := ParseReport(body)
+		if err != nil || !strings.Contains(got.Summary, "graph TD; A-->B") || !strings.HasSuffix(got.Summary, "Done.") {
+			t.Fatalf("ParseReport(%q) = %+v, %v; want the whole summary", body, got, err)
+		}
+		raw, err := ParseJSON[RawReport](body)
+		if err != nil || !strings.HasSuffix(raw.Summary, "Done.") {
+			t.Fatalf("ParseJSON(%q) = %+v, %v; want the whole summary", body, raw, err)
+		}
+	}
+	got, err := ParseTurn(turn, nil)
+	if err != nil || !strings.Contains(got.UserMessage, "go test ./...") {
+		t.Fatalf("ParseTurn = %+v, %v; want the whole message", got, err)
+	}
+}

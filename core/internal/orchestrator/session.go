@@ -806,7 +806,7 @@ func (c *Coord) applyTurn(primary agent.Agent, turn Turn) {
 	}
 	for _, spec := range turn.Tasks {
 		role := parseRole(spec.Role)
-		t := c.Graph.Add(taskgraph.Task{Title: spec.Title, Description: spec.Description, Acceptance: spec.Acceptance, Creator: primary.ID, Priority: spec.Priority, Role: string(role), Workspace: s.Workspace, Difficulty: spec.Difficulty, Vision: spec.Vision, MaxAttempts: settings.MaxRetries, Model: c.modelForTask(role, spec.Difficulty, spec.Vision), Paths: spec.Paths, Scope: spec.Scope})
+		t := c.Graph.Add(taskgraph.Task{Title: spec.Title, Description: spec.Description, Acceptance: spec.Acceptance, Creator: primary.ID, Priority: spec.Priority, Role: string(role), Workspace: s.Workspace, Difficulty: spec.Difficulty, Vision: spec.Vision || spec.Art, Art: spec.Art && c.artOn(), MaxAttempts: settings.MaxRetries, Model: c.modelForTask(role, spec.Difficulty, spec.Vision || spec.Art), Paths: spec.Paths, Scope: spec.Scope})
 		idmap[spec.ID] = t.ID
 		c.emit("task.created", t)
 	}
@@ -1047,7 +1047,7 @@ func (c *Coord) surfaceBlocks() {
 }
 
 func (c *Coord) primaryTurn(ctx context.Context, primary agent.Agent, parts prompt.Parts, ask string) (Turn, error) {
-	body, err := c.runAgent(ctx, primary, parts, ask, prompt.PrimarySchema)
+	body, err := c.runAgent(ctx, primary, parts, ask, prompt.PrimarySchemaFor(c.artOn()))
 	if err != nil {
 		return Turn{}, err
 	}
@@ -1066,7 +1066,7 @@ func (c *Coord) primaryTurn(ctx context.Context, primary agent.Agent, parts prom
 	if strayCall {
 		repair = "Your last reply was tool-call markup, not an executed tool. You have no repository tools; use relo_agents or relo_canvas only if offered. Reply with the JSON turn: what was done in userMessage, and tasks [] when nothing is left to do."
 	}
-	body, err = c.runAgent(ctx, primary, parts, repair, prompt.PrimarySchema)
+	body, err = c.runAgent(ctx, primary, parts, repair, prompt.PrimarySchemaFor(c.artOn()))
 	if err != nil {
 		return Turn{}, err
 	}
@@ -1149,23 +1149,31 @@ func (c *Coord) drive(ctx context.Context) error {
 }
 
 // cancelOrphans retires tasks that can never run because something they depend on failed for good. Left Blocked
-// they would keep Primary from ever being asked to wrap up, and the user would see work silently stop.
+// they would keep Primary from ever being asked to wrap up, and the user would see work silently stop. Repeat to a
+// fixed point because Graph.List is unordered: cancelling a parent can orphan a child that the first pass already saw.
 func (c *Coord) cancelOrphans() {
-	for _, t := range c.Graph.List() {
-		if t.Status != taskgraph.Blocked {
-			continue
-		}
-		for _, dep := range t.Depends {
-			if d, ok := c.Graph.Get(dep); ok && (d.Status == taskgraph.Failed || d.Status == taskgraph.Canceled) {
-				updated, err := c.Graph.Update(t.ID, func(x *taskgraph.Task) {
-					x.Status = taskgraph.Canceled
-					x.Finished = time.Now().UTC()
-				})
-				if err == nil {
-					c.emit("task.updated", updated)
-				}
-				break
+	for {
+		changed := false
+		for _, t := range c.Graph.List() {
+			if t.Status != taskgraph.Blocked {
+				continue
 			}
+			for _, dep := range t.Depends {
+				if d, ok := c.Graph.Get(dep); ok && (d.Status == taskgraph.Failed || d.Status == taskgraph.Canceled) {
+					updated, err := c.Graph.Update(t.ID, func(x *taskgraph.Task) {
+						x.Status = taskgraph.Canceled
+						x.Finished = time.Now().UTC()
+					})
+					if err == nil {
+						changed = true
+						c.emit("task.updated", updated)
+					}
+					break
+				}
+			}
+		}
+		if !changed {
+			return
 		}
 	}
 }
@@ -1324,11 +1332,19 @@ func (c *Coord) failTask(t taskgraph.Task, a agent.Agent, cause error) {
 		c.logWarn("fail task", err)
 		return
 	}
+	c.endReport(a, status, cause)
 	c.emit("task.failed", updated)
 	if status == taskgraph.Canceled {
 		if kept := c.keptNote(t, a); kept != "" {
 			c.chat("system", fmt.Sprintf("%q was stopped.%s", t.Title, kept), "")
 		}
+		return
+	}
+	// A workspace that stayed busy for the whole wait will still be busy on a retry, so retrying only hides the
+	// holder's name behind another long wait. Retryability is decided by type, before the string markers below.
+	var busy *workspaceBusyError
+	if errors.As(cause, &busy) {
+		c.chat("system", fmt.Sprintf("%q failed and will not be retried: %s.%s", t.Title, strings.TrimRight(cause.Error(), "."), c.keptNote(t, a)), "")
 		return
 	}
 	if cause != nil && !retryable(cause) {
@@ -1347,6 +1363,24 @@ func (c *Coord) failTask(t taskgraph.Task, a agent.Agent, cause error) {
 		}
 	}
 	c.retryTask(updated, a)
+}
+
+// endReport gives an agent that ended without writing a report a final message of its own. A stopped or failed run
+// reached no report path, so it left nothing to read, and its card said only "Stopped". A report the agent wrote
+// is never replaced.
+func (c *Coord) endReport(a agent.Agent, status taskgraph.Status, cause error) {
+	if rep, ok := c.Agents.Report(a.ID); ok && strings.TrimSpace(rep.Summary) != "" {
+		return
+	}
+	rep := agent.Report{Status: agent.Failed, Summary: "The agent stopped before it wrote a report."}
+	switch {
+	case status == taskgraph.Canceled:
+		rep.Status, rep.Summary = agent.Cancelled, "Stopped before it finished, so it wrote no report."
+	case cause != nil && strings.TrimSpace(cause.Error()) != "":
+		rep.Summary = "Failed before it wrote a report: " + tailText(cause.Error(), 300)
+	}
+	rep.Raw = rep.Summary
+	c.Agents.SetReport(a.ID, rep)
 }
 
 // keepWork records what an agent that did not finish left in its worktree. Edits in a worktree are invisible until

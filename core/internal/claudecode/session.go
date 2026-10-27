@@ -1,11 +1,13 @@
 package claudecode
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"sort"
@@ -33,7 +35,7 @@ type session struct {
 	interrupt bool   // Cancel asked for an interrupt; the turn's result confirms it
 	timedOut  string // the turn timer fired; the result reports it
 	timer     *time.Timer
-	turns     int // counts the session's turns, so a late timer can tell its turn has ended
+	turns     int                        // counts the session's turns, so a late timer can tell its turn has ended
 	perms     map[string]json.RawMessage // open permission requests: request id -> the tool input
 	seq       int
 	tr        translator
@@ -190,9 +192,12 @@ func (s *session) flags(task runtime.AgentTask) ([]string, string, error) {
 	if len(denied) > 0 {
 		args = append(args, "--disallowedTools", strings.Join(denied, ","))
 	}
-	if tools, ok := s.rt.messageTools(s.dir); ok {
+	if _, ok := s.rt.messageTools(s.dir); ok {
+		// Safe mode drops every MCP server read from --mcp-config except SDK-hosted ones: an "http" entry here left
+		// the agent without relo_agents, relo_image and relo_canvas. The hub is registered as an SDK server instead,
+		// and bridge relays its JSON-RPC to the hub, so the URL and secret stay in Relo and out of the config file.
 		config, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{mcpServer: map[string]any{
-			"type": "http", "url": tools.URL, "headers": map[string]string{"Authorization": "Bearer " + tools.Secret},
+			"type": "sdk", "name": mcpServer,
 		}}})
 		file, err := s.tempFile("mcp-*.json", config)
 		if err != nil {
@@ -327,8 +332,8 @@ func (s *session) finishLocked(end *turnEnd) {
 	}
 }
 
-// control answers a request from the CLI. A permission request becomes Relo's permission event; anything else (hook
-// callbacks, SDK-hosted MCP servers) is refused, since Relo registers none.
+// control answers a request from the CLI. A permission request becomes Relo's permission event and a message for the
+// SDK-hosted hub server goes to the hub; anything else (hook callbacks) is refused, since Relo registers none.
 func (s *session) control(p *process, id string, raw json.RawMessage) {
 	var req struct {
 		Subtype string          `json:"subtype"`
@@ -336,6 +341,10 @@ func (s *session) control(p *process, id string, raw json.RawMessage) {
 		Input   json.RawMessage `json:"input"`
 	}
 	_ = json.Unmarshal(raw, &req)
+	if req.Subtype == "mcp_message" {
+		s.bridge(p, id, raw)
+		return
+	}
 	if req.Subtype != "can_use_tool" {
 		_ = p.write(map[string]any{"type": "control_response", "response": map[string]any{"subtype": "error", "request_id": id, "error": "not supported by Relo"}})
 		return
@@ -358,6 +367,86 @@ func (s *session) control(p *process, id string, raw json.RawMessage) {
 	}
 	s.emitLocked(runtime.Event{Type: "permission.asked", Phase: "tool", Permission: perm})
 	s.mu.Unlock()
+}
+
+// hubWait bounds one relayed hub call. The hub keeps its own deadlines (a canvas capture waits up to a minute); this
+// only stops a call that the hub never answers.
+const hubWait = 90 * time.Second
+
+// maxHubReply bounds a hub reply held in memory: a canvas capture returns an image of at most 4 MiB, base64 encoded.
+const maxHubReply = 16 << 20
+
+// bridge relays one JSON-RPC message of the SDK-hosted "relo" MCP server to Relo's hub and answers the CLI with the
+// hub's reply. It runs apart from the read loop, since a canvas call can take a minute and the CLI's other output,
+// the interrupt result among it, must not wait.
+func (s *session) bridge(p *process, id string, raw json.RawMessage) {
+	var req struct {
+		Server  string          `json:"server_name"`
+		Message json.RawMessage `json:"message"`
+	}
+	if json.Unmarshal(raw, &req) != nil || req.Server != mcpServer || len(req.Message) == 0 {
+		_ = p.write(map[string]any{"type": "control_response", "response": map[string]any{"subtype": "error", "request_id": id, "error": "not supported by Relo"}})
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), hubWait)
+		defer cancel()
+		go func() {
+			select {
+			case <-p.done:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+		reply := s.callHub(ctx, req.Message)
+		_ = p.write(map[string]any{"type": "control_response", "response": map[string]any{
+			"subtype": "success", "request_id": id, "response": map[string]any{"mcp_response": reply}}})
+	}()
+}
+
+// callHub posts one JSON-RPC message to the hub with the secret of this session's directory and returns the reply.
+// A failure becomes a JSON-RPC error for a request, so the model sees a tool error, and an empty result for a
+// notification. The error text never carries the hub's address or secret.
+func (s *session) callHub(ctx context.Context, msg json.RawMessage) json.RawMessage {
+	var head struct {
+		ID json.RawMessage `json:"id"`
+	}
+	_ = json.Unmarshal(msg, &head)
+	ack := json.RawMessage(`{"jsonrpc":"2.0","result":{}}`)
+	fail := func(text string) json.RawMessage {
+		if len(head.ID) == 0 {
+			return ack
+		}
+		b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": head.ID, "error": map[string]any{"code": -32603, "message": text}})
+		return b
+	}
+	tools, ok := s.rt.messageTools(s.dir)
+	if !ok {
+		return fail("Relo's agent hub is not configured for this session")
+	}
+	hr, err := http.NewRequestWithContext(ctx, http.MethodPost, tools.URL, bytes.NewReader(msg))
+	if err != nil {
+		return fail("Relo's agent hub address is not usable")
+	}
+	hr.Header.Set("Content-Type", "application/json")
+	hr.Header.Set("Authorization", "Bearer "+tools.Secret)
+	res, err := http.DefaultClient.Do(hr)
+	if err != nil {
+		return fail("Relo's agent hub did not answer")
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, maxHubReply+1))
+	switch {
+	case err != nil || len(body) > maxHubReply:
+		return fail("Relo's agent hub sent an unreadable or oversized reply")
+	case res.StatusCode == http.StatusAccepted || len(bytes.TrimSpace(body)) == 0 && res.StatusCode == http.StatusOK:
+		return ack
+	case res.StatusCode != http.StatusOK:
+		return fail(fmt.Sprintf("Relo's agent hub refused the call (HTTP %d)", res.StatusCode))
+	case !json.Valid(body):
+		return fail("Relo's agent hub sent an unreadable reply")
+	}
+	return body
 }
 
 // permissionAction is the permission's title in Relo's terms, which permission.Classify reads.

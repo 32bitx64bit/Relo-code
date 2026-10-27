@@ -128,11 +128,22 @@ func (s *Server) callImage(ctx context.Context, arguments json.RawMessage) (any,
 	if err != nil {
 		return toolResult(err.Error(), true), nil
 	}
-	text, err := json.Marshal(out.Text)
-	if err != nil {
-		return toolResult("result is not serializable", true), nil
+	return imageContent(out), nil
+}
+
+// imageContent builds the MCP content of a result that has one text part and any number of pictures: the text block,
+// then an image block for each picture that is a PNG or JPEG within the size limits.
+func imageContent(out ImageResult) map[string]any {
+	// A plain string (a guide, say) goes out as it is; anything else is sent as JSON.
+	text, ok := out.Text.(string)
+	if !ok {
+		encoded, err := json.Marshal(out.Text)
+		if err != nil {
+			return toolResult("result is not serializable", true)
+		}
+		text = string(encoded)
 	}
-	content := []any{map[string]any{"type": "text", "text": string(text)}}
+	content := []any{map[string]any{"type": "text", "text": text}}
 	total := 0
 	for _, img := range out.Images {
 		size, ok := pictureSize(img)
@@ -143,7 +154,7 @@ func (s *Server) callImage(ctx context.Context, arguments json.RawMessage) (any,
 		total += size
 		content = append(content, map[string]any{"type": "image", "mimeType": img.MIME, "data": img.Data})
 	}
-	return map[string]any{"content": content, "isError": false}, nil
+	return map[string]any{"content": content, "isError": false}
 }
 
 // validateImageRequest enforces the wire contract. It never echoes the key.

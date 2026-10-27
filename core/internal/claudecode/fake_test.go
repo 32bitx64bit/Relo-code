@@ -27,6 +27,7 @@ type fakeLog struct {
 	MCPMode    string   `json:"mcpMode,omitempty"`
 	Input      string   `json:"input,omitempty"`
 	Permission string   `json:"permission,omitempty"`
+	Bridge     string   `json:"bridge,omitempty"`
 }
 
 func fakeClaude(mode string) int {
@@ -192,6 +193,25 @@ func fakeClaude(mode string) int {
 				text(0, "done after "+behavior)
 				endStep("end_turn", 2, 5000, 120, 10, 0)
 				result("done after "+behavior, 4, 5000, 5120, 90, 30)
+			case strings.HasPrefix(prompt, "hub"):
+				// An SDK-hosted MCP server's traffic: the CLI sends each JSON-RPC message as an mcp_message control
+				// request and waits for the host's mcp_response. The last message is a tools/call that the hub fails.
+				for i, message := range []string{
+					`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`,
+					`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+					`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"canvas"}}`,
+				} {
+					emit(`{"type":"control_request","request_id":"mcp-%d","request":{"subtype":"mcp_message","server_name":"relo","message":%s}}`, i, message)
+					reply := waitFor("control_response")
+					resp, _ := reply["response"].(map[string]any)
+					answer, _ := resp["response"].(map[string]any)
+					b, _ := json.Marshal(answer["mcp_response"])
+					logf(fakeLog{Bridge: string(b)})
+				}
+				step("m1", 2, 0, 100)
+				text(0, "hub done")
+				endStep("end_turn", 2, 0, 100, 5, 0)
+				result("hub done", 2, 0, 100, 5, 0)
 			case strings.HasPrefix(prompt, "steer"):
 				step("m1", 2, 0, 100)
 				emit(`{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/w/a.go"}}]}}`)
