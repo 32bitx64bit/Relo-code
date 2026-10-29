@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -137,6 +138,8 @@ func fakeClaude(mode string) int {
 			pending = append(pending, m)
 		}
 	}
+	// sdkNames are the servers the initialize request names as SDK-hosted.
+	var sdkNames []string
 	for {
 		var m map[string]any
 		if len(pending) > 0 {
@@ -151,6 +154,12 @@ func fakeClaude(mode string) int {
 		case "control_request":
 			req, _ := m["request"].(map[string]any)
 			if req["subtype"] == "initialize" {
+				names, _ := req["sdkMcpServers"].([]any)
+				for _, n := range names {
+					if name, ok := n.(string); ok {
+						sdkNames = append(sdkNames, name)
+					}
+				}
 				emit(`{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"claude_code_version":"2.1.304","account":{"email":"someone@example.invalid"},"models":[`+
 					`{"value":"default","resolvedModel":"claude-sonnet-5-5","displayName":"Default (recommended)","supportedEffortLevels":["low","medium","high","xhigh","max"]},`+
 					`{"value":"opus","resolvedModel":"claude-opus-5-5","displayName":"Opus 5.5","supportedEffortLevels":["low","medium","high","xhigh","max"]},`+
@@ -212,6 +221,72 @@ func fakeClaude(mode string) int {
 				text(0, "hub done")
 				endStep("end_turn", 2, 0, 100, 5, 0)
 				result("hub done", 2, 0, 100, 5, 0)
+			case strings.HasPrefix(prompt, "callable"):
+				// The tools the model can call, worked out as claude 2.1.306 does (probed against the real CLI):
+				// --tools names the built-ins; --safe-mode keeps only SDK-hosted MCP servers, that is an "sdk" entry
+				// of --mcp-config or a name in initialize.sdkMcpServers, and drops an "http" entry whole; each kept
+				// server is asked for its tools/list through mcp_message; --disallowedTools removes a tool.
+				list := func(flag string) []string {
+					var out []string
+					for i, a := range args {
+						if a == flag && i+1 < len(args) {
+							out = append(out, strings.Split(args[i+1], ",")...)
+						}
+					}
+					return out
+				}
+				var cfg struct {
+					Servers map[string]struct {
+						Type string `json:"type"`
+					} `json:"mcpServers"`
+				}
+				_ = json.Unmarshal([]byte(entry.MCP), &cfg)
+				hosted := map[string]bool{}
+				for name, server := range cfg.Servers {
+					if server.Type == "sdk" {
+						hosted[name] = true
+					}
+				}
+				for _, name := range sdkNames {
+					hosted[name] = true
+				}
+				denied := map[string]bool{}
+				for _, tool := range list("--disallowedTools") {
+					denied[tool] = true
+				}
+				callable := list("--tools")
+				ask := func(server, message string) map[string]any {
+					emit(`{"type":"control_request","request_id":"mcp-%s","request":{"subtype":"mcp_message","server_name":"%s","message":%s}}`, server, server, message)
+					reply := waitFor("control_response")
+					resp, _ := reply["response"].(map[string]any)
+					answer, _ := resp["response"].(map[string]any)
+					out, _ := answer["mcp_response"].(map[string]any)
+					b, _ := json.Marshal(out)
+					logf(fakeLog{Bridge: string(b)})
+					return out
+				}
+				for server := range hosted {
+					ask(server, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`)
+					reply := ask(server, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+					result, _ := reply["result"].(map[string]any)
+					tools, _ := result["tools"].([]any)
+					for _, tool := range tools {
+						name, _ := tool.(map[string]any)["name"].(string)
+						if full := "mcp__" + server + "__" + name; !denied[full] {
+							callable = append(callable, full)
+						}
+					}
+					if prompt == "callable canvas" {
+						ask(server, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"canvas","arguments":{"key":"k","action":"list"}}}`)
+					}
+				}
+				sort.Strings(callable)
+				names, _ := json.Marshal(callable)
+				emit(`{"type":"system","subtype":"init","model":"claude-sonnet-5-5","tools":%s}`, names)
+				step("m1", 2, 0, 100)
+				text(0, string(names))
+				endStep("end_turn", 2, 0, 100, 5, 0)
+				result(string(names), 2, 0, 100, 5, 0)
 			case strings.HasPrefix(prompt, "steer"):
 				step("m1", 2, 0, 100)
 				emit(`{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/w/a.go"}}]}}`)

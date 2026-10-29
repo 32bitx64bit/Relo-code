@@ -31,6 +31,7 @@ type session struct {
 	proc      *process
 	ended     bool   // the process has exited; the conversation is gone
 	key       string // the process's flags, fixed for its life
+	hub       bool   // the process was given Relo's hub as an SDK-hosted MCP server
 	turn      bool   // a Relo turn is running
 	interrupt bool   // Cancel asked for an interrupt; the turn's result confirms it
 	timedOut  string // the turn timer fired; the result reports it
@@ -204,6 +205,7 @@ func (s *session) flags(task runtime.AgentTask) ([]string, string, error) {
 			return nil, "", err
 		}
 		args = append(args, "--mcp-config", file)
+		s.hub = true
 	}
 	return args, key, nil
 }
@@ -243,7 +245,14 @@ func (s *session) startLocked(args []string) error {
 	}
 	s.proc = p
 	go s.read(p, stdout)
-	if err := p.write(controlRequest("relo_init", map[string]any{"subtype": "initialize", "hooks": nil})); err != nil {
+	init := map[string]any{"subtype": "initialize", "hooks": nil}
+	if s.hub {
+		// The hub is named here as well as in --mcp-config, as the SDKs do, so the CLI hosts it through the
+		// initialize request too and not only through whatever --safe-mode keeps of the config file. The CLI
+		// merges the two, so a server named in both is registered once.
+		init["sdkMcpServers"] = []string{mcpServer}
+	}
+	if err := p.write(controlRequest("relo_init", init)); err != nil {
 		return fmt.Errorf("start Claude Code: %w", err)
 	}
 	return nil

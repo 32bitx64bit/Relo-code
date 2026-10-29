@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/relocode/relo/internal/agent"
+	"github.com/relocode/relo/internal/agentmsg"
 	"github.com/relocode/relo/internal/runtime"
 )
 
@@ -533,5 +535,112 @@ func TestTheHubIsRelayedForTheCLI(t *testing.T) {
 	defer mu.Unlock()
 	if len(seen) != 3 || !strings.HasPrefix(seen[0], "Bearer s3cret-token ") {
 		t.Fatalf("the hub saw %q, want three calls with the secret", seen)
+	}
+}
+
+// callableTurn runs one turn on the fake CLI against a real agentmsg hub that serves the canvas tool, with the tool
+// policy the orchestrator would send, and returns the tools the model could call, the hub's canvas calls, and the
+// fake's log. The fake works the tool list out the way the real CLI does under --safe-mode (see fake_test.go).
+func callableTurn(t *testing.T, tools map[string]bool, prompt string) (callable []string, canvasCalls []string, log []fakeLog) {
+	t.Helper()
+	var mu sync.Mutex
+	hub, err := agentmsg.Start(func(context.Context, agentmsg.Request) (any, error) { return map[string]any{}, nil },
+		agentmsg.WithCanvas(func(_ context.Context, req agentmsg.CanvasRequest) (any, error) {
+			mu.Lock()
+			canvasCalls = append(canvasCalls, req.Action)
+			mu.Unlock()
+			return map[string]any{"artifacts": []any{}}, nil
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	rt, path := fakeRuntime(t, "ok")
+	dir := t.TempDir()
+	if err := rt.ConfigureMessages(context.Background(), dir, runtime.MessageTools{URL: hub.URL, Secret: hub.Secret}); err != nil {
+		t.Fatal(err)
+	}
+	sid, evs := start(t, rt, runtime.SessionConfig{Directory: dir})
+	turn := task(prompt)
+	turn.Tools = tools
+	if err := rt.SendTask(context.Background(), sid, turn); err != nil {
+		t.Fatal(err)
+	}
+	got := collect(t, evs, nil)
+	end := got[len(got)-1]
+	if end.Error != "" || json.Unmarshal([]byte(end.Text), &callable) != nil {
+		t.Fatalf("turn end = %+v, want the list of callable tools", end)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return callable, canvasCalls, readLog(t, path)
+}
+
+func has(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+// A Claude Code worker whose prompt offers relo_canvas must be able to call it. Every earlier failure of this kind
+// came from the process starting without the tool: the hub was an "http" MCP entry, which --safe-mode drops, so the
+// model was told about relo_canvas and had no such tool (and no ToolSearch to look for it). The fake CLI applies
+// the same rule, so a config the real CLI would drop leaves the tool out of the list here too.
+func TestAClaudeCodeWorkerCanCallCanvasWhenThePromptOffersIt(t *testing.T) {
+	tools := runtime.WithCanvas(runtime.ToolsFor("worker", "build", true), true, agent.CanvasActionsForRole(agent.Worker))
+	callable, canvasCalls, log := callableTurn(t, tools, "callable canvas")
+	if !has(callable, "mcp__relo__canvas") || !has(callable, "mcp__relo__agents") {
+		t.Fatalf("callable tools = %v, want mcp__relo__canvas and mcp__relo__agents", callable)
+	}
+	if strings.Join(canvasCalls, ",") != "list" {
+		t.Fatalf("the hub saw canvas calls %v, want one list call relayed from the CLI", canvasCalls)
+	}
+	// The hub is hosted twice over, as the SDKs do: named in initialize.sdkMcpServers and as an "sdk" config entry.
+	var named bool
+	for _, e := range log {
+		var m struct {
+			Request struct {
+				Subtype string   `json:"subtype"`
+				Servers []string `json:"sdkMcpServers"`
+			} `json:"request"`
+		}
+		if json.Unmarshal([]byte(e.Input), &m) == nil && m.Request.Subtype == "initialize" {
+			named = strings.Join(m.Request.Servers, ",") == "relo"
+		}
+	}
+	if !named {
+		t.Fatalf("the initialize request does not name the relo SDK server; log: %+v", log)
+	}
+	var args []string
+	for _, e := range log {
+		if has(e.Args, "--system-prompt-file") {
+			args = e.Args
+		}
+	}
+	if allowed, _ := flag(args, "--allowedTools"); !strings.Contains(allowed, "mcp__relo__canvas") {
+		t.Fatalf("--allowedTools = %q, want mcp__relo__canvas", allowed)
+	}
+	if denied, _ := flag(args, "--disallowedTools"); strings.Contains(denied, "mcp__relo__canvas") {
+		t.Fatalf("--disallowedTools = %q denies the canvas tool the prompt offers", denied)
+	}
+}
+
+// The tool policy still decides: a turn that does not offer canvas gets no canvas tool even though the hub serves it,
+// and a read-only role gets the tool the policy gives it.
+func TestAClaudeCodeWorkerGetsNoCanvasUnlessOffered(t *testing.T) {
+	callable, _, _ := callableTurn(t, runtime.ToolsFor("worker", "build", true), "callable")
+	if has(callable, "mcp__relo__canvas") {
+		t.Fatalf("callable tools = %v: canvas was not offered", callable)
+	}
+	if !has(callable, "mcp__relo__agents") {
+		t.Fatalf("callable tools = %v, want mcp__relo__agents", callable)
+	}
+	probe := runtime.WithCanvas(runtime.ToolsFor("probe", "plan", false), true, agent.CanvasActionsForRole(agent.Probe))
+	callable, _, _ = callableTurn(t, probe, "callable")
+	if !has(callable, "mcp__relo__canvas") {
+		t.Fatalf("a read-only role offered canvas lost it: %v", callable)
 	}
 }
