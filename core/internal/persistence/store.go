@@ -3,66 +3,88 @@ package persistence
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/url"
+	"log"
 	"os"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 type Store struct {
-	db *sql.DB
+	db          *sql.DB
+	root        string
+	temporary   bool
+	mu          sync.Mutex
+	sessions    map[string]*sessionHandle
+	clock       uint64
+	legacyReady bool
 }
 
 func Open(path string) (*Store, error) {
-	dsn := path
-	if path != ":memory:" && path != "file::memory:?cache=shared" {
-		dir := filepath.Dir(path)
-		_, statErr := os.Stat(dir)
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return nil, err
-		}
-		if os.IsNotExist(statErr) {
-			if err := os.Chmod(dir, 0o700); err != nil {
-				return nil, err
-			}
-		}
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	root := filepath.Dir(path)
+	temporary := path == ":memory:" || path == "file::memory:?cache=shared"
+	if temporary {
+		var err error
+		root, err = os.MkdirTemp("", "relo-store-")
 		if err != nil {
 			return nil, err
 		}
-		if err := file.Close(); err != nil {
-			return nil, err
-		}
-		if err := os.Chmod(path, 0o600); err != nil {
-			return nil, err
-		}
-		dsn = (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String() + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)"
-	} else {
-		dsn = "file:relo?mode=memory&cache=shared"
 	}
-	db, err := sql.Open("sqlite", dsn)
+	if !temporary {
+		if err := legacyPreflight(filepath.Join(root, "relo.db")); err != nil {
+			if errors.Is(err, syscall.ENOSPC) {
+				return nil, err
+			}
+			log.Printf("persistence: legacy preflight: %v", err)
+		}
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, err
+	}
+	db, err := openDB(filepath.Join(root, "catalog.db"))
 	if err != nil {
-		return nil, err
-	}
-	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
-	if err := s.migrate(); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if path != ":memory:" && path != "file::memory:?cache=shared" {
-		if err := os.Chmod(path, 0o600); err != nil {
-			db.Close()
-			return nil, err
+		if temporary {
+			os.RemoveAll(root)
 		}
+		return nil, err
+	}
+	s := &Store{db: db, root: root, temporary: temporary, sessions: make(map[string]*sessionHandle)}
+	if err := s.migrateCatalog(); err != nil {
+		s.Close()
+		return nil, err
+	}
+	if err := s.initLegacy(); err != nil {
+		s.Close()
+		return nil, err
 	}
 	return s, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var result error
+	for id, h := range s.sessions {
+		if err := h.db.Close(); err != nil && result == nil {
+			result = err
+		}
+		delete(s.sessions, id)
+	}
+	if err := s.db.Close(); err != nil && result == nil {
+		result = err
+	}
+	if s.temporary {
+		if err := os.RemoveAll(s.root); err != nil && result == nil {
+			result = err
+		}
+	}
+	return result
+}
 
 func (s *Store) migrate() error {
 	var version int
@@ -73,11 +95,6 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("database schema version %d is newer than supported version 2", version)
 	}
 	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS kv (
-  k TEXT PRIMARY KEY,
-  v TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
-);
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   workspace TEXT NOT NULL,
@@ -107,12 +124,6 @@ CREATE TABLE IF NOT EXISTS generations (
 CREATE TABLE IF NOT EXISTS findings (
   id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,
-  payload TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS memory (
-  id TEXT PRIMARY KEY,
-  workspace TEXT NOT NULL,
   payload TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -158,21 +169,6 @@ CREATE TABLE IF NOT EXISTS event_latest (
   created_at INTEGER NOT NULL,
   PRIMARY KEY (session_id, name)
 );
--- vworkspaces mirrors the virtual workspaces Git holds (refs/relo/vws/*), for the UI, diagnostics and for noticing
--- when Git and Relo disagree after a restart. Git is the source of truth: a row is rebuilt from refs, never trusted
--- over them. The table is additive, so it needs no schema version and older builds ignore it.
-CREATE TABLE IF NOT EXISTS vworkspaces (
-  workspace TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
-  session_id TEXT NOT NULL DEFAULT '',
-  base_commit TEXT NOT NULL,
-  revision INTEGER NOT NULL,
-  tree_oid TEXT NOT NULL,
-  state TEXT NOT NULL,
-  payload TEXT NOT NULL,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY (workspace, agent_id)
-);
 CREATE INDEX IF NOT EXISTS idx_agents_session ON agents(session_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
 CREATE INDEX IF NOT EXISTS idx_gen_agent ON generations(agent_id);
@@ -205,6 +201,22 @@ func (s *Store) migrateV2() error {
 }
 
 func (s *Store) PutJSON(table, id, session string, extra string, v any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if table != "sessions" && table != "agents" && table != "tasks" && table != "findings" && table != "memory" && table != "changes" && table != "verification" && table != "reports" {
+		return fmt.Errorf("unknown table %s", table)
+	}
+	if table == "sessions" {
+		session = id
+	}
+	db := s.db
+	if table != "memory" {
+		var err error
+		db, err = s.sessionDB(session)
+		if err != nil {
+			return err
+		}
+	}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -212,7 +224,7 @@ func (s *Store) PutJSON(table, id, session string, extra string, v any) error {
 	now := time.Now().Unix()
 	switch table {
 	case "sessions":
-		_, err = s.db.Exec(`INSERT INTO sessions(id, workspace, payload, updated_at) VALUES(?,?,?,?)
+		_, err = db.Exec(`INSERT INTO sessions(id, workspace, payload, updated_at) VALUES(?,?,?,?)
 			ON CONFLICT(id) DO UPDATE SET workspace=excluded.workspace, payload=excluded.payload, updated_at=excluded.updated_at`, id, extra, string(b), now)
 	case "agents":
 		var m struct {
@@ -223,49 +235,72 @@ func (s *Store) PutJSON(table, id, session string, extra string, v any) error {
 		if err := json.Unmarshal(b, &m); err != nil {
 			return err
 		}
-		_, err = s.db.Exec(`INSERT INTO agents(id, session_id, payload, updated_at, steps, cache_read, cache_write) VALUES(?,?,?,?,?,?,?)
+		_, err = db.Exec(`INSERT INTO agents(id, session_id, payload, updated_at, steps, cache_read, cache_write) VALUES(?,?,?,?,?,?,?)
 			ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, payload=excluded.payload, updated_at=excluded.updated_at,
 			steps=excluded.steps, cache_read=excluded.cache_read, cache_write=excluded.cache_write`, id, session, string(b), now, m.Steps, m.CacheRead, m.CacheWrite)
 	case "tasks":
-		_, err = s.db.Exec(`INSERT INTO tasks(id, session_id, payload, updated_at) VALUES(?,?,?,?)
+		_, err = db.Exec(`INSERT INTO tasks(id, session_id, payload, updated_at) VALUES(?,?,?,?)
 			ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, payload=excluded.payload, updated_at=excluded.updated_at`, id, session, string(b), now)
 	case "findings":
-		_, err = s.db.Exec(`INSERT INTO findings(id, session_id, payload, updated_at) VALUES(?,?,?,?)
+		_, err = db.Exec(`INSERT INTO findings(id, session_id, payload, updated_at) VALUES(?,?,?,?)
 			ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`, id, session, string(b), now)
 	case "memory":
-		_, err = s.db.Exec(`INSERT INTO memory(id, workspace, payload, updated_at) VALUES(?,?,?,?)
+		_, err = db.Exec(`INSERT INTO memory(id, workspace, payload, updated_at) VALUES(?,?,?,?)
 			ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`, id, extra, string(b), now)
 	case "changes":
-		_, err = s.db.Exec(`INSERT INTO changes(id, session_id, payload, updated_at) VALUES(?,?,?,?)
+		_, err = db.Exec(`INSERT INTO changes(id, session_id, payload, updated_at) VALUES(?,?,?,?)
 			ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`, id, session, string(b), now)
 	case "verification":
-		_, err = s.db.Exec(`INSERT INTO verification(id, session_id, payload, updated_at) VALUES(?,?,?,?)
+		_, err = db.Exec(`INSERT INTO verification(id, session_id, payload, updated_at) VALUES(?,?,?,?)
 			ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`, id, session, string(b), now)
 	case "reports":
-		_, err = s.db.Exec(`INSERT INTO reports(id, session_id, agent_id, payload, updated_at) VALUES(?,?,?,?,?)
+		_, err = db.Exec(`INSERT INTO reports(id, session_id, agent_id, payload, updated_at) VALUES(?,?,?,?,?)
 			ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`, id, session, extra, string(b), now)
 	default:
 		return fmt.Errorf("unknown table %s", table)
 	}
-	return err
+	if err != nil || table == "memory" {
+		return err
+	}
+	if table == "sessions" {
+		if _, err = s.db.Exec(`INSERT INTO sessions(id,workspace,updated_at) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET workspace=excluded.workspace,updated_at=excluded.updated_at`, id, extra, now); err != nil {
+			return err
+		}
+	}
+	return s.indexID(table, id, session)
 }
 
 func (s *Store) PutGeneration(session, agent, id string, number int, v any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO generations(id, session_id, agent_id, number, payload, updated_at) VALUES(?,?,?,?,?,?)
+	db, err := s.sessionDB(session)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO generations(id, session_id, agent_id, number, payload, updated_at) VALUES(?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`, id, session, agent, number, string(b), time.Now().Unix())
-	return err
+	if err != nil {
+		return err
+	}
+	return s.indexID("generations", id, session)
 }
 
 func (s *Store) PutUsage(session string, v any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO usage(session_id, payload, created_at) VALUES(?,?,?)`, session, string(b), time.Now().Unix())
+	db, err := s.sessionDB(session)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO usage(session_id, payload, created_at) VALUES(?,?,?)`, session, string(b), time.Now().Unix())
 	return err
 }
 
@@ -281,51 +316,80 @@ var snapshotEventKinds = map[string]bool{
 }
 
 func (s *Store) LogEvent(session, name string, v any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
 	now := time.Now().Unix()
+	db, err := s.sessionDB(session)
+	if err != nil {
+		return err
+	}
 	if snapshotEventKinds[name] {
-		_, err = s.db.Exec(`INSERT INTO event_latest(session_id, name, payload, created_at) VALUES(?,?,?,?)
+		_, err = db.Exec(`INSERT INTO event_latest(session_id, name, payload, created_at) VALUES(?,?,?,?)
 			ON CONFLICT(session_id, name) DO UPDATE SET payload=excluded.payload, created_at=excluded.created_at`, session, name, string(b), now)
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO events(session_id, name, payload, created_at) VALUES(?,?,?,?)`, session, name, string(b), now)
+	_, err = db.Exec(`INSERT INTO events(session_id, name, payload, created_at) VALUES(?,?,?,?)`, session, name, string(b), now)
 	return err
 }
 
 func (s *Store) Get(table, id string, dest any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !validTable(table) {
 		return fmt.Errorf("unknown table %s", table)
 	}
+	db := s.db
+	if table != "memory" {
+		session, err := s.resolveID(table, id)
+		if err != nil {
+			return err
+		}
+		db, err = s.sessionDB(session)
+		if err != nil {
+			return err
+		}
+	}
 	q := "SELECT payload FROM " + table + " WHERE id=?"
 	var payload string
-	if err := s.db.QueryRow(q, id).Scan(&payload); err != nil {
+	if err := db.QueryRow(q, id).Scan(&payload); err != nil {
 		return err
 	}
 	return json.Unmarshal([]byte(payload), dest)
 }
 
 func (s *Store) List(table, session string) ([]json.RawMessage, error) {
+	if table == "sessions" {
+		return s.ListSessions(session)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !validTable(table) {
 		return nil, fmt.Errorf("unknown table %s", table)
 	}
 	var rows *sql.Rows
 	var err error
+	db := s.db
+	if table != "memory" {
+		db, err = s.sessionDB(session)
+		if err != nil {
+			return nil, err
+		}
+	}
 	switch table {
-	case "sessions":
-		rows, err = s.db.Query(`SELECT payload FROM sessions WHERE workspace=? ORDER BY updated_at DESC`, session)
 	case "memory":
-		rows, err = s.db.Query(`SELECT payload FROM memory WHERE workspace=? ORDER BY updated_at DESC`, session)
+		rows, err = db.Query(`SELECT payload FROM memory WHERE workspace=? ORDER BY updated_at DESC`, session)
 	case "generations":
-		rows, err = s.db.Query(`SELECT payload FROM generations WHERE session_id=? ORDER BY agent_id, number`, session)
+		rows, err = db.Query(`SELECT payload FROM generations WHERE session_id=? ORDER BY agent_id, number`, session)
 	case "usage":
-		rows, err = s.db.Query(`SELECT payload FROM usage WHERE session_id=? ORDER BY id`, session)
+		rows, err = db.Query(`SELECT payload FROM usage WHERE session_id=? ORDER BY id`, session)
 	case "events":
-		rows, err = s.db.Query(`SELECT payload FROM events WHERE session_id=? ORDER BY id`, session)
+		rows, err = db.Query(`SELECT payload FROM events WHERE session_id=? ORDER BY id`, session)
 	default:
-		rows, err = s.db.Query(`SELECT payload FROM `+table+` WHERE session_id=? ORDER BY updated_at DESC`, session)
+		rows, err = db.Query(`SELECT payload FROM `+table+` WHERE session_id=? ORDER BY updated_at DESC`, session)
 	}
 	if err != nil {
 		return nil, err
@@ -350,10 +414,16 @@ type EventRow struct {
 
 // EventRows returns the stored events of a session, newest first, with the name of each event.
 func (s *Store) EventRows(session string, limit int) ([]EventRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if limit <= 0 {
 		limit = 200
 	}
-	rows, err := s.db.Query(`
+	db, err := s.sessionDB(session)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.Query(`
 		SELECT name, payload FROM (
 			SELECT name, payload, created_at FROM event_latest WHERE session_id=?
 			UNION ALL
@@ -378,7 +448,13 @@ func (s *Store) EventRows(session string, limit int) ([]EventRow, error) {
 
 // DeleteSession removes a session and everything stored for it.
 func (s *Store) DeleteSession(id string) error {
-	tx, err := s.db.Begin()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	db, err := s.sessionDB(id)
+	if err != nil {
+		return err
+	}
+	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
@@ -389,6 +465,20 @@ func (s *Store) DeleteSession(id string) error {
 		}
 	}
 	if _, err := tx.Exec(`DELETE FROM sessions WHERE id=?`, id); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	tx, err = s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`DELETE FROM ids WHERE session_id=?`, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM sessions WHERE id=?`, id); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -404,12 +494,14 @@ func validTable(table string) bool {
 }
 
 func (s *Store) LatestSession(workspace string) (json.RawMessage, error) {
-	var p string
-	err := s.db.QueryRow(`SELECT payload FROM sessions WHERE workspace=? ORDER BY updated_at DESC LIMIT 1`, workspace).Scan(&p)
+	list, err := s.ListSessions(workspace)
 	if err != nil {
 		return nil, err
 	}
-	return json.RawMessage(p), nil
+	if len(list) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return list[0], nil
 }
 
 func (s *Store) SetKV(k, v string) error {
@@ -424,13 +516,19 @@ func (s *Store) GetKV(k string) (string, error) {
 }
 
 func (s *Store) Events(session string, limit int) ([]json.RawMessage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if limit <= 0 {
 		limit = 200
 	}
 	// Merge the newest snapshots (event_latest) with the appended events, newest first, so the operator log
 	// still shows the latest snapshot of each kind. The three snapshot kinds are excluded from events to avoid
 	// showing both a stored snapshot and any historical append-only rows left by an older build.
-	rows, err := s.db.Query(`
+	db, err := s.sessionDB(session)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.Query(`
 		SELECT payload FROM (
 			SELECT payload, created_at FROM event_latest WHERE session_id=?
 			UNION ALL

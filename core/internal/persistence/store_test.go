@@ -1,7 +1,9 @@
 package persistence
 
 import (
+	"bytes"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +11,107 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+func TestSplitStoreAndSessionLRU(t *testing.T) {
+	root := t.TempDir()
+	legacy := filepath.Join(root, "relo.db")
+	original := []byte("legacy bytes must remain untouched")
+	if err := os.WriteFile(legacy, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wal := []byte("legacy wal bytes must remain untouched")
+	if err := os.WriteFile(legacy+"-wal", wal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var first *sql.DB
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("s%d", i)
+		if err := s.PutSession(id, "workspace", map[string]string{"id": id}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutJSON("tasks", "task-"+id, id, "", map[string]string{"id": id}); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			first = s.sessions[id].db
+		}
+	}
+	if len(s.sessions) != 4 || s.sessions["s0"] != nil {
+		t.Fatalf("LRU sessions: %v", s.sessions)
+	}
+	if err := first.Ping(); err == nil {
+		t.Fatal("eviction left database open")
+	}
+	if err := s.PutGeneration("s1", "agent", "generation", 1, map[string]string{"id": "generation"}); err != nil {
+		t.Fatal(err)
+	}
+	var generation map[string]string
+	if err := s.Get("generations", "generation", &generation); err != nil || generation["id"] != "generation" {
+		t.Fatalf("generation lookup: %v, %v", generation, err)
+	}
+	var got map[string]string
+	if err := s.Get("tasks", "task-s0", &got); err != nil || got["id"] != "s0" {
+		t.Fatalf("Get after eviction: %v, %v", got, err)
+	}
+	h := s.sessions["s0"]
+	if err := s.CloseSession("s0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.db.Ping(); err == nil {
+		t.Fatal("CloseSession left database open")
+	}
+	if err := s.GetIn("tasks", "task-s0", "s0", &got); err != nil || got["id"] != "s0" {
+		t.Fatalf("GetIn after close: %v, %v", got, err)
+	}
+	list, err := s.ListSessions("workspace")
+	if err != nil || len(list) != 5 {
+		t.Fatalf("ListSessions: %d, %v", len(list), err)
+	}
+	for _, path := range []string{"catalog.db", "sessions/s0.db"} {
+		if _, err := os.Stat(filepath.Join(root, path)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, err := os.ReadFile(legacy)
+	if err != nil || !bytes.Equal(original, after) {
+		t.Fatalf("legacy changed: %v", err)
+	}
+	after, err = os.ReadFile(legacy + "-wal")
+	if err != nil || !bytes.Equal(wal, after) {
+		t.Fatalf("legacy WAL changed: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.Get("tasks", "task-s0", &got); err != nil || got["id"] != "s0" {
+		t.Fatalf("Get after restart: %v, %v", got, err)
+	}
+}
+
+func TestFreshStoreDoesNotCreateLegacy(t *testing.T) {
+	root := t.TempDir()
+	s, err := Open(filepath.Join(root, "relo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.PutSession("s1", "workspace", struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "relo.db")); !os.IsNotExist(err) {
+		t.Fatalf("legacy file exists: %v", err)
+	}
+}
 
 func TestRoundTrip(t *testing.T) {
 	s, err := Open(":memory:")
@@ -52,22 +155,21 @@ func TestRejectsUnknownTableAndSecuresFile(t *testing.T) {
 	if _, err := s.List("other", "x"); err == nil {
 		t.Fatal("expected invalid table rejection")
 	}
-	info, err := os.Stat(dbPath)
+	info, err := os.Stat(filepath.Join(filepath.Dir(dbPath), "catalog.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("database mode = %o", info.Mode().Perm())
 	}
-	var version int
-	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
-		t.Fatalf("schema version = %d, err = %v", version, err)
-	}
 }
 
 func TestAgentMetricsMigrateFromV1(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "relo.db")
-	old, err := sql.Open("sqlite", dbPath)
+	if err := os.MkdirAll(filepath.Join(filepath.Dir(dbPath), "sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old, err := sql.Open("sqlite", filepath.Join(filepath.Dir(dbPath), "sessions", "s1.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,9 +186,10 @@ PRAGMA user_version=1;`); err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	db := testSessionDB(t, s, "s1")
 	var steps, cacheRead, cacheWrite int
 	var payload string
-	if err := s.db.QueryRow(`SELECT payload, steps, cache_read, cache_write FROM agents WHERE id='a1'`).Scan(&payload, &steps, &cacheRead, &cacheWrite); err != nil {
+	if err := db.QueryRow(`SELECT payload, steps, cache_read, cache_write FROM agents WHERE id='a1'`).Scan(&payload, &steps, &cacheRead, &cacheWrite); err != nil {
 		t.Fatal(err)
 	}
 	if payload != `{"id":"a1"}` || steps != 0 || cacheRead != 0 || cacheWrite != 0 {
@@ -102,7 +205,7 @@ PRAGMA user_version=1;`); err != nil {
 	if err := s.PutJSON("agents", "a1", "s1", "", agentRow{ID: "a1", Steps: 3, CacheRead: 80, CacheWrite: 10}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.db.QueryRow(`SELECT steps, cache_read, cache_write FROM agents WHERE id='a1'`).Scan(&steps, &cacheRead, &cacheWrite); err != nil {
+	if err := db.QueryRow(`SELECT steps, cache_read, cache_write FROM agents WHERE id='a1'`).Scan(&steps, &cacheRead, &cacheWrite); err != nil {
 		t.Fatal(err)
 	}
 	if steps != 3 || cacheRead != 80 || cacheWrite != 10 {
@@ -180,7 +283,7 @@ func TestVWorkspaceTableNeedsNoSchemaVersion(t *testing.T) {
 	}
 	defer s.Close()
 	var version int
-	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
+	if err := testSessionDB(t, s, "s1").QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
 		t.Fatalf("user_version = %d %v, want 2", version, err)
 	}
 }

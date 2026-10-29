@@ -1,16 +1,28 @@
 package persistence
 
 import (
+	"database/sql"
 	"encoding/json"
 	"path/filepath"
 	"testing"
 )
 
+func testSessionDB(t *testing.T, s *Store, session string) *sql.DB {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	db, err := s.sessionDB(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
 // countRows counts rows in one table for a session and event name.
 func countRows(t *testing.T, s *Store, table, session, name string) int {
 	t.Helper()
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE session_id=? AND name=?`, session, name).Scan(&n); err != nil {
+	if err := testSessionDB(t, s, session).QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE session_id=? AND name=?`, session, name).Scan(&n); err != nil {
 		t.Fatalf("count %s %s: %v", table, name, err)
 	}
 	return n
@@ -59,7 +71,7 @@ func TestSnapshotEventsKeepOneRowPerSessionAndKind(t *testing.T) {
 
 	// The stored snapshot is the newest one written (i = 4 of 0..4), not a stale copy.
 	var payload string
-	if err := s.db.QueryRow(`SELECT payload FROM event_latest WHERE session_id='s1' AND name='session.updated'`).Scan(&payload); err != nil {
+	if err := testSessionDB(t, s, "s1").QueryRow(`SELECT payload FROM event_latest WHERE session_id='s1' AND name='session.updated'`).Scan(&payload); err != nil {
 		t.Fatal(err)
 	}
 	var m map[string]any
@@ -121,7 +133,7 @@ func TestSnapshotMigrationIsAdditive(t *testing.T) {
 	}
 	// Simulate rows written by an older build: full-state snapshots appended straight into events.
 	for i := 0; i < 3; i++ {
-		if _, err := s.db.Exec(`INSERT INTO events(session_id, name, payload, created_at) VALUES('s1','session.updated','{"old":true}',1)`); err != nil {
+		if _, err := testSessionDB(t, s, "s1").Exec(`INSERT INTO events(session_id, name, payload, created_at) VALUES('s1','session.updated','{"old":true}',1)`); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -136,7 +148,7 @@ func TestSnapshotMigrationIsAdditive(t *testing.T) {
 	}
 	defer s.Close()
 	var version int
-	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
+	if err := testSessionDB(t, s, "s1").QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
 		t.Fatalf("user_version = %d %v, want 2", version, err)
 	}
 	oldCount := func() int {
