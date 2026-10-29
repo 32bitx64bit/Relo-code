@@ -38,6 +38,54 @@ type Config struct {
 	ByDifficulty map[string]string `json:"byDifficulty"`
 	// Mode "advanced" enables ByDifficulty. Empty or "simple" ignores it.
 	Mode string `json:"mode,omitempty"`
+	// Optional backup models, used after the main model fails with quota, rate, or runtime errors.
+	// BackupByDifficulty is read in both modes and overrides the per-tier keys.
+	BackupByDifficulty map[string]string `json:"backupByDifficulty,omitempty"`
+	PrimaryBackupModel string            `json:"primaryBackupModel,omitempty"`
+	Tier1BackupModel   string            `json:"tier1BackupModel,omitempty"`
+	Tier2BackupModel   string            `json:"tier2BackupModel,omitempty"`
+}
+
+// BackupFor returns the provider-qualified backup model ("owner/model") for a difficulty.
+// It returns "" when no backup is set, the difficulty is unknown, or the backup equals main
+// (the model this difficulty would otherwise route to) or preferred (the model in use).
+// BackupByDifficulty is checked first in both modes; then the per-tier key of the tier.
+func (c Config) BackupFor(difficulty, main, preferred string) string {
+	level := NormalizeDifficulty(difficulty)
+	if level == "" {
+		return ""
+	}
+	// Mirrors For: a complex task without its own row uses the hard row.
+	kinds := []string{level}
+	if level == Complex {
+		kinds = append(kinds, Hard)
+	}
+	backup := ""
+	for _, kind := range kinds {
+		if m := strings.TrimSpace(c.BackupByDifficulty[kind]); m != "" {
+			backup = m
+			break
+		}
+	}
+	if backup == "" {
+		switch tierForDifficulty(level) {
+		case 0:
+			backup = strings.TrimSpace(c.Tier2BackupModel)
+		case 1:
+			backup = strings.TrimSpace(c.Tier1BackupModel)
+		case 2:
+			backup = strings.TrimSpace(c.PrimaryBackupModel)
+		}
+	}
+	if backup == "" {
+		return ""
+	}
+	for _, same := range []string{main, preferred} {
+		if s := strings.TrimSpace(same); s != "" && s == backup {
+			return ""
+		}
+	}
+	return backup
 }
 
 // byLevel returns the explicit per-difficulty model, or "" when the mode is not advanced.

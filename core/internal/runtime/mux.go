@@ -50,6 +50,30 @@ func (m *Mux) owner(session SessionID) AgentRuntime {
 	return m.base
 }
 
+// Serves reports whether provider has its own route or is listed by the base runtime. StartSession sends any other
+// provider to the base silently, so a caller that needs a specific provider checks this first.
+func (m *Mux) Serves(ctx context.Context, provider string) bool {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		return false
+	}
+	for _, r := range m.routes {
+		if r.Provider == provider {
+			return true
+		}
+	}
+	ps, err := m.base.Providers(ctx)
+	if err != nil {
+		return false
+	}
+	for _, p := range ps {
+		if p.ID == provider {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Mux) StartSession(ctx context.Context, cfg SessionConfig) (SessionID, error) {
 	rt, prefix := m.base, ""
 	for _, r := range m.routes {

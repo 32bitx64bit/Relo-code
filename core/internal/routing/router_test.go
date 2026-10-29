@@ -161,3 +161,50 @@ func TestSeeingWalksTheLadderToAModelThatSees(t *testing.T) {
 		t.Errorf("EscalateSeeing with nothing seeing = %q, %v, want plain escalation", got, ok)
 	}
 }
+
+func TestBackupFor(t *testing.T) {
+	tests := []struct {
+		name       string
+		config     Config
+		difficulty string
+		main       string
+		preferred  string
+		want       string
+	}{
+		{"unset returns empty", Config{Primary: "p", Tier1: "one", Tier2: "two"}, Hard, "p/one", "p/one", ""},
+		{"unknown difficulty returns empty", Config{Tier1BackupModel: "b1"}, "bogus", "p/one", "p/one", ""},
+		{"empty difficulty returns empty", Config{Tier1BackupModel: "b1"}, "", "p/one", "p/one", ""},
+		{"tier1 key covers hard", Config{Tier1BackupModel: "b1"}, Hard, "p/one", "p/one", "b1"},
+		{"tier2 key covers easy", Config{Tier2BackupModel: "b2"}, Easy, "p/two", "p/two", "b2"},
+		{"primary key covers expert", Config{PrimaryBackupModel: "bp", Tier1BackupModel: "b1"}, Expert, "p/top", "p/top", "bp"},
+		{"tier key ignored for other tier", Config{PrimaryBackupModel: "bp"}, Hard, "p/one", "p/one", ""},
+		{"simple mode reads backupByDifficulty", Config{Tier1BackupModel: "b1", BackupByDifficulty: map[string]string{Hard: "custom"}}, Hard, "p/one", "p/one", "custom"},
+		{"simple mode map without row falls to tier key", Config{Tier1BackupModel: "b1", BackupByDifficulty: map[string]string{Expert: "custom"}}, Hard, "p/one", "p/one", "b1"},
+		{"advanced map overrides tier key", Config{Mode: ModeAdvanced, Tier1BackupModel: "b1", BackupByDifficulty: map[string]string{Hard: "custom"}}, Hard, "p/one", "p/one", "custom"},
+		{"advanced map without row falls to tier key", Config{Mode: ModeAdvanced, Tier1BackupModel: "b1", BackupByDifficulty: map[string]string{Expert: "custom"}}, Hard, "p/one", "p/one", "b1"},
+		{"complex without row uses hard backup", Config{Mode: ModeAdvanced, BackupByDifficulty: map[string]string{Hard: "strong"}}, Complex, "p/one", "p/one", "strong"},
+		{"complex own row wins over hard", Config{BackupByDifficulty: map[string]string{Complex: "mid", Hard: "strong"}}, Complex, "p/one", "p/one", "mid"},
+		{"whitespace is empty", Config{Tier2BackupModel: "   "}, Easy, "p/two", "p/two", ""},
+		{"backup equal to main is empty", Config{Tier1BackupModel: "p/one"}, Hard, "p/one", "p/one", ""},
+		{"backup equal to main with whitespace is empty", Config{Tier1BackupModel: " p/one "}, Hard, "p/one", "", ""},
+		{"backup equal to preferred is empty", Config{Tier1BackupModel: "p/one"}, Hard, "p/picked", "p/one", ""},
+		{"no main still returns backup", Config{Tier1BackupModel: "b1"}, Hard, "", "", "b1"},
+		{"cross-provider backup returned intact", Config{Primary: "opencode/big", Tier1BackupModel: "claude-code/claude-sonnet-4-5"}, Hard, "opencode/big", "opencode/big", "claude-code/claude-sonnet-4-5"},
+		{"backupByDifficulty keeps its owner prefix", Config{BackupByDifficulty: map[string]string{Expert: "codex/gpt-5"}}, Expert, "opencode/big", "opencode/big", "codex/gpt-5"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.config.BackupFor(tt.difficulty, tt.main, tt.preferred); got != tt.want {
+				t.Fatalf("BackupFor(%q, %q, %q) = %q, want %q", tt.difficulty, tt.main, tt.preferred, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBackupForProviderMatchesMuxOwner(t *testing.T) {
+	c := Config{Primary: "opencode/main", PrimaryBackupModel: "claude-code/claude-opus-4"}
+	got := c.BackupFor(Expert, c.For(agent.TierPrimary, agent.Worker, Expert), "")
+	if owner, id := Split(got); owner != "claude-code" || id != "claude-opus-4" {
+		t.Fatalf("Split(BackupFor) = %q, %q; want provider owner claude-code (runtime.Mux routes by owner prefix)", owner, id)
+	}
+}
