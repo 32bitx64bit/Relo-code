@@ -579,14 +579,6 @@
           "type": "number",
           "default": 0.85
         },
-        "relo.context.autoRefresh": {
-          "type": "boolean",
-          "default": true
-        },
-        "relo.context.refreshThreshold": {
-          "type": "number",
-          "default": 0.8
-        },
         "relo.context.keepRawHistory": {
           "type": "boolean",
           "default": true

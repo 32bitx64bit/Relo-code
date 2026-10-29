@@ -709,12 +709,6 @@ func (a *App) applySettings(p map[string]any) {
 			s.CompactAt = n
 		}
 	}
-	if n := num(p, "refreshThreshold", 0); n > 0 {
-		s.Threshold = n
-	}
-	if v, ok := p["autoRefresh"].(bool); ok {
-		s.AutoRefresh = v
-	}
 	if v, ok := p["keepRawHistory"].(bool); ok {
 		s.KeepHistory = v
 	}
