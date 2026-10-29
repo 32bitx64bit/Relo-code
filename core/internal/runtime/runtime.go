@@ -15,17 +15,16 @@ type SessionConfig struct {
 }
 
 type AgentTask struct {
-	AgentID    string
-	Role       string
-	Model      string
-	Provider   string
-	System     string
-	Prompt     string
-	Tools      map[string]bool
-	Effort     string // reasoning effort (variant id); empty = model default
-	Schema     map[string]any
-	Directory  string
-	TimeoutSec int
+	AgentID   string
+	Role      string
+	Model     string
+	Provider  string
+	System    string
+	Prompt    string
+	Tools     map[string]bool
+	Effort    string // reasoning effort (variant id); empty = model default
+	Schema    map[string]any
+	Directory string
 }
 
 // Model is one selectable model. Context/Output are the model's own maximums in tokens (0 = unknown).

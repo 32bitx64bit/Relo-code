@@ -76,6 +76,35 @@ func TestComposePartsWithFragments(t *testing.T) {
 	}
 }
 
+func TestTaskIndependentPrefixAndVolatileRetry(t *testing.T) {
+	roles := []agent.Role{agent.Primary, agent.Head, agent.Probe, agent.Architect, agent.Debug, agent.Worker, agent.Test, agent.Reviewer, agent.Integration}
+	for _, role := range roles {
+		t.Run(string(role), func(t *testing.T) {
+			first := ctxeng.Generation{Items: []ctxeng.Item{
+				{Class: ctxeng.ClassTask, Source: ctxeng.SourceUser, Title: "Task", Content: "first task"},
+				{Class: ctxeng.ClassTask, Source: ctxeng.SourceParent, Title: "Previous attempt failed", Content: "retry reason"},
+			}}
+			second := ctxeng.Generation{Items: []ctxeng.Item{{Class: ctxeng.ClassTask, Source: ctxeng.SourceUser, Title: "Task", Content: "second task"}}}
+			a := ComposePartsWith(role, first, "ask", "voice")
+			b := ComposePartsWith(role, second, "ask", "voice")
+			if a.Static != b.Static || !strings.Contains(a.Stable, "first task") || !strings.Contains(b.Stable, "second task") {
+				t.Fatal("task-specific text changed the role prefix or left the stable block")
+			}
+			contract := "schema contract"
+			prefix := contract + a.Static + "\n\n"
+			if !strings.HasPrefix(a.System(contract), prefix) || !strings.HasPrefix(b.System(contract), prefix) || strings.Index(a.System(contract), contract) != 0 {
+				t.Fatal("schema and role must precede task-specific context")
+			}
+			if strings.Contains(a.Static+a.Stable, "retry reason") || !strings.Contains(a.Dynamic, "## Current user input and failures\n### Latest failure [parent_report]\nretry reason") {
+				t.Fatal("retry note not rendered as volatile with parent provenance")
+			}
+			if first.Items[1].Title != "Previous attempt failed" {
+				t.Fatal("composition mutated generation")
+			}
+		})
+	}
+}
+
 func TestSchemaCapsAndRolePromptSizes(t *testing.T) {
 	for name, schema := range map[string]any{"primary": PrimarySchema, "report": ReportSchema} {
 		if _, err := json.Marshal(schema); err != nil {
@@ -105,9 +134,13 @@ func TestSchemaCapsAndRolePromptSizes(t *testing.T) {
 		}
 	}
 	roles := []agent.Role{agent.Primary, agent.Head, agent.Probe, agent.Architect, agent.Debug, agent.Worker, agent.Test, agent.Reviewer, agent.Integration}
+	before := map[agent.Role]int{agent.Primary: 6067, agent.Head: 1504, agent.Probe: 1862, agent.Architect: 2264, agent.Debug: 2540, agent.Worker: 2764, agent.Test: 1543, agent.Reviewer: 1835, agent.Integration: 2279}
 	for _, role := range roles {
 		prompt := For(role)
-		t.Logf("role=%s chars=%d", role, len(prompt))
+		t.Logf("role=%s bytes before=%d after=%d", role, before[role], len(prompt))
+		if len(prompt) > before[role] {
+			t.Errorf("%s prompt grew: %d > %d bytes", role, len(prompt), before[role])
+		}
 		// For already includes Shared; count what is actually sent rather than charging Shared twice.
 		if total := len(prompt); total > 6200 {
 			t.Errorf("%s prompt too large: %d chars", role, total)

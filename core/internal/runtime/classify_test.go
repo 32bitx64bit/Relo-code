@@ -55,6 +55,7 @@ func TestClassifyTable(t *testing.T) {
 		// Plain text fallback.
 		{"text rate", "Rate limit reached for requests", ClassRateLimit},
 		{"text quota", "out of credits, top up to continue", ClassQuota},
+		{"text 429 quota", "HTTP 429 insufficient quota", ClassQuota},
 		{"text token exhaustion", "tokens exhausted for this month", ClassQuota},
 		{"text context", "maximum context length is 200000 tokens", ClassContext},
 		{"text auth", "authentication failed", ClassAuth},
