@@ -166,8 +166,6 @@ type Settings struct {
 	PathLeases         bool              `json:"pathLeases"`
 	MaxUtil            float64           `json:"maxUtilization"`
 	CompactAt          float64           `json:"compactAt"`
-	AutoRefresh        bool              `json:"autoRefresh"`
-	Threshold          float64           `json:"refreshThreshold"`
 	KeepHistory        bool              `json:"keepRawHistory"`
 	Memory             bool              `json:"projectMemory"`
 	Strategy           string            `json:"compressionStrategy"`
@@ -192,7 +190,7 @@ type Settings struct {
 func DefaultSettings() Settings {
 	return Settings{
 		MaxTotal: 6, MaxTier1: 3, MaxTier2: 4, MaxDepth: 3, MaxRetries: 1,
-		MaxUtil: 0.85, CompactAt: 0.9, AutoRefresh: true, Threshold: 0.8, KeepHistory: true,
+		MaxUtil: 0.85, CompactAt: 0.9, KeepHistory: true,
 		Memory: true, Strategy: "variable", AutoVerify: true, AutoReview: true, Escalate: true, ReportMaxChars: 1200,
 		Budget: 24000,
 	}

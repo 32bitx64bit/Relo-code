@@ -79,7 +79,7 @@ func TestAFourthFamilyLaunchSpawnsWithoutAsking(t *testing.T) {
 		{"prior-1", "Widget stage 2"}, {"prior-2", "Widget stage 2 (retry)"}, {"prior-3", "widget STAGE 2!"},
 	} {
 		capTestFamilyTask(c, prior.id, prior.title)
-		c.Graph.Update(prior.id, func(x *taskgraph.Task) { x.Status, x.Attempts, x.Finished = taskgraph.Done, 1, time.Now().UTC() })
+		c.Graph.Update(prior.id, func(x *taskgraph.Task) { x.Status, x.Attempt, x.Finished = taskgraph.Done, 1, time.Now().UTC() })
 	}
 	capTestFamilyTask(c, "fourth", "Widget stage 2 per plan")
 	started := make(chan int, 1)
@@ -135,7 +135,7 @@ func TestRetryAfterSiblingSuccessStillLaunches(t *testing.T) {
 	c, r := capTestCoord(t)
 	capTestFamilyTask(c, "retry-done", "Widget stage 2")
 	capTestFamilyTask(c, "retry-next", "Widget stage 2 (retry)")
-	c.Graph.Update("retry-next", func(x *taskgraph.Task) { x.Attempts = 3 })
+	c.Graph.Update("retry-next", func(x *taskgraph.Task) { x.Attempt = 3 })
 	c.Graph.Update("retry-done", func(x *taskgraph.Task) { x.Status, x.Finished = taskgraph.Done, time.Now().UTC() })
 	started := make(chan int, 1)
 	go func() { started <- c.dispatch(context.Background(), c.scheduler()) }()

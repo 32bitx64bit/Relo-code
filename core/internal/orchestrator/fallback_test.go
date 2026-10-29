@@ -60,13 +60,13 @@ func TestWorkerFallbackWithinLaunchAndNextTaskUsesMain(t *testing.T) {
 	var events captured
 	c.SetEmitter(events.emit)
 	for _, id := range []string{"first", "second"} {
-		task := c.Graph.Add(taskgraph.Task{ID: id, Title: id, Role: string(agent.Probe), Difficulty: "medium", Model: "main/model", Attempt: 1, Attempts: 1})
+		task := c.Graph.Add(taskgraph.Task{ID: id, Title: id, Role: string(agent.Probe), Difficulty: "medium", Model: "main/model", Attempt: 1})
 		a := c.spawn(task, agent.Probe)
 		if err := c.execWorker(context.Background(), task, a); err != nil {
 			t.Fatal(err)
 		}
 		got, _ := c.Graph.Get(id)
-		if got.Status != taskgraph.Done || got.Attempts != 1 || got.Model != "main/model" {
+		if got.Status != taskgraph.Done || got.Attempt != 1 || got.Model != "main/model" {
 			t.Fatalf("task = %+v", got)
 		}
 		worker, _ := c.Agents.Get(a.ID)
@@ -207,12 +207,12 @@ func TestWorkerFallbackMissingUsesFailTaskAndStallDoesNotSwitch(t *testing.T) {
 		c.SetRuntime(r)
 		c.CreateSession(t.TempDir(), "test", ModePlan)
 		c.Settings.AutoVerify, c.Settings.AutoReview = false, false
-		task := c.Graph.Add(taskgraph.Task{ID: "failed", Title: "failed", Role: string(agent.Probe), Difficulty: "medium", Model: "main/model", Attempt: 1, Attempts: 1, MaxAttempts: 1})
+		task := c.Graph.Add(taskgraph.Task{ID: "failed", Title: "failed", Role: string(agent.Probe), Difficulty: "medium", Model: "main/model", Attempt: 1, MaxAttempts: 1})
 		a := c.spawn(task, agent.Probe)
 		err := c.execWorker(context.Background(), task, a)
 		got, _ := c.Graph.Get(task.ID)
 		worker, _ := c.Agents.Get(a.ID)
-		if err == nil || got.Status != taskgraph.Failed || got.Attempts != 1 || worker.FallbackFrom != "" || len(r.tasks) != 1 {
+		if err == nil || got.Status != taskgraph.Failed || got.Attempt != 1 || worker.FallbackFrom != "" || len(r.tasks) != 1 {
 			t.Fatalf("stall=%v err=%v task=%+v agent=%+v calls=%d", stall, err, got, worker, len(r.tasks))
 		}
 		c.CloseMessages()

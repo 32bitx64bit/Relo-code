@@ -103,15 +103,15 @@ func TestWorkerSeedIncludesDepReportsOnly(t *testing.T) {
 	}
 }
 
-// Architect packs are unchanged: every finding still arrives.
-func TestWorkerSeedArchitectKeepsAllFindings(t *testing.T) {
+// Architect packs hold related findings only; an unrelated one stays out.
+func TestWorkerSeedArchitectKeepsOnlyRelatedFindings(t *testing.T) {
 	c := New(logging.New(nil, logging.Error))
 	task := c.Graph.Add(taskgraph.Task{ID: "task-main", Title: "Fix parser", Description: "Rework pkg/parse.go."})
 	c.Engine.PromoteFinding(ctxeng.Finding{ID: "f-other", TaskID: "task-other", Summary: "other task finding", Files: []string{"net/http/handler.go"}})
 
 	items := seedTitles(c.workerSeed(task, agent.Architect))
-	if _, ok := items["other task finding"]; !ok {
-		t.Fatal("architect pack lost findings outside dep scope")
+	if _, ok := items["other task finding"]; ok {
+		t.Fatal("architect pack holds a finding unrelated to its task")
 	}
 }
 

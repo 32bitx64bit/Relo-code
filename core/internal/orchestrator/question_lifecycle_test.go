@@ -74,7 +74,7 @@ func TestLegacyRunLimitQuestionRequeuesWhenAnswered(t *testing.T) {
 	c, r := capTestCoord(t)
 	task := capTestFamilyTask(c, "legacy-run-limit", "Widget stage 2")
 	c.Graph.Update(task.ID, func(x *taskgraph.Task) {
-		x.Status, x.Attempts, x.Finished = taskgraph.Asking, 3, time.Now().UTC()
+		x.Status, x.Attempt, x.Finished = taskgraph.Asking, 3, time.Now().UTC()
 		x.BlockedOn = &taskgraph.BlockedOn{
 			Question: "This work has already run 3 times (limit 3). Answer whether to allow more runs, or change the plan.",
 			Options:  []taskgraph.Option{{Label: "Allow one more run"}, {Label: "Change the plan", Recommended: true}},

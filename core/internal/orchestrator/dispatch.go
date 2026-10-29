@@ -34,6 +34,11 @@ type waiting struct {
 	why   string // what the status line says, so it is written once and not on every look
 }
 
+type retryCarryError struct{ err error }
+
+func (e *retryCarryError) Error() string { return e.err.Error() }
+func (e *retryCarryError) Unwrap() error { return e.err }
+
 // dispatcher runs the tasks of one round. Only the dispatch goroutine touches queued and started; running and errs
 // are shared with the workers.
 type dispatcher struct {
@@ -45,6 +50,7 @@ type dispatcher struct {
 
 	queued  map[string]waiting // task ID -> the agent that waits for it to fit
 	started int
+	delayed bool // runnable retry is waiting for its not-before time
 
 	mu      sync.Mutex
 	running map[string]bool // task ID -> a worker goroutine for it is still alive
@@ -64,6 +70,15 @@ func (c *Coord) dispatch(ctx context.Context, sched *scheduler.Scheduler) int {
 		if d.alive() == 0 {
 			if held {
 				continue // the worker that held a task has gone since; it can start now
+			}
+			if d.delayed {
+				select {
+				case <-tick.C:
+				case <-d.c.wake:
+					d.c.stepQueued(ctx)
+				case <-ctx.Done():
+				}
+				continue
 			}
 			// Nothing is running, so nothing will free a slot or finish a dependency: what is left cannot start now.
 			break
@@ -200,6 +215,7 @@ func (d *dispatcher) wakePeers() {
 // passed over a task because the worker of its last attempt had not finished yet.
 func (d *dispatcher) admit() (held bool) {
 	c := d.c
+	d.delayed = false
 	tasks := d.sched.Next(c.Graph, 0)
 	if d.sched.Paused() {
 		return false // Next has nothing to say while paused, which must not read as "no task wants to run"
@@ -218,6 +234,10 @@ func (d *dispatcher) admit() (held bool) {
 	for _, task := range tasks {
 		if d.ctx.Err() != nil || d.sched.Paused() {
 			return held
+		}
+		if time.Now().Before(task.NotBefore) {
+			d.delayed = true
+			continue
 		}
 		// A task that failed and was queued for another attempt is still held by the worker that failed it, which is
 		// closing its session. The new attempt starts after that worker has gone, as it did between rounds.
@@ -263,7 +283,6 @@ func (d *dispatcher) admit() (held bool) {
 			x.AgentID = a.ID
 			x.Started = time.Now().UTC()
 			x.Attempt++
-			x.Attempts++
 		})
 		if err != nil {
 			release()
@@ -274,14 +293,39 @@ func (d *dispatcher) admit() (held bool) {
 		}
 		c.Agents.Update(a.ID, func(x *agent.Agent) { x.Status = agent.Starting; x.Phase = "context"; x.Activity = "Starting" })
 		c.Agents.Update(a.ID, func(x *agent.Agent) { x.Attempt = updated.Attempt })
+		a.Attempt = updated.Attempt
 		if queued {
 			// The holder may have finished while this task waited, so record its work before the re-cut restacks.
 			c.leaseLineage(a, d.sched.PriorHolders(task.Paths))
 			c.recutQueued(updated, a)
 		}
-		c.mu.Lock()
-		delete(c.escalations, task.ID)
-		c.mu.Unlock()
+		if updated.RetryPatch != "" {
+			ws := c.workspace()
+			applied, err := false, fmt.Errorf("workspace unavailable")
+			if ws != nil {
+				applied, err = ws.ApplyRetry(a.ID, updated.RetryPatch)
+			}
+			if err != nil {
+				release()
+				lease()
+				c.announceEscalation(updated)
+				c.fail(a.ID, err)
+				c.failTask(updated, a, &retryCarryError{err: err})
+				continue
+			}
+			state := "The earlier diff was applied; continue from those changes."
+			if !applied {
+				state = "The earlier diff conflicted with the new base; starting fresh."
+			}
+			updated, err = c.Graph.Update(task.ID, func(x *taskgraph.Task) { x.RetryPatch, x.RetryState = "", state })
+			if err != nil {
+				release()
+				lease()
+				c.logWarn("record retry diff", err)
+				continue
+			}
+		}
+		c.announceEscalation(updated)
 		c.emit("task.updated", updated)
 		d.launch(updated, a)
 	}
@@ -449,6 +493,7 @@ func (d *dispatcher) launch(t taskgraph.Task, a agent.Agent) {
 			c.fail(a.ID, err)
 			c.failTask(t, a, err)
 		}
+		c.clearSucceededRetry(t.ID, a.ID)
 		c.Agents.Update(a.ID, func(x *agent.Agent) {
 			if err != nil && ctx.Err() != nil {
 				x.Status, x.Activity = agent.Cancelled, "Stopped"

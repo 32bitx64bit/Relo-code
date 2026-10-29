@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/relocode/relo/internal/agent"
+	ctxeng "github.com/relocode/relo/internal/context"
 	"github.com/relocode/relo/internal/logging"
 	"github.com/relocode/relo/internal/taskgraph"
 )
@@ -249,7 +250,7 @@ func TestTheFamilyLaunchesWithoutARunLimit(t *testing.T) {
 				c.Graph.Add(taskgraph.Task{
 					ID: fmt.Sprintf("task-run-%d", i), Title: "SPT stage 2 per spt-impl-plan contract",
 					Role: string(agent.Worker), Paths: []string{"pax_game_ai.c"}, Scope: "ai",
-					Status: taskgraph.Failed, Attempts: n,
+					Status: taskgraph.Failed, Attempt: n,
 				})
 			}
 			next := c.Graph.Add(taskgraph.Task{
@@ -355,5 +356,72 @@ func TestTurnConstraintsAreTrimmedDedupedAndCapped(t *testing.T) {
 	}
 	if n := len([]rune(got[1])); n != 200 {
 		t.Fatalf("long constraint kept at %d runes, want 200", n)
+	}
+}
+
+// A probe reads only what its dependencies concluded; a report from an unrelated task stays out.
+func TestProbeBriefTakesOnlyItsDependencyReports(t *testing.T) {
+	c := New(logging.New(nil, logging.Error))
+	dep := c.Graph.Add(taskgraph.Task{ID: "task-dep", Title: "dep"})
+	probe := c.Graph.Add(taskgraph.Task{ID: "task-probe", Title: "probe", Depends: []string{dep.ID}})
+	depAgent := c.Agents.Create(agent.Agent{Role: agent.Worker, Title: "dep work", TaskID: dep.ID})
+	otherAgent := c.Agents.Create(agent.Agent{Role: agent.Worker, Title: "other work", TaskID: "task-other"})
+	c.Agents.SetReport(depAgent.ID, agent.Report{Status: agent.Completed, Summary: "dep summary", Files: []string{"pkg/dep.go"}})
+	c.Agents.SetReport(otherAgent.ID, agent.Report{Status: agent.Completed, Summary: "other summary", Files: []string{"pkg/other.go"}})
+
+	items := seedTitles(c.workerSeed(probe, agent.Probe))
+	if rep, ok := items["dep work"]; !ok || rep.TaskID != dep.ID {
+		t.Fatalf("probe lost its dependency report: %+v", rep)
+	}
+	if _, ok := items["other work"]; ok {
+		t.Fatal("probe brief carries a report from a non-dependency task")
+	}
+}
+
+// An architect pack holds the findings related to its task, at most architectFindingCap, the dep's first.
+func TestArchitectBriefHoldsRelatedFindingsCappedAt40(t *testing.T) {
+	c := New(logging.New(nil, logging.Error))
+	dep := c.Graph.Add(taskgraph.Task{ID: "task-dep", Title: "dep"})
+	task := c.Graph.Add(taskgraph.Task{ID: "task-main", Title: "Rework parser", Description: "Change pkg/parse.go.", Depends: []string{dep.ID}})
+	c.Engine.PromoteFinding(ctxeng.Finding{ID: "f-dep", TaskID: dep.ID, Summary: "dep finding", Confidence: 0.1})
+	for i := 0; i < architectFindingCap+5; i++ {
+		c.Engine.PromoteFinding(ctxeng.Finding{ID: fmt.Sprintf("f-rel-%02d", i), TaskID: "task-x", Summary: fmt.Sprintf("related %02d", i), Files: []string{"pkg/parse.go"}, Confidence: 0.5})
+	}
+	for i := 0; i < 5; i++ {
+		c.Engine.PromoteFinding(ctxeng.Finding{ID: fmt.Sprintf("f-off-%d", i), TaskID: "task-y", Summary: fmt.Sprintf("unrelated %d", i), Files: []string{"net/http/h.go"}, Verified: true, Confidence: 0.9})
+	}
+
+	var findings []string
+	for _, it := range c.workerSeed(task, agent.Architect) {
+		if it.Class == ctxeng.ClassFinding {
+			findings = append(findings, it.Title)
+		}
+	}
+	if len(findings) != architectFindingCap {
+		t.Fatalf("architect findings = %d, want %d", len(findings), architectFindingCap)
+	}
+	if findings[0] != "dep finding" {
+		t.Errorf("dependency finding not ranked first: %v", findings[:2])
+	}
+	for _, title := range findings {
+		if strings.HasPrefix(title, "unrelated") {
+			t.Fatalf("architect pack holds an unrelated finding: %q", title)
+		}
+	}
+}
+
+// A task with no dependencies gets no dependency reports, even when other tasks have finished reports.
+func TestNoDepTaskGetsNoDependencyReports(t *testing.T) {
+	c := New(logging.New(nil, logging.Error))
+	task := c.Graph.Add(taskgraph.Task{ID: "task-solo", Title: "solo"})
+	other := c.Agents.Create(agent.Agent{Role: agent.Worker, Title: "other work", TaskID: "task-other"})
+	c.Agents.SetReport(other.ID, agent.Report{Status: agent.Completed, Summary: "other summary"})
+
+	for _, role := range []agent.Role{agent.Worker, agent.Probe} {
+		for _, it := range c.workerSeed(task, role) {
+			if it.Class == ctxeng.ClassReport {
+				t.Fatalf("%s with no deps got a report: %+v", role, it)
+			}
+		}
 	}
 }

@@ -817,14 +817,18 @@ func (c *Coord) workerSeed(t taskgraph.Task, role agent.Role) []ctxeng.Item {
 	items = append(items, c.failureNote(t)...)
 	scoped := scopedPackRole(role)
 	var deps, scopeFiles map[string]bool
-	if scoped {
+	if scoped || role == agent.Architect {
 		deps = depIDSet(c.depTaskIDs(t))
 		scopeFiles = taskScopeFiles(t)
 	}
-	for _, f := range c.Engine.Findings() {
-		if scoped && !findingInPack(f, deps, scopeFiles) {
-			continue
-		}
+	findings := c.Engine.Findings()
+	switch {
+	case role == agent.Architect:
+		findings = packFindings(findings, deps, scopeFiles, architectFindingCap)
+	case scoped:
+		findings = packFindings(findings, deps, scopeFiles, 0)
+	}
+	for _, f := range findings {
 		items = append(items, ctxeng.Item{
 			Class: ctxeng.ClassFinding, Source: ctxeng.SourceVerified, Title: f.Summary, Content: f.Summary + "\n" + f.RootCause,
 			Files: f.Files, Verified: f.Verified, Confidence: f.Confidence, Durability: 0.9, Kind: f.Kind, TaskID: f.TaskID,
@@ -841,10 +845,13 @@ func (c *Coord) workerSeed(t taskgraph.Task, role agent.Role) []ctxeng.Item {
 	return items
 }
 
+// architectFindingCap bounds the findings an architect pack carries, most relevant first.
+const architectFindingCap = 40
+
 // scopedPackRole reports whether role's pack is limited to the findings and reports its task needs.
 func scopedPackRole(role agent.Role) bool {
 	switch role {
-	case agent.Worker, agent.Debug, agent.Integration:
+	case agent.Worker, agent.Debug, agent.Integration, agent.Probe:
 		return true
 	}
 	return false
@@ -925,6 +932,36 @@ func findingInPack(f ctxeng.Finding, deps, scopeFiles map[string]bool) bool {
 		}
 	}
 	return false
+}
+
+// packFindings keeps the findings related to the task, most relevant first, and at most limit of them (0 = no cap).
+// Relevance: from a dep task, then verified, then confidence. The engine holds findings in a map, so the order is
+// sorted here, with ID as the final tiebreak, to keep the pack the same on every build.
+func packFindings(fs []ctxeng.Finding, deps, scopeFiles map[string]bool, limit int) []ctxeng.Finding {
+	var kept []ctxeng.Finding
+	for _, f := range fs {
+		if findingInPack(f, deps, scopeFiles) {
+			kept = append(kept, f)
+		}
+	}
+	sort.Slice(kept, func(i, j int) bool {
+		a, b := kept[i], kept[j]
+		da, db := deps[a.TaskID], deps[b.TaskID]
+		if da != db {
+			return da
+		}
+		if a.Verified != b.Verified {
+			return a.Verified
+		}
+		if a.Confidence != b.Confidence {
+			return a.Confidence > b.Confidence
+		}
+		return a.ID < b.ID
+	})
+	if limit > 0 && len(kept) > limit {
+		kept = kept[:limit]
+	}
+	return kept
 }
 
 // depReports returns one report item per dep task that has a finished report, so a worker builds on what its
@@ -1413,6 +1450,10 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 	a = c.freshAgent(a)
 	generation := c.Engine.CurrentNumber(a.ID)
 	body, err := c.runAgentWith(ctx, a, parts, ask, schema, false)
+	if errors.Is(err, errLoopDetected) && strings.TrimSpace(body) != "" {
+		// The partial body is the agent's report so far. A new attempt would repeat the same loop from scratch.
+		return body, nil
+	}
 	if err == nil || ctx.Err() != nil || a.Role == agent.Primary || a.FallbackFrom != "" {
 		return body, err
 	}
@@ -1521,7 +1562,7 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 			x.Generation = gen
 		})
 	}
-	system := parts.Static + schemaContract(schema)
+	system := parts.System(schemaContract(schema))
 	dynamic := parts.Dynamic
 	if previousDynamic != "" {
 		if strings.HasPrefix(dynamic, previousDynamic) {
@@ -1530,10 +1571,7 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 			c.logWarn("cache: dynamic prefix changed within generation", fmt.Errorf("agent %s generation %d", a.ID, gen))
 		}
 	}
-	if dynamic != "" && ask != "" {
-		dynamic += "\n\n"
-	}
-	promptText := dynamic + ask
+	promptText := ""
 	canvasTools, imageTools, spriteTools, artTools := false, false, false, false
 	// The canvas tool is scoped to the role: the policy names the actions this agent may use, and the core refuses
 	// any action outside it (core/internal/orchestrator/canvas.go), so the turn never offers more than it may use.
@@ -1572,6 +1610,15 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 			promptText += "\n\n" + prompt.CanvasGuidanceForMode(a.Role, sess.Mode == ModeBuild) + canvasScopeText(a.Role, canvasActions) + " Your Canvas key is the same private key: pass it as key to relo_canvas. Never copy it into artifacts or reports."
 		}
 	}
+	promptText = strings.TrimPrefix(promptText, "\n\n")
+	if promptText != "" && (dynamic != "" || ask != "") {
+		promptText += "\n\n"
+	}
+	promptText += dynamic
+	if dynamic != "" && ask != "" {
+		promptText += "\n\n"
+	}
+	promptText += ask
 	peerText, peerIDs := "", []string(nil)
 	if !peerWake {
 		peerText, peerIDs = c.peerTurnText(a.ID)
@@ -1614,6 +1661,7 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 	defer tick.Stop()
 	usageRecorded := false
 	recoveries := 0
+	var loops loopDetector
 	for {
 		select {
 		case <-ctx.Done():
@@ -1647,10 +1695,32 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 			st.last = time.Now()
 			c.showProgress(a, st)
 			st.noteTool(ev)
+			switch loops.observe(ev) {
+			case 1:
+				if !st.interrupting {
+					interruptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					err := rt.Cancel(interruptCtx, sid)
+					cancel()
+					if err != nil {
+						c.abortAgentSession(a.ID, rt, sid)
+						c.discardStream(a, st)
+						return body.String(), fmt.Errorf("loop steering interrupt: %w", err)
+					}
+				}
+				st.interrupting, st.nudge = true, loopNudge
+				c.chat("system", "An agent repeated identical tool calls. It was interrupted and told to change approach.", a.ID)
+			case 2:
+				c.abortAgentSession(a.ID, rt, sid)
+				c.discardStream(a, st)
+				c.chat("system", "An agent kept repeating identical tool calls and was stopped.", a.ID)
+				return body.String(), errLoopDetected
+			}
 			if ev.Interrupted && st.interrupting {
 				// The runtime has stopped the stuck call. The session is intact: tell the agent what happened.
 				st.resume()
-				body.Reset()
+				if st.nudge != loopNudge {
+					body.Reset()
+				}
 				c.Agents.Update(a.ID, func(x *agent.Agent) {
 					if !agent.Terminal(x.Status) {
 						x.Phase, x.Activity = st.phase, st.label
@@ -1788,24 +1858,19 @@ func (c *Coord) recordUsage(a agent.Agent, generation int, usage runtime.Usage, 
 		held = usage.PromptTokens()
 	}
 	window := c.settings().Window(a.Model)
-	c.Agents.Update(a.ID, func(x *agent.Agent) {
+	updated, ok := c.Agents.Update(a.ID, func(x *agent.Agent) {
 		x.InputTokens += u.Input
 		x.OutputTokens += u.Output
 		x.CacheRead += u.CacheRead
 		x.CacheWrite += u.CacheWrite
-		x.UsedTokens = max(0, x.UsedTokens-streamed) + u.Input + u.Output + u.Reasoning
+		x.UsedTokens = max(0, x.UsedTokens-streamed) + u.UsedTokens()
 		x.ContextTokens = held
 		x.Window = window
 	})
-	snapshot := cache.Snapshot()
-	agents := make([]map[string]any, 0, len(snapshot.Agents))
-	for _, row := range snapshot.Agents {
-		agents = append(agents, map[string]any{"agentId": row.AgentID, "generation": row.Generation, "model": row.Model, "role": row.Role, "profile": row.Profile, "input": row.Usage.Input, "output": row.Usage.Output, "cacheRead": row.Usage.CacheRead, "cacheWrite": row.Usage.CacheWrite, "hitRate": row.HitRate})
+	if ok {
+		c.emit("usage.updated", map[string]any{"agentId": a.ID, "usedTokens": updated.UsedTokens, "input": updated.InputTokens, "output": updated.OutputTokens, "cacheRead": updated.CacheRead, "cacheWrite": updated.CacheWrite})
 	}
-	usageMap := func(row metrics.CacheRow) map[string]any {
-		return map[string]any{"hitRate": row.HitRate, "input": row.Usage.Input, "output": row.Usage.Output, "cacheRead": row.Usage.CacheRead, "cacheWrite": row.Usage.CacheWrite}
-	}
-	c.emit("cache.updated", map[string]any{"session": usageMap(snapshot.Session), "agents": agents})
+	c.emit("cache.updated", cache.Snapshot().Payload())
 }
 
 // runState is what handleEvent remembers about one model turn.
@@ -2121,12 +2186,14 @@ func (c *Coord) sampleUsage(a agent.Agent, body *strings.Builder, st *runState) 
 	// Added on top of what earlier calls cost, so the running total never drops back to the reply size.
 	delta := n - st.live
 	st.live = n
+	var cacheRead, cacheWrite int
 	c.Agents.Update(a.ID, func(x *agent.Agent) {
 		if !agent.Terminal(x.Status) {
 			x.UsedTokens = max(0, x.UsedTokens+delta)
 		}
+		cacheRead, cacheWrite = x.CacheRead, x.CacheWrite
 	})
-	c.emit("usage.updated", map[string]any{"agentId": a.ID, "tokens": n})
+	c.emit("usage.updated", map[string]any{"agentId": a.ID, "tokens": n, "cacheRead": cacheRead, "cacheWrite": cacheWrite})
 }
 
 func (c *Coord) askPerm(ctx context.Context, a agent.Agent, ev runtime.Event) {

@@ -91,12 +91,12 @@ func TestPauseResumeRestartsDrive(t *testing.T) {
 
 func TestNextAttemptBoundAndReviewOnce(t *testing.T) {
 	c := New(logging.New(nil, logging.Error))
-	c.Sched = scheduler.New(scheduler.Limits{MaxRetry: 4})
+	c.Sched = scheduler.New(scheduler.Limits{MaxRetry: 1})
 	c.Configure(DefaultSettings(), c.Sched, routing.Config{Tier2: "mock/t2", Tier1: "mock/t1", Primary: "mock/p"})
 	c.CreateSession(t.TempDir(), "review", ModeBuild)
 	p := c.Agents.Create(agent.Agent{Role: agent.Primary})
 	a := c.Agents.Create(agent.Agent{Role: agent.Worker, ParentID: p.ID})
-	task := c.Graph.Add(taskgraph.Task{ID: "bounded", Title: "change", Role: string(agent.Worker), Attempt: 1})
+	task := c.Graph.Add(taskgraph.Task{ID: "bounded", Title: "change", Role: string(agent.Worker), Attempt: 1, MaxAttempts: 4})
 	for _, tt := range []struct {
 		attempt int
 		model   string
@@ -305,7 +305,7 @@ func TestUsageLedgerAndCacheUpdatedShape(t *testing.T) {
 		t.Fatalf("session usage = %#v", usage)
 	}
 	gotSession, ok := payload["session"].(map[string]any)
-	if !ok || len(gotSession) != 5 || gotSession["input"] != 10 || gotSession["cacheRead"] != 8 {
+	if !ok || len(gotSession) != 6 || gotSession["input"] != 10 || gotSession["reasoning"] != 2 || gotSession["cacheRead"] != 8 {
 		t.Fatalf("session cache payload = %#v", payload)
 	}
 	rows, ok := payload["agents"].([]map[string]any)
@@ -521,7 +521,7 @@ func TestVerificationFailureFailsAndBoundsRetry(t *testing.T) {
 		t.Fatalf("failing checks started another attempt: %+v", again)
 	}
 	c.Graph.Update(task.ID, func(x *taskgraph.Task) { x.Attempt = 2; x.Status = taskgraph.Failed })
-	c.retryTask(taskgraph.Task{ID: task.ID, Attempt: 2}, a)
+	c.retryTask(taskgraph.Task{ID: task.ID, Attempt: 2, MaxAttempts: 1}, a)
 	got, _ = c.Graph.Get(task.ID)
 	if got.Status != taskgraph.Failed {
 		t.Fatalf("retry exceeded cap: %+v", got)

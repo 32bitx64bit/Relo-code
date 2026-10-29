@@ -22,8 +22,6 @@ func TestAcceptanceScenario(t *testing.T) {
 	c.Settings.Tier1Model = "mock/relo-tier1"
 	c.Settings.Tier2Model = "mock/relo-tier2"
 	c.Settings.Budget = 8000
-	c.Settings.Threshold = 0.2
-	c.Settings.AutoRefresh = true
 	events := []string{}
 	var eventsMu sync.Mutex
 	c.SetEmitter(func(name string, payload any) { eventsMu.Lock(); events = append(events, name); eventsMu.Unlock() })

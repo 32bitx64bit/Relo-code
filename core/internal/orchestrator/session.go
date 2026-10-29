@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"sort"
 	"strings"
@@ -1485,7 +1486,7 @@ func (c *Coord) nextAttempt(t taskgraph.Task, a agent.Agent) (string, bool) {
 			model = next
 		}
 	}
-	return model, t.Attempt <= c.scheduler().Limits.MaxRetry
+	return model, t.CanRetry()
 }
 
 // rememberFailure keeps why an attempt failed so the attempt that replaces it does not start blind. Attempts are new
@@ -1499,30 +1500,96 @@ func (c *Coord) rememberFailure(taskID, why string) {
 	c.mu.Unlock()
 }
 
+// clearSucceededRetry retires retry context only for the attempt that actually completed.
+func (c *Coord) clearSucceededRetry(taskID, agentID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cleared := false
+	_, err := c.Graph.Update(taskID, func(t *taskgraph.Task) {
+		if t.Status == taskgraph.Done && t.AgentID == agentID {
+			t.RetryPatch, t.RetryState = "", ""
+			cleared = true
+		}
+	})
+	if err == nil && cleared {
+		delete(c.failures, taskID)
+	}
+}
+
 // failureNote is the item that tells a retried agent what went wrong last time, or nothing on a first attempt.
 func (c *Coord) failureNote(t taskgraph.Task) []ctxeng.Item {
 	c.mu.Lock()
 	why := c.failures[t.ID]
 	c.mu.Unlock()
-	if why == "" {
+	if why == "" && t.RetryState == "" {
 		return nil
+	}
+	if why == "" {
+		why = "it did not finish"
+	}
+	state := t.RetryState
+	if state == "" {
+		state = "The earlier changes were not carried over."
+	}
+	prefix, suffix := "An earlier attempt at this task failed because ", ". "+state+" Take a different approach to what went wrong."
+	reason := []rune(why)
+	if maxReason := 1500 - len([]rune(prefix+suffix)); len(reason) > maxReason {
+		reason = reason[:max(0, maxReason)]
 	}
 	return []ctxeng.Item{{
 		Class: ctxeng.ClassTask, Source: ctxeng.SourceParent, Title: "Previous attempt failed", Durability: 1,
-		Content: "An earlier attempt at this task failed because " + why + ". Its changes were not kept. Take a different approach to whatever went wrong.",
+		Content: prefix + string(reason) + suffix,
 	}}
 }
 
 func (c *Coord) retryTask(t taskgraph.Task, a agent.Agent) {
+	c.retryTaskAfter(t, a, nil)
+}
+
+// retryDelay uses the dispatched attempt count, adding jitter without exceeding one minute.
+func retryDelay(attempt int, jitter float64) time.Duration {
+	base := 5 * time.Second
+	if attempt == 2 {
+		base = 20 * time.Second
+	} else if attempt >= 3 {
+		return 54*time.Second + time.Duration(float64(6*time.Second)*jitter)
+	}
+	delay := base + time.Duration(float64(base)*0.2*jitter)
+	return delay
+}
+
+func (c *Coord) retryTaskAfter(t taskgraph.Task, a agent.Agent, cause error) {
 	model, retry := c.nextAttempt(t, a)
 	if !retry {
 		c.chat("system", fmt.Sprintf("%q failed after %s and was not retried again. Ask Relo to try a different approach.%s", t.Title, plural(t.Attempt, "attempt"), c.keptNote(t, a)), "")
 		return
 	}
 	from := a.Model
+	patch, state := "", "The earlier changes were not carried over."
+	if ws := c.workspace(); ws != nil {
+		if tree, ok := ws.Tree(a.ID); ok && tree.Direct {
+			state = "Earlier edits remain in the shared workspace."
+		} else if ok && tree.Path != "" {
+			var err error
+			patch, err = ws.Patch(a.ID)
+			if err != nil {
+				state = "The earlier diff could not be captured; starting fresh."
+				c.logWarn("capture retry diff", err)
+			} else if patch != "" {
+				state = "The earlier diff is waiting to be applied."
+			} else {
+				state = "The earlier attempt left no changes."
+			}
+		}
+	}
+	var notBefore time.Time
+	if class := runtime.Classify(cause); class == runtime.ClassRateLimit || class == runtime.ClassServer {
+		notBefore = time.Now().UTC().Add(retryDelay(t.Attempt, rand.Float64()))
+	}
 	updated, err := c.Graph.Update(t.ID, func(x *taskgraph.Task) {
 		x.Status, x.AgentID, x.Model = taskgraph.Queued, "", model
 		x.Started, x.Finished = time.Time{}, time.Time{}
+		x.RetryPatch, x.RetryState, x.NotBefore = patch, state, notBefore
 	})
 	if err != nil {
 		c.logWarn("retry failed task", err)
@@ -1535,9 +1602,20 @@ func (c *Coord) retryTask(t taskgraph.Task, a agent.Agent) {
 		}
 		c.escalations[t.ID] = from
 		c.mu.Unlock()
-		c.emit("agent.escalated", map[string]any{"taskId": t.ID, "from": from, "to": model, "attempt": t.Attempt + 1, "reason": "repeated attempt failed; escalating model"})
 	}
 	c.emit("task.updated", updated)
+}
+
+// announceEscalation reports a model change once its attempt has started, so the attempt number is the one dispatch
+// recorded rather than a prediction made when the retry was queued.
+func (c *Coord) announceEscalation(started taskgraph.Task) {
+	c.mu.Lock()
+	from, ok := c.escalations[started.ID]
+	delete(c.escalations, started.ID)
+	c.mu.Unlock()
+	if ok {
+		c.emit("agent.escalated", map[string]any{"taskId": started.ID, "from": from, "to": started.Model, "attempt": started.Attempt, "reason": "repeated attempt failed; escalating model"})
+	}
 }
 
 // Automatic review is for work big or hard enough that a second reader pays for itself. On a small diff the
@@ -1605,6 +1683,11 @@ func (c *Coord) failTask(t taskgraph.Task, a agent.Agent, cause error) {
 		c.chat("system", fmt.Sprintf("%q failed and will not be retried: %s.%s", t.Title, strings.TrimRight(cause.Error(), "."), c.keptNote(t, a)), "")
 		return
 	}
+	var carry *retryCarryError
+	if errors.As(cause, &carry) {
+		c.chat("system", fmt.Sprintf("%q failed while restoring prior work: %s. The prior attempt's worktree remains available.", t.Title, cause), "")
+		return
+	}
 	if cause != nil && !retryable(cause) {
 		c.chat("system", fmt.Sprintf("%q failed and will not be retried: %s.%s", t.Title, strings.TrimRight(cause.Error(), "."), c.keptNote(t, a)), "")
 		return
@@ -1620,7 +1703,7 @@ func (c *Coord) failTask(t taskgraph.Task, a agent.Agent, cause error) {
 			return
 		}
 	}
-	c.retryTask(updated, a)
+	c.retryTaskAfter(updated, a, cause)
 }
 
 // endReport gives an agent that ended without writing a report a final message of its own. A stopped or failed run
@@ -1669,6 +1752,10 @@ func (c *Coord) keptNote(t taskgraph.Task, a agent.Agent) string {
 // retryable reports whether trying the same task again could change the outcome. A rejected key, an exhausted quota
 // or an unknown model fail identically every time; retrying only spends more.
 func retryable(err error) bool {
+	class := runtime.Classify(err)
+	if class == runtime.ClassRateLimit || class == runtime.ClassServer {
+		return true
+	}
 	e := strings.ToLower(err.Error())
 	for _, marker := range []string{"401", "403", "unauthorized", "forbidden", "invalid api key", "invalid x-api-key", "incorrect api key", "authentication", "insufficient", "quota", "billing", "credit balance", "model not found", "unknown model", "does not exist", "not available", "no models"} {
 		if strings.Contains(e, marker) {
