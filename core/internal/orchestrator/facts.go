@@ -8,8 +8,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-
-	"github.com/relocode/relo/internal/taskgraph"
 )
 
 // refreshSnapshot re-reads the user's working tree so that agents started from now on are cut from what the user
@@ -239,12 +237,7 @@ func orUnknown(s string) string {
 
 // settled reports whether every task has finished, one way or another.
 func (c *Coord) settled() bool {
-	for _, t := range c.Graph.List() {
-		if t.Status == taskgraph.Queued || t.Status == taskgraph.Running || t.Status == taskgraph.Blocked {
-			return false
-		}
-	}
-	return true
+	return c.Graph.Settled()
 }
 
 // staleMemory prefixes what memory recalls. It is what a worker reported in an earlier session, true then; the

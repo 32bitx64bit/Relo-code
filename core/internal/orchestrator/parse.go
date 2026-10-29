@@ -54,8 +54,10 @@ type Turn struct {
 }
 
 type ResolvedBlock struct {
-	TaskID string `json:"taskId"`
-	Answer string `json:"answer"`
+	TaskID     string                 `json:"taskId"`
+	Answer     string                 `json:"answer"`
+	AnsweredBy taskgraph.AnswerSource `json:"answeredBy,omitempty"`
+	Cite       string                 `json:"cite,omitempty"`
 }
 
 type TurnTask struct {
@@ -74,19 +76,20 @@ type TurnTask struct {
 }
 
 type RawReport struct {
-	Status          string       `json:"status"`
-	Summary         string       `json:"summary"`
-	Findings        []string     `json:"findings"`
-	Files           []string     `json:"filesChanged"`
-	Verify          []RawVerify  `json:"verification"`
-	Risks           []string     `json:"remainingRisks"`
-	Next            []string     `json:"recommendedNextActions"`
-	Cause           string       `json:"rootCause"`
-	Handoff         string       `json:"handoff"`
-	Question        string       `json:"question"`
-	Structured      []RawFinding `json:"structuredFindings"`
-	ValidationError string       `json:"-"`
-	unstructured    bool         // a prose reply, not a valid report object; never a valid negative verdict
+	Status          string             `json:"status"`
+	Summary         string             `json:"summary"`
+	Findings        []string           `json:"findings"`
+	Files           []string           `json:"filesChanged"`
+	Verify          []RawVerify        `json:"verification"`
+	Risks           []string           `json:"remainingRisks"`
+	Next            []string           `json:"recommendedNextActions"`
+	Cause           string             `json:"rootCause"`
+	Handoff         string             `json:"handoff"`
+	Question        string             `json:"question"`
+	Options         []taskgraph.Option `json:"options,omitempty"`
+	Structured      []RawFinding       `json:"structuredFindings"`
+	ValidationError string             `json:"-"`
+	unstructured    bool               // a prose reply, not a valid report object; never a valid negative verdict
 }
 
 type RawVerify struct {
@@ -118,6 +121,12 @@ func (r *RawReport) UnmarshalJSON(data []byte) error {
 		Handoff: looseText(fields["handoff"]), Question: looseText(fields["question"]),
 		Findings: looseList(fields["findings"]), Files: looseList(fields["filesChanged"]),
 		Risks: looseList(fields["remainingRisks"]), Next: looseList(fields["recommendedNextActions"]),
+	}
+	for _, raw := range looseItems(fields["options"]) {
+		var option taskgraph.Option
+		if json.Unmarshal(raw, &option) == nil {
+			r.Options = append(r.Options, option)
+		}
 	}
 	for _, raw := range looseItems(fields["verification"]) {
 		var v RawVerify

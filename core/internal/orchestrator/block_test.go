@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -12,7 +11,7 @@ import (
 	"github.com/relocode/relo/internal/taskgraph"
 )
 
-// blockCoord is a Coord with only the task graph, enough for admission, answers and the family cap.
+// blockCoord is a Coord with only the task graph, enough for admission, answers and the family.
 func blockCoord(t *testing.T) (*Coord, taskgraph.Task) {
 	t.Helper()
 	c := &Coord{Graph: taskgraph.New()}
@@ -44,34 +43,15 @@ func TestResolvedBlocksRecordAnswerOnce(t *testing.T) {
 	})
 	c.applyResolvedBlocks([]ResolvedBlock{
 		{TaskID: "missing", Answer: "ignored"},
-		{TaskID: first.ID, Answer: "use the new one"},
+		{TaskID: first.ID, Answer: "use the new one", Cite: "use the new one"},
 		{TaskID: first.ID, Answer: "later answer"},
-	})
+	}, "use the new one")
 	got, _ := c.Graph.Get(first.ID)
 	if got.BlockedOn == nil || got.BlockedOn.Resolution != "use the new one" || got.BlockedOn.Unresolved() {
 		t.Fatalf("blockedOn %+v, want first valid answer recorded and resolved", got.BlockedOn)
 	}
 	if open := c.openQuestions(); len(open) != 0 {
 		t.Fatalf("open questions %d, want 0", len(open))
-	}
-}
-
-func TestFamilyAttemptsCountAcrossIDsAndCapBlocks(t *testing.T) {
-	c, first := blockCoord(t)
-	c.Graph.Update(first.ID, func(x *taskgraph.Task) { x.Attempts = 2 })
-	second := c.Graph.Add(taskgraph.Task{Title: "widget   STAGE 2!", Role: "worker", Paths: []string{"a.go", "b.go"}, Scope: "API"})
-	c.Graph.Update(second.ID, func(x *taskgraph.Task) { x.Attempts = 1 })
-	other := c.Graph.Add(taskgraph.Task{Title: "Widget stage 2", Role: "test", Paths: []string{"a.go", "b.go"}, Scope: "api"})
-	c.Graph.Update(other.ID, func(x *taskgraph.Task) { x.Attempts = 5 })
-
-	got, _ := c.Graph.Get(second.ID)
-	if n := c.familyAttempts(got); n != 3 {
-		t.Fatalf("familyAttempts %d, want 3 (other role is a separate family)", n)
-	}
-	c.capBlock(got, 3)
-	after, _ := c.Graph.Get(second.ID)
-	if after.Status != taskgraph.Failed || after.BlockedOn == nil || !after.BlockedOn.Unresolved() || after.BlockedOn.Family != taskgraph.FamilyKey(got) {
-		t.Fatalf("cap task %+v, want Failed with unresolved cap BlockedOn", after)
 	}
 }
 
@@ -92,96 +72,84 @@ func capTestFamilyTask(c *Coord, id, title string) taskgraph.Task {
 	})
 }
 
-// The cap of three launches is reached through real dispatches, not by setting Attempts by hand. Four tasks that are
-// one family - distinct ids, reworded titles - run one slot at a time. The first three launches run for real and are
-// summed into the family budget; the fourth is refused before any agent starts for it, and the agent that had queued
-// for it is retired with no model call. The reworded titles are HYPOTHETICAL fragments of one staged piece of work,
-// reconstructed for the test.
-func TestTheFamilyCapCountsThreeRealLaunchesAcrossIdsAndTitles(t *testing.T) {
+// A fourth launch of a family that already ran three times is not refused or parked: it spawns like any other.
+func TestAFourthFamilyLaunchSpawnsWithoutAsking(t *testing.T) {
 	c, r := capTestCoord(t)
-	ids := []string{"cap-1", "cap-2", "cap-3", "cap-4"}
-	titles := []string{"Widget stage 2", "Widget  stage 2 (retry)", "widget STAGE 2!", "Widget stage 2 per plan"}
-	var first taskgraph.Task
-	for i, id := range ids {
-		task := capTestFamilyTask(c, id, titles[i])
-		if i == 0 {
-			first = task
-		} else if taskgraph.FamilyKey(task) != taskgraph.FamilyKey(first) {
-			t.Fatalf("task %s (%q) is not in the family of %s", id, titles[i], first.ID)
-		}
+	for _, prior := range []struct{ id, title string }{
+		{"prior-1", "Widget stage 2"}, {"prior-2", "Widget stage 2 (retry)"}, {"prior-3", "widget STAGE 2!"},
+	} {
+		capTestFamilyTask(c, prior.id, prior.title)
+		c.Graph.Update(prior.id, func(x *taskgraph.Task) { x.Status, x.Attempts, x.Finished = taskgraph.Done, 1, time.Now().UTC() })
 	}
-
+	capTestFamilyTask(c, "fourth", "Widget stage 2 per plan")
 	started := make(chan int, 1)
 	go func() { started <- c.dispatch(context.Background(), c.scheduler()) }()
+	r.release(nextBegun(t, r))
+	select {
+	case n := <-started:
+		if n != 1 {
+			t.Fatalf("started %d workers, want 1", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatch did not finish")
+	}
+	got, _ := c.Graph.Get("fourth")
+	if got.Status != taskgraph.Done || got.BlockedOn != nil {
+		t.Fatalf("fourth launch ended %s with block %+v, want done without a question", got.Status, got.BlockedOn)
+	}
+}
 
-	// The first three launches run for real, one behind the single tier-1 slot. Each release frees the slot and the
-	// dispatcher admits the next queued launch.
-	begun := map[string]bool{}
-	for i := 0; i < 3; i++ {
+// Successful launches of one family all run; none is parked for a run limit.
+func TestSuccessfulFamilyLaunchesAllRun(t *testing.T) {
+	c, r := capTestCoord(t)
+	ids := []string{"run-1", "run-2", "run-3", "run-4"}
+	titles := []string{"Widget stage 2", "Widget stage 2 (retry)", "widget STAGE 2!", "Widget stage 2 per plan"}
+	for i, id := range ids {
+		capTestFamilyTask(c, id, titles[i])
+	}
+	started := make(chan int, 1)
+	go func() { started <- c.dispatch(context.Background(), c.scheduler()) }()
+	for range ids {
 		title := nextBegun(t, r)
-		begun[title] = true
 		r.release(title)
 	}
 	select {
 	case n := <-started:
-		if n != 3 {
-			t.Fatalf("dispatch started %d workers, want the three launches inside the cap", n)
+		if n != 4 {
+			t.Fatalf("started %d workers, want 4", n)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("dispatch did not finish once the family reached its cap")
+		t.Fatal("dispatch did not finish")
 	}
-
-	// The fourth launch never reached a model call.
-	select {
-	case title := <-r.begun:
-		t.Fatalf("%q began after the family reached its cap of %d", title, maxFamilyAttempts)
-	case <-time.After(100 * time.Millisecond):
-	}
-	for i := 0; i < 3; i++ {
-		if !begun[titles[i]] {
-			t.Errorf("launch %q never ran", titles[i])
-		}
-	}
-	if begun[titles[3]] {
-		t.Fatalf("the fourth launch %q ran", titles[3])
-	}
-
-	// The budget really is three real launches, summed across ids and titles.
-	if n := c.familyAttempts(first); n != maxFamilyAttempts {
-		t.Fatalf("familyAttempts = %d, want %d from three real launches", n, maxFamilyAttempts)
-	}
-
-	for i, id := range ids {
+	for _, id := range ids {
 		got, _ := c.Graph.Get(id)
-		if i < 3 {
-			if got.Status != taskgraph.Done {
-				t.Errorf("launch %d (%s) ended %s, want done", i+1, id, got.Status)
-			}
-			continue
-		}
-		if got.Status != taskgraph.Failed {
-			t.Fatalf("the capped task is %s, want failed", got.Status)
-		}
-		if got.BlockedOn == nil || !got.BlockedOn.Unresolved() {
-			t.Fatalf("capped task blockedOn = %+v, want an open question", got.BlockedOn)
-		}
-		if !strings.Contains(got.BlockedOn.Question, "limit 3") {
-			t.Fatalf("the cap question does not state the limit: %q", got.BlockedOn.Question)
-		}
-		if got.BlockedOn.Family != taskgraph.FamilyKey(first) {
-			t.Fatalf("capped family = %q, want %q", got.BlockedOn.Family, taskgraph.FamilyKey(first))
+		if got.Status != taskgraph.Done {
+			t.Errorf("%s ended %s, want done", id, got.Status)
 		}
 	}
+}
 
-	// The agent that had queued for the fourth launch is retired, never run.
-	retired := agentsOf(c, ids[3])
-	if len(retired) != 1 {
-		t.Fatalf("the capped task has %d agents, want the one queued agent", len(retired))
+// A worker that just failed leaves its task Queued for a retry with no Started or Finished. Past three attempts a
+// sibling's success does not park it: the retry launches like any other.
+func TestRetryAfterSiblingSuccessStillLaunches(t *testing.T) {
+	c, r := capTestCoord(t)
+	capTestFamilyTask(c, "retry-done", "Widget stage 2")
+	capTestFamilyTask(c, "retry-next", "Widget stage 2 (retry)")
+	c.Graph.Update("retry-next", func(x *taskgraph.Task) { x.Attempts = 3 })
+	c.Graph.Update("retry-done", func(x *taskgraph.Task) { x.Status, x.Finished = taskgraph.Done, time.Now().UTC() })
+	started := make(chan int, 1)
+	go func() { started <- c.dispatch(context.Background(), c.scheduler()) }()
+	r.release(nextBegun(t, r))
+	select {
+	case n := <-started:
+		if n != 1 {
+			t.Fatalf("started %d workers, want 1", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatch did not finish")
 	}
-	if retired[0].Status != agent.Cancelled {
-		t.Errorf("the queued agent is %s, want cancelled", retired[0].Status)
-	}
-	if !strings.Contains(retired[0].Activity, "family run limit reached") {
-		t.Errorf("the queued agent says %q, want the cap reason", retired[0].Activity)
+	got, _ := c.Graph.Get("retry-next")
+	if got.Status != taskgraph.Done || got.BlockedOn != nil {
+		t.Fatalf("retry ended %s with block %+v, want done", got.Status, got.BlockedOn)
 	}
 }

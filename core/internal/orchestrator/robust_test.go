@@ -65,6 +65,48 @@ func TestAdmitTasksDropsRepeatsWithoutCappingPlanning(t *testing.T) {
 	}
 }
 
+func TestAdmitNearCopiesOnlyForUnansweredQuestions(t *testing.T) {
+	c, _, _ := briefFixture(t)
+	events := &captured{}
+	c.SetEmitter(events.emit)
+	c.Graph.Add(taskgraph.Task{Title: "Fix login bug", Role: "worker", Status: taskgraph.Done})
+	c.Graph.Add(taskgraph.Task{Title: "Parse request body", Role: "worker", Status: taskgraph.Running})
+	c.Graph.Add(taskgraph.Task{Title: "Update configuration", Role: "worker", Paths: []string{"first.go"}, Status: taskgraph.Done})
+	blocked := c.Graph.Add(taskgraph.Task{Title: "SPT S3d Implement diplomacy interactions", Role: "worker", Status: taskgraph.Asking, BlockedOn: &taskgraph.BlockedOn{Question: "Which rules?"}})
+	got := c.admitTasks([]TurnTask{
+		{ID: "logout", Title: "Fix logout bug", Role: "worker"},
+		{ID: "response", Title: "Parse response body", Role: "worker"},
+		{ID: "copy", Title: "SPT S3d Build diplomacy interactions", Role: "worker"},
+		{ID: "different", Title: "SPT S3e Implement diplomacy interactions", Role: "worker"},
+		{ID: "path", Title: "Update configuration", Role: "worker", Paths: []string{"second.go"}},
+	})
+	if len(got) != 4 || got[0].ID != "logout" || got[1].ID != "response" || got[2].ID != "different" || got[3].ID != "path" {
+		t.Fatalf("admitted = %+v", got)
+	}
+	primary, _ := c.Agents.Primary()
+	found := false
+	for _, item := range c.Engine.SnapshotPool(primary.ID) {
+		if item.Title == "Refused blocked replans: "+blocked.ID && item.Pinned && strings.Contains(item.Content, blocked.ID) && strings.Contains(item.Content, "Build diplomacy interactions") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("missing pinned refusal note")
+	}
+	msgs := events.named("chat.message")
+	if len(msgs) != 1 || !strings.Contains(msgs[0].(Chat).Text, "Skipped") {
+		t.Fatalf("warning = %+v", msgs)
+	}
+	if err := c.AnswerQuestion(blocked.ID, "Use the existing rules"); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range c.Engine.SnapshotPool(primary.ID) {
+		if item.Title == "Refused blocked replans: "+blocked.ID {
+			t.Fatal("answered question retained refusal note")
+		}
+	}
+}
+
 func TestAdmitTasksReplansFailedOrCanceledWork(t *testing.T) {
 	c := New(logging.New(nil, logging.Error))
 	c.CreateSession(t.TempDir(), "", ModeBuild)
@@ -83,8 +125,8 @@ func TestAdmitTasksReplansFailedOrCanceledWork(t *testing.T) {
 		{ID: "q", Title: "SPT stage 2 per spt-impl-plan contract", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"},
 		{ID: "r", Title: "SPT stage 2", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"},
 	})
-	if len(got) != 2 {
-		t.Fatalf("admitted = %+v, want family-shaped work planned again when nothing is waiting on an answer", got)
+	if len(got) != 1 {
+		t.Fatalf("admitted = %+v, want one near-copy task in the turn", got)
 	}
 	if fams := c.unresolvedFamilies(); len(fams) != 0 {
 		t.Fatalf("families reported as blocked = %v, want none", fams)
@@ -106,8 +148,8 @@ func TestAFailedTaskWithoutAQuestionLeavesItsFamilyOpen(t *testing.T) {
 		{ID: "p", Title: "SPT stage 2 per spt-impl-plan contract", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"},
 		{ID: "l", Title: "SPT stage 2", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"},
 	})
-	if len(got) != 2 {
-		t.Fatalf("admitted = %+v, want failed and canceled work planned again", got)
+	if len(got) != 1 {
+		t.Fatalf("admitted = %+v, want one replacement, not two near-copies", got)
 	}
 }
 
@@ -132,20 +174,20 @@ func TestADependencyBlockedTaskIsNotAnOpenQuestion(t *testing.T) {
 		t.Fatal("settled() = true with a task Blocked on a dependency; that status must keep its meaning")
 	}
 	got := c.admitTasks([]TurnTask{{ID: "p", Title: "SPT stage 2", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"}})
-	if len(got) != 1 || got[0].ID != "p" {
-		t.Fatalf("admitted = %+v, want a dependency-blocked family left plannable", got)
+	if len(got) != 0 {
+		t.Fatalf("admitted = %+v, want existing near-copy retained", got)
 	}
 }
 
 // The answer is the only thing that reopens a blocked family, and it is recorded on the task rather than inferred
 // from whatever the user typed next. A reader already holding the block is not rewritten in place.
-func TestAnAnswerReopensTheBlockedFamilyAndRestartsItsBudget(t *testing.T) {
+func TestAnAnswerReopensTheBlockedFamily(t *testing.T) {
 	c := New(logging.New(nil, logging.Error))
 	c.CreateSession(t.TempDir(), "", ModeBuild)
 	verified := "SPT stage 2 per spt-impl-plan contract" // the incident's verified task title
 	blocked := c.Graph.Add(taskgraph.Task{
 		ID: "task-blocked", Title: verified, Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai",
-		Status: taskgraph.Failed, Attempts: maxFamilyAttempts,
+		Status: taskgraph.Failed,
 	})
 	question := "Which contract governs stage 2?"
 	if _, err := c.Graph.Update(blocked.ID, func(x *taskgraph.Task) {
@@ -167,7 +209,9 @@ func TestAnAnswerReopensTheBlockedFamilyAndRestartsItsBudget(t *testing.T) {
 	}
 
 	answer := "Follow spt-staged-plan.md lines 67-78."
-	c.applyResolvedBlocks([]ResolvedBlock{{TaskID: blocked.ID, Answer: answer}})
+	if err := c.AnswerQuestion(blocked.ID, answer); err != nil {
+		t.Fatal(err)
+	}
 	answered, _ := c.Graph.Get(blocked.ID)
 	if answered.BlockedOn.Unresolved() {
 		t.Fatal("the recorded answer did not clear the block")
@@ -187,13 +231,8 @@ func TestAnAnswerReopensTheBlockedFamilyAndRestartsItsBudget(t *testing.T) {
 	// The family may be planned again, under a new id and a reworded title. The reworded title is a HYPOTHETICAL
 	// fragment of the same family, reconstructed for the test.
 	got := c.admitTasks([]TurnTask{{ID: "n1", Title: "SPT stage 2 per the staged plan", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"}})
-	if len(got) != 1 || got[0].ID != "n1" {
-		t.Fatalf("admitted = %+v, want the answered family planned again", got)
-	}
-	// The launches it spent before the answer do not count against the new budget.
-	fresh := c.Graph.Add(taskgraph.Task{ID: "task-fresh", Title: "SPT stage 2", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"})
-	if n := c.familyAttempts(fresh); n != 0 {
-		t.Fatalf("family attempts after the answer = %d, want a fresh budget", n)
+	if len(got) != 0 {
+		t.Fatalf("admitted = %+v, want the same task resumed", got)
 	}
 }
 
@@ -264,7 +303,9 @@ func TestAnOpenQuestionSurvivesCompressionAndAReload(t *testing.T) {
 		t.Fatalf("Unresolved questions items = %d, want 1", n)
 	}
 	// Answering clears the group: the question is no longer shown to the Primary.
-	c.applyResolvedBlocks([]ResolvedBlock{{TaskID: task.ID, Answer: "Follow spt-staged-plan.md lines 67-78."}})
+	if err := c.AnswerQuestion(task.ID, "Follow spt-staged-plan.md lines 67-78."); err != nil {
+		t.Fatal(err)
+	}
 	c.pinBlocks(primary.ID)
 	for _, it := range c.Engine.SnapshotPool(primary.ID) {
 		if it.Title == "Unresolved questions" {

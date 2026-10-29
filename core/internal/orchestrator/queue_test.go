@@ -575,8 +575,8 @@ func TestAQuestionIsSurfacedOnceWhenTheRunGoesQuiet(t *testing.T) {
 		if !task.BlockedOn.Unresolved() {
 			t.Fatalf("task %s kept no open question: %+v", id, task.BlockedOn)
 		}
-		if task.Status != taskgraph.Failed {
-			t.Errorf("task %s = %s, want failed", id, task.Status)
+		if task.Status != taskgraph.Asking {
+			t.Errorf("task %s = %s, want asking", id, task.Status)
 		}
 	}
 	// The questions were pinned to the Primary while the workers ran, so the wrap-up turn sees them too.
@@ -585,10 +585,12 @@ func TestAQuestionIsSurfacedOnceWhenTheRunGoesQuiet(t *testing.T) {
 	}
 
 	// Answering both releases the session.
-	c.applyResolvedBlocks([]ResolvedBlock{
-		{TaskID: "w1", Answer: "Follow spt-staged-plan.md lines 67-78."},
-		{TaskID: "w2", Answer: "the three files the task allows"},
-	})
+	if err := c.AnswerQuestion("w1", "Follow spt-staged-plan.md lines 67-78."); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AnswerQuestion("w2", "the three files the task allows"); err != nil {
+		t.Fatal(err)
+	}
 	c.surfaceBlocks()
 	if got := c.Current().Status; got != "active" {
 		t.Fatalf("session = %q after the answers, want active", got)

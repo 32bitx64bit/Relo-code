@@ -77,6 +77,12 @@ func cloneSession(s *Session) *Session {
 	out.Constraints = append([]string(nil), s.Constraints...)
 	out.Decisions = append([]string(nil), s.Decisions...)
 	out.PeerMessages = append([]PeerMessage(nil), s.PeerMessages...)
+	if s.PeerWakes != nil {
+		out.PeerWakes = make(map[string]int, len(s.PeerWakes))
+		for k, v := range s.PeerWakes {
+			out.PeerWakes[k] = v
+		}
+	}
 	out.Messages = append([]Chat(nil), s.Messages...)
 	out.Changes = append([]Change(nil), s.Changes...)
 	out.Verify = append([]verification.Result(nil), s.Verify...)
@@ -727,7 +733,7 @@ func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text strin
 		return err
 	}
 	c.emit("context.created", map[string]any{"agentId": primary.ID, "generation": gen.Number, "tokens": gen.Tokens})
-	extra := c.workspaceFacts() + c.constraintsNote() + "\nUser message:\n" + text
+	extra := c.workspaceFacts() + c.constraintsNote() + c.waitNote() + "\nUser message:\n" + text
 	if line := style.PlanLeanLine(settings.Efficiency); line != "" {
 		extra += "\n" + line
 	}
@@ -740,7 +746,7 @@ func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text strin
 	if turn.UserMessage != "" {
 		c.chat("assistant", turn.UserMessage, primary.ID)
 	}
-	c.applyTurn(primary, turn)
+	c.applyTurn(primary, turn, text)
 	if len(turn.Tasks) > 0 {
 		c.primaryWaits()
 	}
@@ -784,7 +790,7 @@ func (c *Coord) primaryWaits() {
 	})
 }
 
-func (c *Coord) applyTurn(primary agent.Agent, turn Turn) {
+func (c *Coord) applyTurn(primary agent.Agent, turn Turn, userText ...string) {
 	settings := c.settings()
 	s := c.Current()
 	if s == nil {
@@ -794,7 +800,7 @@ func (c *Coord) applyTurn(primary agent.Agent, turn Turn) {
 		c.ResolveChanges(turn.ResolvedChanges)
 	}
 	// Answers come before admission, so a family whose question is answered here can be planned in this same turn.
-	c.applyResolvedBlocks(turn.ResolvedBlocks)
+	c.applyResolvedBlocks(turn.ResolvedBlocks, userText...)
 	c.pinBlocks(primary.ID)
 	c.setConstraints(turn.Constraints)
 	idmap := map[string]string{}
@@ -913,38 +919,53 @@ func (c *Coord) admitTaskAliases(specs []TurnTask) (kept []TurnTask, existing, i
 	if len(specs) == 0 {
 		return specs, nil, nil
 	}
-	seen := map[string]string{} // taskKey -> persisted task ID
-	for _, t := range c.Graph.List() {
-		if t.Status != taskgraph.Failed && t.Status != taskgraph.Canceled {
-			key := taskKey(t.Title, t.Role)
-			if _, ok := seen[key]; !ok {
-				seen[key] = t.ID
-			}
-		}
-	}
-	turnKept := map[string]string{} // taskKey -> kept spec ID of this turn
 	existing, inTurn = map[string]string{}, map[string]string{}
-	blocked := c.unresolvedFamilies()
+	refusals := c.refuseAroundQuestions(specs)
+	notes := map[string][]string{} // asking task ID -> what was refused for it, pinned for the Primary
 	dupes, refused := 0, 0
-	for _, spec := range specs {
-		// A family waiting on the user is refused under any id or title until its question is answered.
-		if blocked[specFamily(spec)] {
+	for i, spec := range specs {
+		// Work that touches a question waiting for the user is refused under any id, title, role or wording until
+		// the user answers.
+		if r, ok := refusals[i]; ok {
+			note := fmt.Sprintf("Skipped %q because it %s task %s (%q), which is waiting for the user's answer: %s. Wait for the user; do not plan around it.", spec.Title, r.why, r.asking.ID, r.asking.Title, r.asking.BlockedOn.Question)
+			notes[r.asking.ID] = append(notes[r.asking.ID], note)
+			c.chat("system", note, "")
 			refused++
 			continue
 		}
-		key := taskKey(spec.Title, string(parseRole(spec.Role)))
-		if id, ok := seen[key]; ok {
-			existing[spec.ID] = id
-			dupes++
+		candidate := specTask(spec)
+		matched := false
+		for _, t := range c.Graph.List() {
+			if t.Status != taskgraph.Failed && t.Status != taskgraph.Canceled && taskgraph.FamilyKey(t) == taskgraph.FamilyKey(candidate) {
+				existing[spec.ID] = t.ID
+				dupes++
+				matched = true
+				break
+			}
+		}
+		if matched {
 			continue
 		}
-		if id, ok := turnKept[key]; ok {
-			inTurn[spec.ID] = id
-			dupes++
+		for _, prior := range kept {
+			other := taskgraph.Task{Title: prior.Title, Role: string(parseRole(prior.Role)), Paths: prior.Paths, Scope: prior.Scope}
+			if taskgraph.FamilyKey(other) == taskgraph.FamilyKey(candidate) {
+				inTurn[spec.ID] = prior.ID
+				dupes++
+				matched = true
+				break
+			}
+		}
+		if matched {
 			continue
 		}
-		turnKept[key] = spec.ID
 		kept = append(kept, spec)
+	}
+	if c.Agents != nil && c.Engine != nil && len(notes) > 0 {
+		if primary, ok := c.Agents.Primary(); ok {
+			for id, lines := range notes {
+				c.Engine.SetTaskState(primary.ID, "Refused blocked replans: "+id, []ctxeng.Item{{Source: ctxeng.SourceSystem, Kind: ctxeng.KindConstraint, Content: strings.Join(lines, "\n"), Durability: 1, Relevance: 1, Pinned: true}})
+			}
+		}
 	}
 	if dupes > 0 {
 		c.logWarn("planner repeated tasks", fmt.Errorf("dropped %d duplicate task(s)", dupes))
@@ -955,13 +976,124 @@ func (c *Coord) admitTaskAliases(specs []TurnTask) (kept []TurnTask, existing, i
 	return kept, existing, inTurn
 }
 
-func taskKey(title, role string) string {
-	return strings.ToLower(strings.Join(strings.Fields(title), " ")) + "|" + strings.ToLower(role)
+// specTask is the task shape the spec would have once admitted, as far as family and path checks go.
+func specTask(spec TurnTask) taskgraph.Task {
+	return taskgraph.Task{ID: spec.ID, Title: spec.Title, Description: spec.Description, Role: string(parseRole(spec.Role)), Paths: spec.Paths, Scope: spec.Scope, Depends: spec.Deps}
 }
 
 // specFamily is the family key the task spec would get once admitted.
 func specFamily(spec TurnTask) string {
-	return taskgraph.FamilyKey(taskgraph.Task{Title: spec.Title, Role: string(parseRole(spec.Role)), Paths: spec.Paths, Scope: spec.Scope})
+	return taskgraph.FamilyKey(specTask(spec))
+}
+
+// questionRefusal says which waiting question a planned task touches and how.
+type questionRefusal struct {
+	asking taskgraph.Task
+	why    string // a verb phrase that ends before the task, such as "shares path a.go with"
+}
+
+// refuseAroundQuestions maps the index of each spec that must not be admitted to the open question it touches.
+// While a question waits for the user, Primary may not act around it: no new task may repeat or reword its work
+// under another role, reuse its id, share one of its paths, depend on it (or on a task that does), or name it; and a
+// task that depends on a refused spec goes with it. Work that touches none of these continues. The guard lifts when
+// the question is answered, and for a question the user delegated to Primary, unless only the user may answer it.
+// A parked task that is not Asking (an older store shape) keeps only the near-copy rule.
+func (c *Coord) refuseAroundQuestions(specs []TurnTask) map[int]questionRefusal {
+	open := c.openQuestions()
+	if len(open) == 0 {
+		return nil
+	}
+	delegated := false
+	if s := c.Current(); s != nil {
+		delegated = s.DelegateAnswers
+	}
+	graph := c.Graph.List()
+	refused := map[int]questionRefusal{}
+	for i, spec := range specs {
+		candidate := specTask(spec)
+		for _, t := range open {
+			strict := t.Status == taskgraph.Asking && !(delegated && !userOnlyQuestion(t.BlockedOn.Question))
+			if why := questionConflict(t, candidate, spec, strict, graph); why != "" {
+				refused[i] = questionRefusal{asking: t, why: why}
+				break
+			}
+		}
+	}
+	// A task that waits on a refused one cannot run without it, so it is part of the same workaround.
+	for changed := true; changed; {
+		changed = false
+		for i, spec := range specs {
+			if _, done := refused[i]; done {
+				continue
+			}
+			for j, other := range specs {
+				if r, bad := refused[j]; bad && other.ID != "" && slices.Contains(spec.Deps, other.ID) {
+					refused[i] = questionRefusal{asking: r.asking, why: fmt.Sprintf("depends on the skipped task %q, which is tied to", other.Title)}
+					changed = true
+					break
+				}
+			}
+		}
+	}
+	return refused
+}
+
+// questionConflict explains how the candidate touches the waiting task t, or returns "" when it does not.
+func questionConflict(t, candidate taskgraph.Task, spec TurnTask, strict bool, graph []taskgraph.Task) string {
+	if strict {
+		switch {
+		case spec.ID != "" && spec.ID == t.ID:
+			return "would change or replace"
+		case dependsOnTask(spec.Deps, t.ID, graph):
+			return "depends on"
+		case (t.BlockedOn.Family != "" && t.BlockedOn.Family == taskgraph.FamilyKey(candidate)) || taskgraph.Related(t, candidate):
+			return "is the same work as"
+		case mentionsTask(spec, t):
+			return "refers to"
+		}
+		if shared := taskgraph.SharedPaths(candidate, t); len(shared) > 0 {
+			return fmt.Sprintf("shares %s with", strings.Join(shared, ", "))
+		}
+	}
+	if (t.Status == taskgraph.Asking || t.Status == taskgraph.Failed || t.Status == taskgraph.Canceled) && taskgraph.NearCopy(t, candidate) {
+		return "repeats"
+	}
+	return ""
+}
+
+// dependsOnTask reports whether any dep is the task or a task that depends on it, however indirectly.
+func dependsOnTask(deps []string, id string, graph []taskgraph.Task) bool {
+	down := map[string]bool{id: true}
+	for changed := true; changed; {
+		changed = false
+		for _, t := range graph {
+			if down[t.ID] {
+				continue
+			}
+			for _, d := range t.Depends {
+				if down[d] {
+					down[t.ID], changed = true, true
+					break
+				}
+			}
+		}
+	}
+	for _, d := range deps {
+		if down[d] {
+			return true
+		}
+	}
+	return false
+}
+
+// mentionsTask reports whether the spec names the waiting task by id, or by a title long enough to be specific.
+func mentionsTask(spec TurnTask, t taskgraph.Task) bool {
+	text := strings.ToLower(strings.Join(append([]string{spec.Title, spec.Description, spec.Scope}, spec.Acceptance...), "\n"))
+	if id := strings.ToLower(t.ID); id != "" && strings.Contains(text, id) {
+		return true
+	}
+	title := strings.Join(strings.Fields(strings.ToLower(t.Title)), " ")
+	return len(title) >= 12 && strings.Contains(strings.Join(strings.Fields(text), " "), title)
 }
 
 // openQuestions returns the tasks still waiting on an answer to a blocked question.
@@ -986,38 +1118,158 @@ func (c *Coord) unresolvedFamilies() map[string]bool {
 
 // applyResolvedBlocks records the user's answers on the tasks waiting for them. Unknown ids, empty answers and tasks
 // already answered are ignored.
-func (c *Coord) applyResolvedBlocks(answers []ResolvedBlock) {
+func (c *Coord) applyResolvedBlocks(answers []ResolvedBlock, userText ...string) {
 	for _, r := range answers {
-		answer := strings.TrimSpace(r.Answer)
-		if answer == "" {
+		cite := strings.TrimSpace(r.Cite)
+		source := taskgraph.AnswerSource("")
+		if cite != "" && len(userText) > 0 && strings.Contains(userText[0], cite) {
+			source = taskgraph.AnsweredByUser
+		} else if len([]rune(cite)) >= 12 && c.answerEvidence(cite) {
+			source = taskgraph.AnsweredByPrimary
+		} else if s := c.Current(); s != nil && s.DelegateAnswers {
+			source = taskgraph.AnsweredByDelegated
+		}
+		t, ok := c.Graph.Get(r.TaskID)
+		if !ok || !t.BlockedOn.Unresolved() || source == "" || (userOnlyQuestion(t.BlockedOn.Question) && source != taskgraph.AnsweredByUser) {
 			continue
 		}
-		if t, ok := c.Graph.Get(r.TaskID); !ok || !t.BlockedOn.Unresolved() {
-			continue
-		}
-		updated, err := c.Graph.Update(r.TaskID, func(x *taskgraph.Task) {
-			if !x.BlockedOn.Unresolved() {
-				return
-			}
-			b := *x.BlockedOn // copy, so readers holding the old pointer never see a change
-			b.Resolution, b.ResolvedAt = answer, time.Now().UTC()
-			x.BlockedOn = &b
-		})
-		if err != nil {
+		if err := c.recordQuestionAnswer(r.TaskID, r.Answer, source, cite); err != nil {
 			c.logWarn("record answer", err)
+		}
+	}
+}
+
+func (c *Coord) answerEvidence(cite string) bool {
+	if s := c.Current(); s != nil {
+		if strings.Contains(s.Objective, cite) {
+			return true
+		}
+		for _, text := range append(append([]string{}, s.Decisions...), s.Constraints...) {
+			if strings.Contains(text, cite) {
+				return true
+			}
+		}
+		for _, m := range s.Messages {
+			if m.Role == "user" && !m.Queued && !m.Dropped && strings.Contains(m.Text, cite) {
+				return true
+			}
+		}
+	}
+	for _, f := range c.Engine.Findings() {
+		if !f.Verified {
 			continue
 		}
-		c.emit("task.updated", updated)
+		for _, text := range append([]string{f.Summary, f.Detail, f.RootCause}, f.Evidence...) {
+			if strings.Contains(text, cite) {
+				return true
+			}
+		}
 	}
+	return false
+}
+
+func userOnlyQuestion(question string) bool {
+	q := strings.ToLower(question)
+	for _, marker := range []string{"quota", "provider", "billing", "credit balance", "token exhaustion", "token limit", "rate limit"} {
+		if strings.Contains(q, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// AnswerQuestion records an explicit user choice or custom answer.
+func (c *Coord) AnswerQuestion(taskID, answer string) error {
+	return c.recordQuestionAnswer(taskID, answer, taskgraph.AnsweredByUser, "")
+}
+
+// SetDelegateAnswers changes whether Primary may answer without cited evidence.
+func (c *Coord) SetDelegateAnswers(enabled bool) {
+	c.mu.Lock()
+	if c.sess == nil {
+		c.mu.Unlock()
+		return
+	}
+	c.sess.DelegateAnswers = enabled
+	c.sess.Updated = time.Now().UTC()
+	s := cloneSession(c.sess)
+	c.mu.Unlock()
+	c.emit("session.updated", s)
+}
+
+func (c *Coord) recordQuestionAnswer(taskID, answer string, source taskgraph.AnswerSource, cite string) error {
+	answer = strings.TrimSpace(answer)
+	if answer == "" {
+		return fmt.Errorf("answer is empty")
+	}
+	changed := false
+	updated, err := c.Graph.Update(taskID, func(x *taskgraph.Task) {
+		if !x.BlockedOn.Unresolved() {
+			return
+		}
+		b := *x.BlockedOn
+		now := time.Now().UTC()
+		b.Resolution, b.Answer, b.AnsweredBy, b.Cite, b.ResolvedAt, b.AnsweredAt = answer, answer, source, cite, now, now
+		x.BlockedOn = &b
+		x.Status, x.Finished = taskgraph.Queued, time.Time{}
+		changed = true
+	})
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return fmt.Errorf("question is not open")
+	}
+	c.emit("task.updated", updated)
+	c.chat("system", fmt.Sprintf("%q answered by %s: %s", updated.Title, source, answer), "")
+	if c.Agents != nil && c.Engine != nil {
+		if primary, ok := c.Agents.Primary(); ok {
+			c.Engine.SetTaskState(primary.ID, "Refused blocked replans: "+taskID, nil)
+		}
+	}
+	if len(c.openQuestions()) == 0 {
+		c.mu.Lock()
+		var s *Session
+		if c.sess != nil && c.sess.Status == "blocked" {
+			c.sess.Status = "active"
+			c.sess.Updated = time.Now().UTC()
+			s = cloneSession(c.sess)
+		}
+		c.mu.Unlock()
+		if s != nil {
+			c.emit("session.updated", s)
+		}
+	}
+	c.wakeHead()
+	return nil
 }
 
 // pinBlocks pins each open question to the Primary's state, so every Primary turn shows it until it is answered.
 func (c *Coord) pinBlocks(primaryID string) {
 	var items []ctxeng.Item
 	for _, t := range c.openQuestions() {
-		items = append(items, ctxeng.Item{Source: ctxeng.SourceSystem, Kind: ctxeng.KindConstraint, Content: fmt.Sprintf("Task %s (%q) is blocked, unanswered: %s. When the user answers, return resolvedBlocks [{taskId,answer}].", t.ID, t.Title, t.BlockedOn.Question), Durability: 1, Relevance: 1, Pinned: true})
+		where := ""
+		if len(t.Paths) > 0 {
+			where = " Its paths: " + strings.Join(t.Paths, ", ") + "."
+		}
+		items = append(items, ctxeng.Item{Source: ctxeng.SourceSystem, Kind: ctxeng.KindConstraint, Content: fmt.Sprintf("WAIT FOR USER: task %s (%q) is blocked, unanswered: %s.%s Do not replan, cancel, replace or work around it, and do not plan tasks that share its family or paths or depend on it: core refuses them. Work that is disjoint from it may continue. Return resolvedBlocks [{taskId,answer,answeredBy,cite}] only with authorized evidence; provider and quota questions require the user.", t.ID, t.Title, t.BlockedOn.Question, where), Durability: 1, Relevance: 1, Pinned: true})
 	}
 	c.Engine.SetTaskState(primaryID, "Unresolved questions", items)
+}
+
+// waitNote lists the questions waiting for the user in the Primary's turn message, so a turn that plans while one is
+// open sees it where it plans and not only in the pinned context.
+func (c *Coord) waitNote() string {
+	open := c.openQuestions()
+	if len(open) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n## Waiting for the user (do not plan around these; core refuses tasks that share their family or paths or depend on them)\n")
+	for _, t := range open {
+		fmt.Fprintf(&b, "- %s (%q): %s\n", t.ID, t.Title, t.BlockedOn.Question)
+	}
+	return b.String()
 }
 
 // surfaceBlocks shows the user each open question once per drive exit and marks the session blocked while any remain.
@@ -1181,8 +1433,14 @@ func (c *Coord) cancelOrphans() {
 func (c *Coord) repromptPrimary(ctx context.Context) {
 	settings := c.settings()
 	p, ok := c.Agents.Primary()
-	if !ok || !c.settled() {
+	if !ok {
 		return
+	}
+	asking := len(c.openQuestions()) > 0
+	for _, t := range c.Graph.List() {
+		if t.Status == taskgraph.Queued || t.Status == taskgraph.Running || (t.Status == taskgraph.Blocked && !asking) {
+			return
+		}
 	}
 	// Guidance queued while the workers ran is part of this step.
 	queued, refs, hasQueued := c.takeQueued(c.SessionID())
@@ -1197,7 +1455,7 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 	}
 	c.emit("context.compressed", map[string]any{"agentId": p.ID, "generation": gen.Number})
 	resolvedPrimary := style.Resolve(settings.Efficiency, p.Role, p.Difficulty, p.Attempt, settings.Budget)
-	extra := c.workspaceFacts() + c.constraintsNote() + "\nAll scheduled workers finished. If every task is done and no check failed, put what was done in userMessage and return tasks as []. Plan follow-up work only for a task that failed or an acceptance criterion that is still unmet."
+	extra := c.workspaceFacts() + c.constraintsNote() + c.waitNote() + "\nAll scheduled workers finished. If every task is done and no check failed, put what was done in userMessage and return tasks as []. Plan follow-up work only for a task that failed or an acceptance criterion that is still unmet."
 	if hasQueued {
 		extra += "\nThe user sent this while you were working:\n" + queued
 	}
@@ -1212,7 +1470,7 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 	if turn.UserMessage != "" {
 		c.chat("assistant", turn.UserMessage, p.ID)
 	}
-	c.applyTurn(p, turn)
+	c.applyTurn(p, turn, queued)
 	c.honorRefreshSelf(p.ID, turn)
 }
 
