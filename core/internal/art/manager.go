@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -141,17 +142,18 @@ func (b Budget) MarshalJSON() ([]byte, error) {
 type Status struct {
 	Enabled bool `json:"enabled"`
 	// Ready is false when no pictures can be made yet; Problem says why.
-	Ready      bool     `json:"ready"`
-	Problem    string   `json:"problem,omitempty"`
-	Model      string   `json:"model"`
-	Quality    string   `json:"quality"`
-	Size       string   `json:"size"`
-	Count      int      `json:"picturesPerJob"`
-	Qualities  []string `json:"qualities"`
-	Sizes      []string `json:"sizes"`
-	Backgrouds []string `json:"backgrounds"`
-	Budget     Budget   `json:"budget"`
-	Note       string   `json:"note,omitempty"`
+	Ready               bool     `json:"ready"`
+	Problem             string   `json:"problem,omitempty"`
+	Model               string   `json:"model"`
+	Quality             string   `json:"quality"`
+	Size                string   `json:"size"`
+	Count               int      `json:"picturesPerJob"`
+	Qualities           []string `json:"qualities"`
+	Sizes               []string `json:"sizes"`
+	Backgrouds          []string `json:"backgrounds"`
+	Budget              Budget   `json:"budget"`
+	Note                string   `json:"note,omitempty"`
+	SupportedParameters any      `json:"supported_parameters"`
 }
 
 // Manager runs jobs for one workspace.
@@ -201,7 +203,7 @@ func (m *Manager) Recover() {
 		case j.State == StateRunning:
 			m.fail(j.ID, "Relo stopped while this job was running. The provider may still have made and billed the pictures: check its usage page before running it again.", nil)
 		case j.State == StateQueued && j.Approval == "pending":
-			m.process(j.ID)
+			m.process(j.ID, nil)
 		case j.State == StateQueued:
 			m.cancelJob(j.ID, "Relo stopped before this job started.")
 		}
@@ -238,8 +240,13 @@ func (m *Manager) Status(sessionID string) Status {
 	st := Status{Enabled: s.Enabled, Ready: s.Enabled, Model: s.Model, Quality: s.Quality, Size: s.Size, Count: s.Count,
 		Qualities: qualities, Sizes: sizes, Backgrouds: backgrounds, Budget: m.Budget(sessionID),
 		Note: "Prices are estimates until a job finishes, then they are worked out from the usage the provider reports."}
-	if _, err := m.endpoint(s); err != nil {
+	st.SupportedParameters = "unknown"
+	if ep, err := m.endpoint(s); err != nil {
 		st.Ready, st.Problem = false, err.Error()
+	} else if isOpenRouter(ep) {
+		if caps, ok := modelParams(m.ctx, m.client, ep, s.Model); ok {
+			st.SupportedParameters = paramNames(caps)
+		}
 	}
 	return st
 }
@@ -248,7 +255,11 @@ func (m *Manager) endpoint(s Settings) (Endpoint, error) {
 	if m.hooks.Endpoint == nil {
 		return Endpoint{}, errors.New("no image provider is configured")
 	}
-	return m.hooks.Endpoint(s.Provider)
+	ep, err := m.hooks.Endpoint(s.Provider)
+	if ep.Provider == "" {
+		ep.Provider = s.Provider
+	}
+	return ep, err
 }
 
 // Budget is the money a session has used, counting each job at its real cost when known and its estimate otherwise.
@@ -274,14 +285,17 @@ func (m *Manager) Budget(sessionID string) Budget {
 // GenerateInput is a request for new pictures. Refs are ids from Store.AddRef; with any, the call is an edit that
 // uses them as the pictures to start from. Quality, Size, Background and Count fall back to the user's settings.
 type GenerateInput struct {
-	SessionID  string
-	AgentID    string
-	Prompt     string
-	Refs       []string
-	Quality    string
-	Size       string
-	Background string
-	Count      int
+	SessionID   string
+	AgentID     string
+	Prompt      string
+	Refs        []string
+	Quality     string
+	Size        string
+	Background  string
+	Count       int
+	AspectRatio string
+	Resolution  string
+	Seed        *int64
 }
 
 // Generate starts a job. It checks everything it can before anything is spent, and returns while the user is still
@@ -292,6 +306,15 @@ func (m *Manager) Generate(ctx context.Context, in GenerateInput) (Job, error) {
 		return Job{}, errors.New("picture generation is switched off")
 	}
 	prompt := strings.TrimSpace(in.Prompt)
+	if in.AspectRatio != "" && !regexp.MustCompile(`^[0-9]+:[0-9]+$`).MatchString(in.AspectRatio) {
+		return Job{}, errors.New("aspect_ratio must be N:N using digits")
+	}
+	if in.Resolution != "" && !regexp.MustCompile(`^[A-Za-z0-9]{1,16}$`).MatchString(in.Resolution) {
+		return Job{}, errors.New("resolution must be 1 to 16 ASCII letters or digits")
+	}
+	if in.Seed != nil && *in.Seed < 0 {
+		return Job{}, errors.New("seed must be a nonnegative integer")
+	}
 	if prompt == "" || len(prompt) > maxPromptBytes {
 		return Job{}, fmt.Errorf("prompt must be 1 to %d bytes of text", maxPromptBytes)
 	}
@@ -323,8 +346,10 @@ func (m *Manager) Generate(ctx context.Context, in GenerateInput) (Job, error) {
 		seen[id] = true
 		refs = append(refs, Ref{ID: id, File: filepath.Join(m.store.RefsDir(), id+".png")})
 	}
-	if _, err := m.endpoint(s); err != nil {
+	if ep, err := m.endpoint(s); err != nil {
 		return Job{}, err
+	} else if !isOpenRouter(ep) && (in.AspectRatio != "" || in.Resolution != "" || in.Seed != nil) {
+		return Job{}, errors.New("aspect_ratio, resolution and seed are only supported for OpenRouter")
 	}
 	b := m.Budget(in.SessionID)
 	if !b.JobsUnlimited && b.SessionJobs >= s.SessionJobLimit {
@@ -335,11 +360,13 @@ func (m *Manager) Generate(ctx context.Context, in GenerateInput) (Job, error) {
 		return Job{}, fmt.Errorf("not enough budget: this job could cost up to $%.2f and $%.2f of the session's $%.2f is left. Do not retry at the same size; ask for fewer pictures or a lower quality, or stop and tell the user", estimate, b.RemainingUSD, b.LimitUSD)
 	}
 	created, err := m.store.Create(Job{SessionID: in.SessionID, AgentID: in.AgentID, State: StateQueued, Prompt: prompt, Model: s.Model, Quality: quality, Size: size,
-		Background: background, Count: count, Refs: refs, EstimateUSD: estimate, Approval: "pending", Message: "Waiting for the user to approve the spend."})
+		Background: background, AspectRatio: in.AspectRatio, Resolution: in.Resolution, Seed: in.Seed, Count: count, Refs: refs, EstimateUSD: estimate, Approval: "pending", Message: "Waiting for the user to approve the spend."})
 	if err != nil {
 		return Job{}, err
 	}
-	m.process(created.ID)
+	// A value equal to the user's default overrides nothing, so it counts as inherited: the playbook tells agents to pass
+	// size 1024x1024, and a model that does not list size must not refuse that as if the agent had chosen something else.
+	m.process(created.ID, map[string]bool{"size": size == s.Size, "quality": quality == s.Quality, "background": background == "auto"})
 	return created, nil
 }
 
@@ -361,7 +388,7 @@ func contains(list []string, s string) bool {
 
 // process asks for approval if it is needed, then runs the job. It works in the background so the agent's call returns
 // at once.
-func (m *Manager) process(id string) {
+func (m *Manager) process(id string, defaults map[string]bool) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -410,7 +437,7 @@ func (m *Manager) process(id string) {
 			return
 		}
 		_, _ = m.store.Update(id, func(x *Job) { x.Approval = "approved"; x.Message = "" })
-		m.run(ctx, id)
+		m.run(ctx, id, defaults)
 	}()
 }
 
@@ -443,7 +470,7 @@ func (m *Manager) ask(ctx context.Context, j Job) (string, error) {
 }
 
 // run makes the call and stores what came back.
-func (m *Manager) run(ctx context.Context, id string) {
+func (m *Manager) run(ctx context.Context, id string, defaults map[string]bool) {
 	select {
 	case m.slots <- struct{}{}:
 		defer func() { <-m.slots }()
@@ -459,7 +486,7 @@ func (m *Manager) run(ctx context.Context, id string) {
 		m.fail(id, err.Error(), zero())
 		return
 	}
-	call := imageCall{Model: j.Model, Prompt: j.Prompt, Size: j.Size, Quality: j.Quality, Background: j.Background, N: j.Count}
+	call := imageCall{Model: j.Model, Prompt: j.Prompt, Size: j.Size, Quality: j.Quality, Background: j.Background, AspectRatio: j.AspectRatio, Resolution: j.Resolution, Seed: j.Seed, N: j.Count, defaults: defaults, recovered: defaults == nil}
 	for _, r := range j.Refs {
 		data, err := readPicture(r.File)
 		if err != nil {
@@ -484,8 +511,14 @@ func (m *Manager) run(ctx context.Context, id string) {
 		m.fail(id, err.Error(), zero())
 		return
 	}
-	cost, fromEstimate := CostUSD(j.Model, reply.Usage), false
-	if !reply.HasUsage {
+	// A cost the endpoint reported is the real charge; token usage is priced locally; otherwise the job keeps its estimate.
+	cost, fromEstimate := 0.0, false
+	switch {
+	case reply.HasCost:
+		cost = reply.CostUSD
+	case reply.HasUsage:
+		cost = CostUSD(j.Model, reply.Usage)
+	default:
 		cost, fromEstimate = j.EstimateUSD, true
 	}
 	cost = round4(cost)

@@ -130,7 +130,47 @@ func TestCandidateSheetLaysOutAndNumbers(t *testing.T) {
 	if img.Bounds().Dx() != 2*512+3*8 || img.Bounds().Dy() != 2*512+3*8 {
 		t.Fatalf("sheet is %v", img.Bounds())
 	}
+	// The gutter between cells is checked, not a flat dark fill.
+	if p := color.NRGBAModel.Convert(img.At(512+4, 4)).(color.NRGBA); p != checkerLight && p != checkerDark {
+		t.Fatalf("gutter pixel = %+v, want a checker colour", p)
+	}
 	if _, err := CandidateSheet(Job{ID: "j9"}); err == nil {
 		t.Fatal("made a sheet of nothing")
+	}
+}
+
+func TestCandidateSheetShowsAlphaOnChecker(t *testing.T) {
+	s, _ := newStore(t)
+	job, _ := s.Create(Job{})
+	added, err := s.attach(job, [][]byte{discPNG(t, 300, 300, color.NRGBA{0, 0, 0, 0})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job.Candidates = added
+	data, err := CandidateSheet(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img.Bounds().Dx() != 1024+2*8 || img.Bounds().Dy() != 1024+2*8 {
+		t.Fatalf("sheet is %v", img.Bounds())
+	}
+	// The picture is centred in a 1024 cell from (8,8): its transparent top-left is at (8+362, 8+362).
+	x, y := 8+362, 8+362
+	first := color.NRGBAModel.Convert(img.At(x, y)).(color.NRGBA)
+	if first != checkerLight && first != checkerDark {
+		t.Fatalf("transparent pixel = %+v, want a light checker colour", first)
+	}
+	// A neighbouring square has the other colour, so alpha reads as a checker rather than a flat fill.
+	next := color.NRGBAModel.Convert(img.At(x+checkerSize, y)).(color.NRGBA)
+	if next == first {
+		t.Fatalf("adjacent checker squares share %+v", first)
+	}
+	// Nothing in the sheet is left transparent.
+	if a := color.NRGBAModel.Convert(img.At(x, y)).(color.NRGBA).A; a != 255 {
+		t.Fatalf("alpha under the sprite = %d", a)
 	}
 }

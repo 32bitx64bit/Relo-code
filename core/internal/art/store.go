@@ -39,22 +39,25 @@ type Candidate struct {
 
 // Job is one image generation or edit. The JSON form is the file form.
 type Job struct {
-	ID         string      `json:"id"`
-	SessionID  string      `json:"sessionId"`
-	AgentID    string      `json:"agentId"`
-	State      string      `json:"state"`
-	Prompt     string      `json:"prompt"`
-	Model      string      `json:"model"`
-	Quality    string      `json:"quality"`
-	Size       string      `json:"size"`
-	Background string      `json:"background"`
-	Count      int         `json:"count"`
-	Refs       []Ref       `json:"refs"`
-	Candidates []Candidate `json:"candidates"`
-	Dir        string      `json:"dir"`
-	Message    string      `json:"message,omitempty"`
-	CreatedAt  time.Time   `json:"createdAt"`
-	UpdatedAt  time.Time   `json:"updatedAt"`
+	ID          string      `json:"id"`
+	SessionID   string      `json:"sessionId"`
+	AgentID     string      `json:"agentId"`
+	State       string      `json:"state"`
+	Prompt      string      `json:"prompt"`
+	Model       string      `json:"model"`
+	Quality     string      `json:"quality"`
+	Size        string      `json:"size"`
+	Background  string      `json:"background"`
+	AspectRatio string      `json:"aspectRatio,omitempty"`
+	Resolution  string      `json:"resolution,omitempty"`
+	Seed        *int64      `json:"seed,omitempty"`
+	Count       int         `json:"count"`
+	Refs        []Ref       `json:"refs"`
+	Candidates  []Candidate `json:"candidates"`
+	Dir         string      `json:"dir"`
+	Message     string      `json:"message,omitempty"`
+	CreatedAt   time.Time   `json:"createdAt"`
+	UpdatedAt   time.Time   `json:"updatedAt"`
 
 	// EstimateUSD is the conservative price worked out before the call. CostUSD is what the call cost, from the usage
 	// the endpoint reported; it is nil while that is unknown (a call that was cut off may or may not have been billed),
@@ -87,6 +90,10 @@ func (j Job) clone() Job {
 	c := j
 	c.Refs = append([]Ref(nil), j.Refs...)
 	c.Candidates = append([]Candidate(nil), j.Candidates...)
+	if j.Seed != nil {
+		v := *j.Seed
+		c.Seed = &v
+	}
 	if j.CostUSD != nil {
 		v := *j.CostUSD
 		c.CostUSD = &v

@@ -9,6 +9,7 @@ Relo calls the API itself, from the core, with a provider and key you already ga
 | Provider kind | Pictures |
 |---|---|
 | `openai` | Yes: any endpoint that implements `POST {baseURL}/images/generations` and `/images/edits` and answers with base64 pictures (`data[].b64_json`). OpenAI's own does. A router or proxy works if it passes those paths through |
+| `openrouter` | Yes: every job (text-only or with references) is one or more `POST {baseURL}/images` calls, with references as ordered `input_references` image_url data URLs and pictures read from `data[].b64_json`. The reply's `media_type` decides the picture: PNG, JPEG and WebP are accepted, JPEG and WebP are converted to PNG, and any other type fails the job with the type named. `GET {baseURL}/images/models` is checked first (cached for 10 minutes): a listed model that lacks `input_references`, or an explicit `size`/`quality`/`background`/`aspect_ratio`/`resolution`/`seed` it does not support, is refused before anything is spent; settings the user left at their defaults are dropped when unsupported. A failed model list or an unlisted model lets the call through. Each job's pictures cost what `usage.cost` reports in total, or the estimate when the provider reports none |
 | `anthropic` | **No.** Anthropic's API only reads images. Its [vision documentation](https://platform.claude.com/docs/en/build-with-claude/vision) says Claude "cannot generate, produce, edit, manipulate, or create images". Choosing an Anthropic provider for pictures is an error that says so. Claude can still be the model that plans and judges the pictures; it just cannot draw them |
 
 An endpoint that answers with links instead of picture data is refused (Relo does not fetch links). If your router does not expose the image paths, or turns your key into a subscription route, pictures will fail with a message that names the status and path.
@@ -63,14 +64,28 @@ The numbers are not a billing system. Your provider's usage page is the record. 
 
 | Action | Does |
 |---|---|
-| `status` | Is it set up (and if not, why not), the model, the defaults, the budget left. It never shows the endpoint or key |
-| `playbook` | The guide: `overview`, `prompts`, `refs`, `sprites`, `views`, `iterate`, `cost`. On demand, so it is not in every prompt |
+| `status` | Is it set up (and if not, why not), the model, the defaults, the budget left, and the model's supported parameters when the provider publishes them (`supported_parameters`; `unknown` otherwise). It never shows the endpoint or key |
+| `playbook` | The guide: `overview`, `prompts`, `refs`, `sprites`, `views`, `game-dev uses`, `iterate`, `cost`, `jobs`. On demand, so it is not in every prompt |
 | `refs` | Store reference pictures from workspace files or from earlier jobs' pictures; returns an id for each |
-| `generate` | Start a job: `prompt`, optional `refs` (ids, in the order the prompt may call them image 1, image 2, ...), `quality`, `size`, `background` (`auto`, `transparent`, `opaque`) and `count`. Returns at once |
+| `generate` | Start a job: `prompt`, optional `refs` (ids, in the order the prompt may call them image 1, image 2, ...), `quality`, `size`, `background` (`auto`, `transparent`, `opaque`), `count`, and, for OpenRouter, `params` with `aspect_ratio`, `resolution` and `seed`. Returns at once |
 | `wait` | Block up to 45 seconds on a job. When it is ready it returns the pictures as one numbered sheet, with the real cost |
 | `cancel`, `jobs` | Stop a job, list this session's jobs and the budget |
 
-A job without references is a plain generation (`/images/generations`). With references it is an edit (`/images/edits`): the model starts from the pictures and the prompt says what to do with them. That is how a set of items is kept in one style, and how another view of a finished item is made.
+A job without references is a plain generation and one with references is an edit: on an OpenAI-style provider that is `/images/generations` and `/images/edits`; an OpenRouter provider uses its one image endpoint for both (see the provider table). With references the model starts from the pictures, and the prompt says what to do with them. That is how a set of items is kept in one style, and how another view of a finished item is made.
+
+### Parameters that depend on the model
+
+`aspect_ratio` (`N:N`), `resolution` (1 to 16 ASCII letters or digits) and `seed` (a nonnegative integer) are optional OpenRouter parameters. Relo validates only their shape, so the accepted values come from the model, not from Relo. Before a job it reads the provider's published `supported_parameters` for the chosen model (cached for 10 minutes). For a listed model it refuses the job before sending a picture request when the model's list does not name a parameter the agent set; `size`, `quality` and `background` that the user left at their defaults are dropped instead when they are not listed. When the model is unlisted, or the model list cannot be fetched, nothing is checked in advance: the parameter is sent and the provider decides, so the job fails loudly if it rejects it. A provider kind that does not accept these parameters refuses the job before it is created.
+
+`status` reports these capabilities as `supported_parameters`: the chosen model's list when the provider publishes it, or `unknown`. Reference support and how many references a model takes vary the same way; Relo allows up to 6.
+
+### Game-dev uses
+
+The playbook's `game-dev uses` topic covers the common assets: sprites and sheets (one object per picture, or a drawn grid the agent slices with `relo_sprite`), tilesets (a grid sliced with `cols`/`rows`, checked at the final pixel size), seamless textures, backgrounds and skyboxes, and UI pieces such as panels, buttons and frames. Existing art, a finished sprite or a screenshot of the running game can be stored with `refs` and used with a role (`style`, `subject`, `composition`) to edit it or make variations of it; a reference guides style, subject, proportions and palette and is not a copy, so text and exact layouts still need checking.
+
+### Picture formats
+
+The answer's `media_type` decides what can be stored: PNG is used as is, JPEG and WebP are converted to PNG for the job and the sheet, and any other media type, an SVG for example, fails the job with the type named in the error. Relo asks for PNG output where the model lists that parameter. Like reference counts, the format a model actually returns varies by model.
 
 Jobs are asynchronous because a picture can take a minute or two and the hub's calls time out after one. The agent calls `generate`, then `wait` until the job is `ready`, `failed` or `cancelled`. A job belongs to the session, not to the agent's key, so another turn can wait on it. Refining a picture is a new job with the old one as a reference.
 
@@ -104,6 +119,8 @@ After a restart, a job that was waiting for your approval asks again. A job that
 
 - **No call to the real API has been made.** The tests run against a local stand-in that follows OpenAI's documented request and response shapes. `RELO_E2E_IMAGES=1` runs one cheap real call (see below); until someone does, expect to adjust.
 - Whether the 2.5 models accept `background: "transparent"`, how many references `/images/edits` takes (Relo allows 6), and the real per-picture cost of the 2.5 models (OpenAI publishes tokens, not pictures).
+- The values each OpenRouter model accepts for `aspect_ratio` and `resolution`, and whether it accepts `seed`, are known only from the provider's published `supported_parameters`; Relo checks shape, not the model's accepted range.
+- Which media types a real model returns: the tests cover PNG, JPEG, WebP and the rejection of an SVG against local stand-ins, and an unexpected type fails the job rather than being converted.
 - Whether OpenCode's MCP call timeout is longer than the 45 seconds a `wait` may block (the default `wait` is 25).
 - The model names and prices were read from OpenAI's documentation on 2026-10-26.
 

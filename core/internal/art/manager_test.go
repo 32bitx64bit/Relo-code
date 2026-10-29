@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image/color"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +16,71 @@ import (
 	"testing"
 	"time"
 )
+
+func TestArtStatusCapabilitiesAndRecoveredParameters(t *testing.T) {
+	var received = make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodGet {
+			fmt.Fprint(w, `{"data":[{"id":"`+DefaultModel+`","supported_parameters":{"aspect_ratio":{"type":"enum","values":["3:2","16:9"]},"resolution":{"type":"enum","values":["1K","2K"]},"seed":{"type":"boolean"}}}]}`)
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(req.Body).Decode(&body)
+		received <- body
+		fmt.Fprint(w, `{"data":[{"b64_json":"YQ==","media_type":"image/svg+xml"}]}`)
+	}))
+	defer server.Close()
+	mod := func(s *Settings) { s.Provider = "openrouter" }
+	r := newRig(t, mod)
+	r.endpoint = func(string) (Endpoint, error) { return Endpoint{BaseURL: server.URL, Provider: "openrouter"}, nil }
+	status := r.m.Status("s1")
+	params, ok := status.SupportedParameters.([]string)
+	if !ok || !contains(params, "seed") {
+		t.Fatalf("status capabilities=%v", status.SupportedParameters)
+	}
+	r.m.hooks.Approve = func(ctx context.Context, a Approval) (string, error) { <-ctx.Done(); return "reject", ctx.Err() }
+	seed := int64(0)
+	j := r.generate(GenerateInput{AspectRatio: "3:2", Resolution: "2K", Seed: &seed, Count: 1})
+	r.m.Close()
+	r.open(mod)
+	t.Cleanup(r.m.Close)
+	r.endpoint = func(string) (Endpoint, error) { return Endpoint{BaseURL: server.URL, Provider: "openrouter"}, nil }
+	r.m.Recover()
+	done := r.finish(j.ID)
+	if done.State != StateFailed || !strings.Contains(done.Message, "image/svg+xml") || done.Seed == nil || *done.Seed != 0 || done.AspectRatio != "3:2" || done.Resolution != "2K" {
+		t.Fatalf("recovered job=%+v", done)
+	}
+	body := <-received
+	if body["aspect_ratio"] != "3:2" || body["resolution"] != "2K" || body["seed"] != float64(0) {
+		t.Fatal("recovered parameters not sent")
+	}
+	r.endpoint = func(string) (Endpoint, error) {
+		return Endpoint{BaseURL: "http://127.0.0.1:1", Provider: "openrouter"}, nil
+	}
+	if got := r.m.Status("s1").SupportedParameters; got != "unknown" {
+		t.Fatalf("failed listing capabilities=%v", got)
+	}
+}
+
+func TestArtNewParameterValidation(t *testing.T) {
+	r := newRig(t, nil)
+	negative := int64(-1)
+	zero := int64(0)
+	for _, tc := range []struct {
+		input GenerateInput
+		want  string
+	}{
+		{GenerateInput{Prompt: "p", AspectRatio: "1/1"}, "aspect_ratio"},
+		{GenerateInput{Prompt: "p", Resolution: "too-long-resolution"}, "resolution"},
+		{GenerateInput{Prompt: "p", Seed: &negative}, "seed"},
+		{GenerateInput{Prompt: "p", Seed: &zero}, "only supported for OpenRouter"},
+	} {
+		_, err := r.m.Generate(context.Background(), tc.input)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("expected %s: %v", tc.want, err)
+		}
+	}
+}
 
 // rig is a manager wired to a fake API.
 type rig struct {
@@ -537,5 +604,41 @@ func TestListIsNewestFirst(t *testing.T) {
 	list := r.m.List(1)
 	if len(list) != 1 || list[0].ID != b.ID || a.ID == b.ID {
 		t.Fatalf("list = %+v", list)
+	}
+}
+
+func TestAJobKeepsItsOwningSessionAcrossReopen(t *testing.T) {
+	r := newRig(t, nil)
+	j := r.finish(r.generate(GenerateInput{SessionID: "owner-1", Count: 1}).ID)
+	r.m.Close()
+	r.open(nil)
+	t.Cleanup(r.m.Close)
+	got, ok := r.m.Get(j.ID)
+	if !ok || got.SessionID != "owner-1" {
+		t.Fatalf("reopened job = %+v ok=%v, want SessionID owner-1", got, ok)
+	}
+}
+
+// A limit nobody set (a fresh manager, or a negative value) is the default of 25 jobs, and the 26th is refused. Only an
+// explicit 0 lifts the cap (TestUnlimitedMeansNoBudgetAndNoJobCap).
+func TestUnsetOrNegativeJobLimitIsTwentyFive(t *testing.T) {
+	for name, mod := range map[string]func(*Settings){
+		"unset": func(s *Settings) {
+			*s = normalize(Settings{Enabled: true, BudgetUSD: DefaultBudgetUSD, SessionJobLimit: DefaultJobLimit})
+		},
+		"negative": func(s *Settings) { s.BudgetUSD, s.SessionJobLimit = 1000, -1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t, mod)
+			if b := r.m.Budget("s1"); b.JobsUnlimited || b.SessionJobLimit != 25 {
+				t.Fatalf("budget = %+v", b)
+			}
+			for i := 0; i < 25; i++ {
+				r.finish(r.generate(GenerateInput{Count: 1, Quality: "low"}).ID)
+			}
+			if _, err := r.m.Generate(context.Background(), GenerateInput{SessionID: "s1", Prompt: "p"}); err == nil || !strings.Contains(err.Error(), "25 of the 25 jobs") {
+				t.Fatalf("the 26th job should be refused, err = %v", err)
+			}
+		})
 	}
 }
