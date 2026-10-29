@@ -222,40 +222,6 @@ func TestV2AuthenticationRequired(t *testing.T) {
 	}
 }
 
-func TestTurnTimeoutInterruptsAndReportsError(t *testing.T) {
-	interrupted := make(chan struct{}, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/session/ses_timeout/interrupt" {
-			http.NotFound(w, r)
-			return
-		}
-		interrupted <- struct{}{}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer srv.Close()
-	c := NewClientWithAuth(srv.URL, "opencode", "secret")
-	defer c.Close()
-	s := &subscription{ch: make(chan runtime.Event, 2), stop: make(chan struct{}), notify: make(chan struct{}, 1)}
-	c.mu.Lock()
-	c.subs["ses_timeout"] = []*subscription{s}
-	c.mu.Unlock()
-	go c.deliver(s)
-	c.startTurnTimer("ses_timeout", 1)
-	select {
-	case <-interrupted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout did not interrupt session")
-	}
-	select {
-	case ev := <-s.ch:
-		if !strings.Contains(ev.Error, "timed out after 1s") {
-			t.Fatalf("timeout event: %+v", ev)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout error event missing")
-	}
-}
-
 func TestTerminalEventsNeverDropped(t *testing.T) {
 	c := NewClient("http://localhost")
 	s := &subscription{ch: make(chan runtime.Event, 1), stop: make(chan struct{}), notify: make(chan struct{}, 1)}
@@ -613,56 +579,6 @@ func TestSucceededThenIdleEmitsSingleDone(t *testing.T) {
 		`{"id":"e2","type":"session.idle","data":{"sessionID":"ses_d"}}`)
 	if done := doneEvents(evs); len(done) != 1 {
 		t.Fatalf("want exactly one Done, got %d: %+v", len(done), evs)
-	}
-}
-
-func TestStaleTimerDoesNotCancelNextTurn(t *testing.T) {
-	var mu sync.Mutex
-	interrupts := 0
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/session/ses_t/interrupt", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		interrupts++
-		mu.Unlock()
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("true"))
-	})
-	mux.HandleFunc("/api/session/ses_t/agent", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("/api/session/ses_t/prompt", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-	c := NewClientWithAuth(srv.URL, "opencode", "secret")
-	defer c.Close()
-	// turn 1 times out later; it errors before its timer fires, leaving no timer behind
-	c.startTurnTimer("ses_t", 1)
-	dispatchCollect(t, c, "ses_t", `{"id":"e1","type":"session.error","data":{"sessionID":"ses_t","message":"x"}}`)
-	c.mu.Lock()
-	if c.timers["ses_t"] != nil {
-		c.mu.Unlock()
-		t.Fatal("timer survived terminal event")
-	}
-	c.timers["ses_t"] = time.AfterFunc(time.Hour, func() {}) // simulate a stale leftover timer
-	c.mu.Unlock()
-	// turn 2 has no timeout; SendTask must clear the stale timer so it cannot interrupt turn 2
-	if err := c.SendTask(context.Background(), "ses_t", runtime.AgentTask{Prompt: "next"}); err != nil {
-		t.Fatal(err)
-	}
-	c.mu.Lock()
-	if c.timers["ses_t"] != nil {
-		c.mu.Unlock()
-		t.Fatal("SendTask left stale timer")
-	}
-	c.mu.Unlock()
-	time.Sleep(50 * time.Millisecond)
-	mu.Lock()
-	defer mu.Unlock()
-	if interrupts != 0 {
-		t.Fatalf("stale timer interrupted newer turn: %d", interrupts)
 	}
 }
 

@@ -48,7 +48,6 @@ type Client struct {
 	instr            map[string]string
 	locations        map[string]string
 	agents           map[string]string
-	timers           map[string]*time.Timer
 	turnDone         map[string]bool // terminal event already emitted for the session's current turn
 	messageMu        sync.Mutex
 	messageLocations map[string]string
@@ -65,7 +64,7 @@ func NewClientWithAuth(base, username, password string) *Client {
 	return &Client{
 		Base: strings.TrimRight(base, "/"), HTTP: &http.Client{Timeout: 30 * time.Second},
 		Username: username, Password: password, subs: map[string][]*subscription{},
-		models: map[string]string{}, efforts: map[string]string{}, instr: map[string]string{}, locations: map[string]string{}, agents: map[string]string{}, timers: map[string]*time.Timer{},
+		models: map[string]string{}, efforts: map[string]string{}, instr: map[string]string{}, locations: map[string]string{}, agents: map[string]string{},
 		turnDone: map[string]bool{},
 	}
 }
@@ -174,7 +173,6 @@ func (c *Client) StartSession(ctx context.Context, cfg runtime.SessionConfig) (r
 
 func (c *Client) SendTask(ctx context.Context, session runtime.SessionID, task runtime.AgentTask) error {
 	sid := string(session)
-	c.stopTurnTimer(sid) // a timer left by a previous turn must not cancel this one
 	c.mu.Lock()
 	delete(c.turnDone, sid) // new turn: its terminal event is not yet claimed
 	dir := task.Directory
@@ -260,52 +258,13 @@ func (c *Client) SendTask(ctx context.Context, session runtime.SessionID, task r
 		return err
 	}
 	body := map[string]any{"text": task.Prompt}
-	c.startTurnTimer(sid, task.TimeoutSec)
 	if _, err := c.request(ctx, http.MethodPost, "/api/session/"+url.PathEscape(sid)+"/prompt", body, nil, false); err != nil {
-		c.stopTurnTimer(sid)
 		return err
 	}
 	return nil
 }
 
-func (c *Client) startTurnTimer(session string, timeoutSec int) {
-	if timeoutSec <= 0 {
-		return
-	}
-	c.mu.Lock()
-	if old := c.timers[session]; old != nil {
-		old.Stop()
-	}
-	var timer *time.Timer
-	timer = time.AfterFunc(time.Duration(timeoutSec)*time.Second, func() {
-		c.mu.Lock()
-		if c.timers[session] != timer || !c.claimTurn(session) {
-			c.mu.Unlock()
-			return
-		}
-		c.mu.Unlock()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := c.Cancel(ctx, runtime.SessionID(session)); err != nil {
-			c.broadcast(session, runtime.Event{Type: "session.error", Session: session, Done: true, Error: fmt.Sprintf("agent timed out after %ds; interrupt failed: %v", timeoutSec, err)})
-			return
-		}
-		c.broadcast(session, runtime.Event{Type: "session.error", Session: session, Done: true, Error: fmt.Sprintf("agent timed out after %ds", timeoutSec)})
-	})
-	c.timers[session] = timer
-	c.mu.Unlock()
-}
-
-func (c *Client) stopTurnTimer(session string) {
-	c.mu.Lock()
-	if timer := c.timers[session]; timer != nil {
-		timer.Stop()
-		delete(c.timers, session)
-	}
-	c.mu.Unlock()
-}
-
-// claimTurn marks the session's current turn as terminated and stops its timer.
+// claimTurn marks the session's current turn as terminated.
 // It returns false if a terminal event was already emitted for this turn.
 // Caller must hold c.mu.
 func (c *Client) claimTurn(session string) bool {
@@ -313,10 +272,6 @@ func (c *Client) claimTurn(session string) bool {
 		return false
 	}
 	c.turnDone[session] = true
-	if timer := c.timers[session]; timer != nil {
-		timer.Stop()
-		delete(c.timers, session)
-	}
 	return true
 }
 
@@ -491,7 +446,7 @@ func (c *Client) ConfigureMessages(ctx context.Context, directory string, tools 
 }
 
 // DeliverMessage injects one peer message into a session as a steering synthetic part. It deliberately does not
-// touch the turn state, timers, model, or system prompt; delivery alone must never start or end a turn.
+// touch the turn state, model, or system prompt; delivery alone must never start or end a turn.
 func (c *Client) DeliverMessage(ctx context.Context, session runtime.SessionID, id, text string) error {
 	body := map[string]any{
 		"text":        text,
@@ -506,10 +461,6 @@ func (c *Client) DeliverMessage(ctx context.Context, session runtime.SessionID, 
 func (c *Client) CloseSession(ctx context.Context, session runtime.SessionID) error {
 	sid := string(session)
 	c.mu.Lock()
-	if timer := c.timers[sid]; timer != nil {
-		timer.Stop()
-		delete(c.timers, sid)
-	}
 	for _, sub := range c.subs[sid] {
 		sub.once.Do(func() { close(sub.stop) })
 	}
@@ -689,10 +640,6 @@ func (c *Client) Close() error {
 		for _, s := range subs {
 			s.once.Do(func() { close(s.stop) })
 		}
-	}
-	for sid, timer := range c.timers {
-		timer.Stop()
-		delete(c.timers, sid)
 	}
 	c.subs = map[string][]*subscription{}
 	c.mu.Unlock()

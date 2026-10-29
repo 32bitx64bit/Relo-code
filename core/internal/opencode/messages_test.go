@@ -184,11 +184,9 @@ func TestDeliverMessagePostsSyntheticSteerOnly(t *testing.T) {
 	c := NewClientWithAuth(srv.URL, "opencode", "secret")
 	defer c.Close()
 	ctx := context.Background()
-	// A turn timer and a claimed turn must survive delivery untouched.
-	c.startTurnTimer("ses_m", 3600)
+	// A claimed turn must survive delivery untouched.
 	c.mu.Lock()
 	c.turnDone["ses_m"] = true
-	timer := c.timers["ses_m"]
 	c.mu.Unlock()
 
 	if err := c.DeliverMessage(ctx, runtime.SessionID("ses_m"), "msg_1", "hello peer"); err != nil {
@@ -213,11 +211,8 @@ func TestDeliverMessagePostsSyntheticSteerOnly(t *testing.T) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.turnDone["ses_m"] || c.timers["ses_m"] != timer || timer == nil {
-		t.Fatalf("delivery changed turn state: turnDone=%v timer kept=%v", c.turnDone["ses_m"], c.timers["ses_m"] == timer)
-	}
-	if timer != nil {
-		timer.Stop()
+	if !c.turnDone["ses_m"] {
+		t.Fatal("delivery changed turn state")
 	}
 }
 
