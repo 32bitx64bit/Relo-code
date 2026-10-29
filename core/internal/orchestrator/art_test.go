@@ -18,6 +18,7 @@ import (
 	"github.com/relocode/relo/internal/agent"
 	"github.com/relocode/relo/internal/agentmsg"
 	"github.com/relocode/relo/internal/art"
+	"github.com/relocode/relo/internal/logging"
 	"github.com/relocode/relo/internal/runtime"
 	"github.com/relocode/relo/internal/sprite"
 )
@@ -244,7 +245,7 @@ func TestArtStatusAndPlaybook(t *testing.T) {
 	if budget["limitUsd"] != float64(3) || budget["sessionJobLimit"] != float64(8) || budget["remainingUsd"] != float64(3) {
 		t.Fatalf("budget = %v", budget)
 	}
-	if topics, _ := meta["playbookTopics"].([]any); len(topics) != 7 {
+	if topics, _ := meta["playbookTopics"].([]any); len(topics) != 9 {
 		t.Fatalf("topics = %v", meta["playbookTopics"])
 	}
 	for _, leak := range []string{"SECRET", "api.openai", f.api.srv.URL} {
@@ -288,7 +289,7 @@ func TestArtLoopFromReferenceToSprite(t *testing.T) {
 	}
 	refID := list[0].(map[string]any)["id"].(string)
 
-	started := f.mustCall(t, agentmsg.ArtRequest{Action: "generate", Prompt: "match image 1: a single iron ingot, flat solid magenta background", Refs: []string{refID}, Quality: "low"})
+	started := f.mustCall(t, agentmsg.ArtRequest{Action: "generate", Prompt: "match image 1: a single iron ingot, flat solid magenta background", Refs: []agentmsg.ArtRef{{ID: refID, Role: "style"}}, Quality: "low"})
 	id := jobIDOf(t, started)
 	if meta := imageMetadata(t, agentmsg.ImageResult{Text: started.Text}); meta["references"] != float64(1) || meta["estimateUsd"].(float64) <= 0 || meta["budget"] == nil {
 		t.Fatalf("started = %v", meta)
@@ -308,6 +309,9 @@ func TestArtLoopFromReferenceToSprite(t *testing.T) {
 	rm := imageMetadata(t, agentmsg.ImageResult{Text: ready.Text})
 	if rm["state"] != art.StateReady || len(ready.Images) != 1 || rm["costUsd"].(float64) <= 0 {
 		t.Fatalf("ready = %v, images %d", rm, len(ready.Images))
+	}
+	if v, ok := rm["costFromEstimate"]; !ok || v != false {
+		t.Fatalf("costFromEstimate = %v (present %v), want false for a job the endpoint priced", v, ok)
 	}
 	pics := rm["files"].([]any)
 	if len(pics) != 2 || pics[1].(map[string]any)["path"] != ".relo/art/raw/"+id+"/2.png" {
@@ -461,7 +465,8 @@ func TestArtUnlimitedLimitsLetTheWorkContinue(t *testing.T) {
 func TestArtRefusesBadRequestsBeforeSpending(t *testing.T) {
 	f := newArtFixture(t, agent.Worker, "p/seeing", true, nil)
 	for name, req := range map[string]agentmsg.ArtRequest{
-		"unknown ref":    {Action: "generate", Prompt: "an ingot", Refs: []string{"r_missing"}},
+		"unknown ref":    {Action: "generate", Prompt: "an ingot", Refs: []agentmsg.ArtRef{{ID: "r_missing"}}},
+		"param flag":     {Action: "generate", Prompt: "an ingot --sref r_1"},
 		"bad quality":    {Action: "generate", Prompt: "an ingot", Quality: "ultra"},
 		"bad size":       {Action: "generate", Prompt: "an ingot", Size: "5000x5000"},
 		"wait missing":   {Action: "wait", Job: "j99"},
@@ -617,4 +622,141 @@ func TestArtProvenancePathCannotEscapeOrCollide(t *testing.T) {
 		}
 	}
 	_ = sprite.MaxOps
+}
+
+func TestArtPromptStatesEachReferenceRoleAndWeight(t *testing.T) {
+	prompt, ids := agentmsg.ArtPromptWithRefs("  an ingot  ", []agentmsg.ArtRef{{ID: "r_1", Role: "style", Weight: 0.5}, {ID: "r_2"}, {ID: "r_3", Role: "composition"}})
+	want := "an ingot\nReferences: image 1: style reference (weight 0.5); image 2: reference; image 3: composition reference."
+	if prompt != want || strings.Join(ids, ",") != "r_1,r_2,r_3" {
+		t.Fatalf("prompt = %q ids = %v", prompt, ids)
+	}
+	if p, ids := agentmsg.ArtPromptWithRefs("an ingot", nil); p != "an ingot" || ids != nil {
+		t.Fatalf("without refs prompt = %q ids = %v", p, ids)
+	}
+}
+
+func TestArtFailedRefsJobSaysStopAndReport(t *testing.T) {
+	f := newArtFixture(t, agent.Worker, "p/seeing", true, nil)
+	writeDiscs(t, filepath.Join(f.session, "art", "ref", "style.png"), 1)
+	refs := imageMetadata(t, agentmsg.ImageResult{Text: f.mustCall(t, agentmsg.ArtRequest{Action: "refs", Sources: []agentmsg.ArtSource{{Path: "art/ref/style.png"}}}).Text})
+	refID := refs["refs"].([]any)[0].(map[string]any)["id"].(string)
+
+	f.api.mu.Lock()
+	f.api.fail = 401
+	f.api.mu.Unlock()
+	id := jobIDOf(t, f.mustCall(t, agentmsg.ArtRequest{Action: "generate", Prompt: "an ingot", Refs: []agentmsg.ArtRef{{ID: refID, Role: "style"}}}))
+	f.waitState(t, id, art.StateFailed)
+	meta := imageMetadata(t, f.mustCall(t, agentmsg.ArtRequest{Action: "wait", Job: id}))
+	if next, _ := meta["next"].(string); !strings.Contains(next, "Stop and report") || !strings.Contains(next, "never retry it text-only") {
+		t.Fatalf("next = %q", next)
+	}
+}
+
+func TestArtThirdIdenticalPromptIsRefused(t *testing.T) {
+	f := newArtFixture(t, agent.Worker, "p/seeing", true, nil)
+	f.api.mu.Lock()
+	f.api.fail = 401
+	f.api.mu.Unlock()
+	gen := agentmsg.ArtRequest{Action: "generate", Prompt: "an ingot, flat solid magenta background"}
+	for i := 1; i <= maxIdenticalArtPrompts; i++ {
+		jobIDOf(t, f.mustCall(t, gen))
+	}
+	if _, err := f.call(gen); err == nil || !strings.Contains(err.Error(), "already sent") {
+		t.Fatalf("third identical prompt: err = %v", err)
+	}
+	if _, err := f.call(agentmsg.ArtRequest{Action: "generate", Prompt: "a different ingot"}); err != nil {
+		t.Fatalf("different prompt refused: %v", err)
+	}
+}
+
+func TestArtWaitAndRefsAreLimitedToTheSessionsOwnJobs(t *testing.T) {
+	f := newArtFixture(t, agent.Worker, "p/seeing", true, nil)
+	id := f.readyJob(t, agentmsg.ArtRequest{})
+	m := f.manager(t)
+	own, _ := m.Get(id)
+	for _, owner := range []string{"someone-else", ""} {
+		if _, err := m.Store().Update(id, func(j *art.Job) { j.SessionID = owner }); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.call(agentmsg.ArtRequest{Action: "wait", Job: id}); err == nil || !strings.Contains(err.Error(), "belongs to another session") {
+			t.Fatalf("waited on job with owner %q: %v", owner, err)
+		}
+		if _, err := f.call(agentmsg.ArtRequest{Action: "refs", Sources: []agentmsg.ArtSource{{Job: id, Index: 1}}}); err == nil || !strings.Contains(err.Error(), "belongs to another session") {
+			t.Fatalf("stored a picture of job with owner %q: %v", owner, err)
+		}
+		if _, err := f.call(agentmsg.ArtRequest{Action: "cancel", Job: id}); err == nil || !strings.Contains(err.Error(), "belongs to another session") {
+			t.Fatalf("cancelled job with owner %q: %v", owner, err)
+		}
+	}
+	// Back to the caller's own session: the same job can be waited on again.
+	if _, err := m.Store().Update(id, func(j *art.Job) { j.SessionID = own.SessionID }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.call(agentmsg.ArtRequest{Action: "wait", Job: id}); err != nil {
+		t.Fatalf("own job refused: %v", err)
+	}
+}
+
+func TestArtJobsHidesOwnerlessJobs(t *testing.T) {
+	f := newArtFixture(t, agent.Worker, "p/seeing", true, nil)
+	id := f.readyJob(t, agentmsg.ArtRequest{Prompt: "orphan"})
+	if _, err := f.manager(t).Store().Update(id, func(j *art.Job) { j.SessionID = "" }); err != nil {
+		t.Fatal(err)
+	}
+	meta := imageMetadata(t, agentmsg.ImageResult{Text: f.mustCall(t, agentmsg.ArtRequest{Action: "jobs"}).Text})
+	if jobs, _ := meta["jobs"].([]any); len(jobs) != 0 {
+		t.Fatalf("jobs = %v", jobs)
+	}
+}
+
+func TestArtConcurrentIdenticalPromptsStayWithinTheCap(t *testing.T) {
+	f := newArtFixture(t, agent.Worker, "p/seeing", true, nil)
+	f.api.mu.Lock()
+	f.api.fail = 401
+	f.api.mu.Unlock()
+	gen := agentmsg.ArtRequest{Action: "generate", Prompt: "an ingot, racing the cap"}
+	const callers = 8
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make([]error, callers)
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, errs[i] = f.call(gen)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	ok := 0
+	for _, err := range errs {
+		if err == nil {
+			ok++
+		} else if !strings.Contains(err.Error(), "already sent") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if ok != maxIdenticalArtPrompts {
+		t.Fatalf("%d concurrent identical calls started jobs, want %d", ok, maxIdenticalArtPrompts)
+	}
+	jobs := f.manager(t).List(0)
+	if len(jobs) != maxIdenticalArtPrompts {
+		t.Fatalf("%d jobs recorded, want %d", len(jobs), maxIdenticalArtPrompts)
+	}
+}
+
+// A Coord that was never sent the art settings must not read the zero value as "no limits": 0 is the user turning a limit
+// off, so a limit nobody set has to be the default.
+func TestArtManagerBeforeAnySettingsArriveKeepsTheDefaultLimits(t *testing.T) {
+	c := New(logging.New(nil, logging.Error))
+	t.Cleanup(c.CloseArt)
+	m, err := c.artManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := m.Budget("s1")
+	if b.BudgetUnlimited || b.JobsUnlimited || b.LimitUSD != art.DefaultBudgetUSD || b.SessionJobLimit != art.DefaultJobLimit {
+		t.Fatalf("budget before settings = %+v, want the defaults %v and %d", b, art.DefaultBudgetUSD, art.DefaultJobLimit)
+	}
 }

@@ -3,8 +3,12 @@ package agentmsg
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sort"
 	"strings"
 	"testing"
+
+	"github.com/relocode/relo/internal/art"
 )
 
 func startArt(t *testing.T, h ArtHandler, opts ...Option) *Server {
@@ -28,6 +32,26 @@ func callArtTool(t *testing.T, s *Server, args map[string]any) map[string]any {
 
 func nopArt(context.Context, ArtRequest) (ImageResult, error) { return ImageResult{}, nil }
 
+func TestArtPromptParamHints(t *testing.T) {
+	for prompt, want := range map[string]string{"rock --ar 1:1": "params.aspect_ratio", "rock --aspect 1:1": "params.aspect_ratio", "rock --seed 4": "params.seed"} {
+		if err := ArtPromptError(prompt); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("hint for %q: %v", prompt, err)
+		}
+	}
+}
+
+func TestArtParameterValidationChecksShapeNotModelValues(t *testing.T) {
+	seed := int64(0)
+	request := ArtRequest{Key: "k", Action: "generate", Prompt: "p", Params: ArtParams{AspectRatio: "123:456", Resolution: "AbC123", Seed: &seed}}
+	if err := validateArtRequest(request); err != nil {
+		t.Fatalf("valid shapes refused: %v", err)
+	}
+	request.Params.Resolution = strings.Repeat("A", 17)
+	if err := validateArtRequest(request); err == nil || !strings.Contains(err.Error(), "resolution") {
+		t.Fatalf("long resolution accepted: %v", err)
+	}
+}
+
 func TestArtToolIsListedOnlyWhenRegistered(t *testing.T) {
 	if names := toolNames(t, startTest(t, echoHandler)); strings.Contains(strings.Join(names, ","), artToolName) {
 		t.Fatalf("art tool listed without WithArt: %v", names)
@@ -49,6 +73,7 @@ func TestArtToolPassesTheRequestAndReturnsTextThenPictures(t *testing.T) {
 		"prompt":  "a single iron ingot, flat solid magenta background",
 		"refs":    []any{"r_1", "r_2"},
 		"quality": "low", "size": "1536x1024", "background": "transparent", "count": 3,
+		"params": map[string]any{"aspect_ratio": "16:9", "resolution": "2K", "seed": 0},
 	})
 	if res["isError"] != false {
 		t.Fatalf("result = %v", res)
@@ -57,8 +82,9 @@ func TestArtToolPassesTheRequestAndReturnsTextThenPictures(t *testing.T) {
 	if len(content) != 2 || content[1].(map[string]any)["type"] != "image" {
 		t.Fatalf("content = %v", content)
 	}
-	if got.Key != "agent-key" || got.Action != "generate" || len(got.Refs) != 2 || got.Refs[1] != "r_2" ||
-		got.Quality != "low" || got.Size != "1536x1024" || got.Background != "transparent" || got.Count != 3 {
+	if got.Key != "agent-key" || got.Action != "generate" || len(got.Refs) != 2 || got.Refs[1].ID != "r_2" ||
+		got.Quality != "low" || got.Size != "1536x1024" || got.Background != "transparent" || got.Count != 3 ||
+		got.Params.AspectRatio != "16:9" || got.Params.Resolution != "2K" || got.Params.Seed == nil || *got.Params.Seed != 0 {
 		t.Fatalf("request = %+v", got)
 	}
 
@@ -83,6 +109,10 @@ func TestArtToolRejectsMalformedRequests(t *testing.T) {
 		"retired action vary":   {"key": "k", "action": "vary", "job": "j1", "index": 1},
 		"retired action budget": {"key": "k", "action": "budget"},
 		"retired field params":  {"key": "k", "action": "generate", "prompt": "x", "params": map[string]any{"aspect": "1:1"}},
+		"invalid aspect ratio":  {"key": "k", "action": "generate", "prompt": "x", "params": map[string]any{"aspect_ratio": "16/9"}},
+		"invalid resolution":    {"key": "k", "action": "generate", "prompt": "x", "params": map[string]any{"resolution": "2 K"}},
+		"negative seed":         {"key": "k", "action": "generate", "prompt": "x", "params": map[string]any{"seed": -1}},
+		"fractional seed":       {"key": "k", "action": "generate", "prompt": "x", "params": map[string]any{"seed": 1.5}},
 		"unknown field":         {"key": "k", "action": "status", "extra": 1},
 		"key too long":          {"key": strings.Repeat("k", 257), "action": "status"},
 		"generate no prompt":    {"key": "k", "action": "generate"},
@@ -90,7 +120,17 @@ func TestArtToolRejectsMalformedRequests(t *testing.T) {
 		"prompt too long":       {"key": "k", "action": "generate", "prompt": strings.Repeat("x", maxArtPrompt+1)},
 		"too many refs":         {"key": "k", "action": "generate", "prompt": "x", "refs": make([]any, MaxArtRefs+1)},
 		"ref id empty":          {"key": "k", "action": "generate", "prompt": "x", "refs": []any{""}},
-		"ref is an object":      {"key": "k", "action": "generate", "prompt": "x", "refs": []any{map[string]any{"id": "r", "role": "style"}}},
+		"ref role unknown":      {"key": "k", "action": "generate", "prompt": "x", "refs": []any{map[string]any{"id": "r", "role": "hat"}}},
+		"ref weight too big":    {"key": "k", "action": "generate", "prompt": "x", "refs": []any{map[string]any{"id": "r", "weight": 1.5}}},
+		"ref weight negative":   {"key": "k", "action": "generate", "prompt": "x", "refs": []any{map[string]any{"id": "r", "weight": -0.1}}},
+		"ref no id":             {"key": "k", "action": "generate", "prompt": "x", "refs": []any{map[string]any{"role": "style"}}},
+		"ref unknown field":     {"key": "k", "action": "generate", "prompt": "x", "refs": []any{map[string]any{"id": "r", "stylize": 100}}},
+		"two subjects":          {"key": "k", "action": "generate", "prompt": "x", "refs": []any{map[string]any{"id": "a", "role": "subject"}, map[string]any{"id": "b", "role": "subject"}}},
+		"prompt sref flag":      {"key": "k", "action": "generate", "prompt": "a rock --sref r_1"},
+		"prompt ar flag":        {"key": "k", "action": "generate", "prompt": "a rock\n--ar 16:9"},
+		"prompt stylize value":  {"key": "k", "action": "generate", "prompt": "a rock, stylize: 100"},
+		"prompt chaos number":   {"key": "k", "action": "generate", "prompt": "a rock chaos 20"},
+		"prompt raw flag":       {"key": "k", "action": "generate", "prompt": "a rock --raw"},
 		"count too many":        {"key": "k", "action": "generate", "prompt": "x", "count": 5},
 		"count negative":        {"key": "k", "action": "generate", "prompt": "x", "count": -1},
 		"quality not in list":   {"key": "k", "action": "generate", "prompt": "x", "quality": strings.Repeat("q", 21)},
@@ -185,5 +225,89 @@ func TestArtDescriptorListsEveryAction(t *testing.T) {
 	}
 	if desc := d["description"].(string); !strings.Contains(desc, "costs real money") || strings.Contains(desc, "Midjourney") {
 		t.Fatal("the description does not warn that jobs cost money, or still names another generator")
+	}
+}
+
+func TestArtRefsAcceptAnIdOrAnObjectWithRoleAndWeight(t *testing.T) {
+	var got ArtRequest
+	s := startArt(t, func(_ context.Context, req ArtRequest) (ImageResult, error) {
+		got = req
+		return ImageResult{Text: map[string]any{"state": "queued"}}, nil
+	})
+	res := callArtTool(t, s, map[string]any{"key": "k", "action": "generate", "prompt": "a single iron ingot, raw wood handle, no border",
+		"refs": []any{"r_1", map[string]any{"id": "r_2", "role": "style", "weight": 0.5}}})
+	if res["isError"] != false {
+		t.Fatalf("result = %v", res)
+	}
+	if len(got.Refs) != 2 || got.Refs[0] != (ArtRef{ID: "r_1"}) || got.Refs[1] != (ArtRef{ID: "r_2", Role: "style", Weight: 0.5}) {
+		t.Fatalf("refs = %+v", got.Refs)
+	}
+}
+
+func TestArtPromptErrorRefusesParameterFlagsOnly(t *testing.T) {
+	for _, p := range []string{"a rock --sref r_1", "a rock --ar 16:9", "a rock stylize: 100", "a rock chaos 20", "a rock --raw"} {
+		if ArtPromptError(p) == nil {
+			t.Errorf("%q: no error", p)
+		}
+	}
+	for _, p := range []string{"a single iron ingot, raw wood handle, no border", "a dash -- of salt, wide-angle view"} {
+		if err := ArtPromptError(p); err != nil {
+			t.Errorf("%q: %v", p, err)
+		}
+	}
+}
+
+func TestArtDescriptorTopicsMatchThePlaybook(t *testing.T) {
+	topic := artToolDescriptor()["inputSchema"].(map[string]any)["properties"].(map[string]any)["topic"].(map[string]any)["description"].(string)
+	list := strings.TrimPrefix(topic, "playbook: ")
+	list = strings.Replace(strings.Replace(list, " (default)", "", 1), " or ", ", ", 1)
+	got := strings.Split(list, ", ")
+	want := art.PlaybookTopics()
+	sort.Strings(got)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("description topics %v, playbook topics %v", got, want)
+	}
+}
+
+func TestArtMalformedRefObjectReturnsTheDecodeHint(t *testing.T) {
+	called := false
+	s := startArt(t, func(context.Context, ArtRequest) (ImageResult, error) { called = true; return ImageResult{}, nil })
+	res := callArtTool(t, s, map[string]any{"key": "k", "action": "generate", "prompt": "a rock",
+		"refs": []any{map[string]any{"id": "r_1", "stylize": 100}}})
+	e, ok := res["rpcError"].(map[string]any)
+	if !ok || !strings.Contains(fmt.Sprint(e["message"]), "refs entries are an id, or {id, role, weight}") {
+		t.Fatalf("want the refs decode hint, got %v", res)
+	}
+	if called {
+		t.Fatal("the handler ran for a malformed request")
+	}
+}
+
+func TestArtPromptWithRefsIsLimitedAfterTheReferenceNotes(t *testing.T) {
+	refs := []ArtRef{{ID: "r_1", Role: "style", Weight: 0.5}}
+	notes, _ := ArtPromptWithRefs("", refs) // the reference notes alone, with an empty prompt
+	suffix := len(notes)
+	fits := maxArtPrompt - suffix
+	if got, _ := ArtPromptWithRefs(strings.Repeat("x", fits), refs); len(got) != maxArtPrompt {
+		t.Fatalf("composed length %d, want %d", len(got), maxArtPrompt)
+	}
+
+	called := false
+	s := startArt(t, func(context.Context, ArtRequest) (ImageResult, error) { called = true; return ImageResult{}, nil })
+	ok := callArtTool(t, s, map[string]any{"key": "k", "action": "generate", "prompt": strings.Repeat("x", fits),
+		"refs": []any{map[string]any{"id": "r_1", "role": "style", "weight": 0.5}}})
+	if ok["isError"] != false || called != true {
+		t.Fatalf("a prompt at the limit with its notes should pass, got %v", ok)
+	}
+
+	called = false
+	res := callArtTool(t, s, map[string]any{"key": "k", "action": "generate", "prompt": strings.Repeat("x", fits+1),
+		"refs": []any{map[string]any{"id": "r_1", "role": "style", "weight": 0.5}}})
+	e, isErr := res["rpcError"].(map[string]any)
+	if !isErr || !strings.Contains(fmt.Sprint(e["message"]), "the limit is 4000 bytes including them") {
+		t.Fatalf("want a length refusal at validation, got %v", res)
+	}
+	if called {
+		t.Fatal("the handler ran for a prompt over the limit")
 	}
 }

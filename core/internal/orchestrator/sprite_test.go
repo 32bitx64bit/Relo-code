@@ -13,6 +13,7 @@ import (
 
 	"github.com/relocode/relo/internal/agent"
 	"github.com/relocode/relo/internal/agentmsg"
+	"github.com/relocode/relo/internal/art"
 	"github.com/relocode/relo/internal/logging"
 	"github.com/relocode/relo/internal/prompt"
 	"github.com/relocode/relo/internal/routing"
@@ -509,6 +510,62 @@ func TestApplyTurnArtFlagImpliesVisionAndFollowsTheFeature(t *testing.T) {
 		}
 		if wire.Art || wire.Vision || wire.Model != "p/blind" {
 			t.Errorf("enabled=%v: an ordinary task became %+v", enabled, wire)
+		}
+	}
+}
+
+// makeArtPicture stores a ready art job owned by session, with one picture, and returns the job id.
+func makeArtPicture(t *testing.T, f *spriteFixture, session string) string {
+	t.Helper()
+	mgr, err := f.c.artManager(f.session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := mgr.Store().Create(art.Job{SessionID: session, State: art.StateReady, Prompt: "iron ingot",
+		Candidates: []art.Candidate{{Index: 1, File: "1.png"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDiscs(t, filepath.Join(j.Dir, "1.png"), 1)
+	return j.ID
+}
+
+// TestSpriteRequestReadsOnlyTheCallersArtPictures: a job's own picture under .relo/art/raw is readable; every other
+// .relo path, another session's job picture, and any route to them through .. or a symlink is refused.
+func TestSpriteRequestReadsOnlyTheCallersArtPictures(t *testing.T) {
+	f := newSpriteFixture(t, agent.Worker, "p/seeing", true)
+	t.Cleanup(f.c.CloseArt)
+	own := makeArtPicture(t, f, f.c.SessionID())
+	other := makeArtPicture(t, f, "some-other-session")
+	writeDiscs(t, filepath.Join(f.session, ".relo", "notes", "secret.png"), 1)
+	if err := os.MkdirAll(filepath.Join(f.session, "art"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", ".relo", "notes"), filepath.Join(f.session, "art", "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := f.call(agentmsg.SpriteRequest{Input: agentmsg.SpriteInput{Path: ".relo/art/raw/" + own + "/1.png"}, Ops: ironOps(), Output: "Textures/Own.png"})
+	if err != nil {
+		t.Fatalf("the job's own picture was refused: %v", err)
+	}
+	if meta := spriteMeta(t, res); meta["failed"] == true || meta["aborted"] != nil {
+		t.Fatalf("own picture failed its checks: %v", meta)
+	}
+	readPNG(t, filepath.Join(f.work, "Textures", "Own.png"))
+
+	refused := []string{
+		".relo/notes/secret.png",
+		".relo/art/raw/" + other + "/1.png",
+		".relo/art/raw/" + own + "/2.png",
+		".relo/art/jobs/" + own + "/job.json",
+		".relo/art/raw/../../notes/secret.png",
+		"art/link/secret.png",
+		filepath.Join(f.session, ".relo", "notes", "secret.png"),
+	}
+	for _, p := range refused {
+		if _, err := f.call(agentmsg.SpriteRequest{Input: agentmsg.SpriteInput{Path: p}}); err == nil {
+			t.Errorf("relo_sprite read %s", p)
 		}
 	}
 }

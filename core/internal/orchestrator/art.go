@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/relocode/relo/internal/agent"
@@ -33,6 +34,7 @@ const artGuidance = "relo_art makes pictures with an image model through the use
 	"Call it with action status first (is it set up, the model, what is left) and action playbook (prompts, references, transparency, sprites, how much to spend); both are free. " +
 	"Work asynchronously: action generate returns at once with a job id, and action wait (up to 45 seconds a call) returns a contact sheet of numbered pictures when the job is ready. " +
 	"The user may be asked to approve the spend first: keep waiting, and never start a second job for the same picture. " +
+	"A job that fails with references: stop and report it; never retry it text-only. The same prompt with the same references may be sent at most twice a session. " +
 	"Look at the sheet before you ask for more, change one thing at a time, and stop when the sprite passes the brief. To refine a picture, store it as a reference (action refs) and generate again with a prompt that says what to change. " +
 	"A picture you choose is a file in .relo/art/raw/<job>/<n>.png (the result gives the path): pass it to relo_sprite as input.path to matte, fit and check it. " +
 	"When a call says a limit is reached, stop, use what you have, and tell the user what is missing. Pictures are made by a third party from your prompt and references: put nothing private in either."
@@ -217,23 +219,34 @@ func (c *Coord) artRequest(ctx context.Context, req agentmsg.ArtRequest) (agentm
 	case "jobs":
 		return c.artJobsResult(mgr, session, req.Limit), nil
 	case "refs":
+		for _, src := range req.Sources {
+			if src.Job != "" {
+				if _, err := artOwnJob(mgr, session, src.Job); err != nil {
+					return agentmsg.ImageResult{}, err
+				}
+			}
+		}
 		return c.artRefs(ctx, mgr, a, sessionWorkspace, req.Sources)
 	case "generate":
-		job, err := mgr.Generate(ctx, art.GenerateInput{SessionID: session, AgentID: a.ID, Prompt: req.Prompt, Refs: req.Refs,
-			Quality: req.Quality, Size: req.Size, Background: req.Background, Count: req.Count})
+		if err := agentmsg.ArtPromptError(req.Prompt); err != nil {
+			return agentmsg.ImageResult{}, err
+		}
+		prompt, refIDs := agentmsg.ArtPromptWithRefs(req.Prompt, req.Refs)
+		job, err := artGenerateCapped(ctx, mgr, session, art.GenerateInput{SessionID: session, AgentID: a.ID, Prompt: prompt, Refs: refIDs,
+			Quality: req.Quality, Size: req.Size, Background: req.Background, Count: req.Count,
+			AspectRatio: req.Params.AspectRatio, Resolution: req.Params.Resolution, Seed: req.Params.Seed})
 		if err != nil {
 			return agentmsg.ImageResult{}, err
 		}
 		return agentmsg.ImageResult{Text: c.artStarted(mgr, job)}, nil
 	case "wait":
+		if _, err := artOwnJob(mgr, session, req.Job); err != nil {
+			return agentmsg.ImageResult{}, err
+		}
 		return c.artWait(ctx, mgr, req)
 	case "cancel":
-		job, ok := mgr.Get(req.Job)
-		if !ok {
-			return agentmsg.ImageResult{}, fmt.Errorf("no job %q", req.Job)
-		}
-		if job.SessionID != session {
-			return agentmsg.ImageResult{}, fmt.Errorf("job %s belongs to another session; only the user can cancel it", req.Job)
+		if _, err := artOwnJob(mgr, session, req.Job); err != nil {
+			return agentmsg.ImageResult{}, err
 		}
 		out, err := mgr.Cancel(req.Job)
 		if err != nil {
@@ -244,6 +257,68 @@ func (c *Coord) artRequest(ctx context.Context, req agentmsg.ArtRequest) (agentm
 	return agentmsg.ImageResult{}, fmt.Errorf("unknown action %q", req.Action)
 }
 
+// maxIdenticalArtPrompts is how many jobs with the same prompt and references one session may start. A third one is
+// refused: the same request again will not make a different picture.
+const maxIdenticalArtPrompts = 2
+
+// artPromptMu makes the repeat check and the job record one step, so concurrent identical generate calls cannot both
+// pass the check before either job exists.
+var artPromptMu sync.Mutex
+
+// artGenerateCapped starts a job unless this session has already sent the same prompt with the same references
+// maxIdenticalArtPrompts times. The check and the start hold artPromptMu.
+func artGenerateCapped(ctx context.Context, mgr *art.Manager, session string, in art.GenerateInput) (art.Job, error) {
+	artPromptMu.Lock()
+	defer artPromptMu.Unlock()
+	if err := artRepeatError(mgr, session, in.Prompt, in.Refs); err != nil {
+		return art.Job{}, err
+	}
+	return mgr.Generate(ctx, in)
+}
+
+// artOwnsJob is true when job j belongs to session. A job with no owner belongs to nobody.
+func artOwnsJob(j art.Job, session string) bool {
+	return j.SessionID != "" && j.SessionID == session
+}
+
+// artOwnJob returns job id when the calling session owns it. Anything else is refused.
+func artOwnJob(mgr *art.Manager, session, id string) (art.Job, error) {
+	j, ok := mgr.Get(id)
+	if !ok {
+		return art.Job{}, fmt.Errorf("no job %q", id)
+	}
+	if !artOwnsJob(j, session) {
+		return art.Job{}, fmt.Errorf("job %s belongs to another session; only the session that started it can use it", id)
+	}
+	return j, nil
+}
+
+// artRepeatError refuses a job whose prompt and references this session has already sent maxIdenticalArtPrompts times.
+func artRepeatError(mgr *art.Manager, session, prompt string, refIDs []string) error {
+	sent := 0
+	for _, j := range mgr.List(0) {
+		if artOwnsJob(j, session) && j.Prompt == prompt && artSameRefs(j.Refs, refIDs) {
+			sent++
+		}
+	}
+	if sent >= maxIdenticalArtPrompts {
+		return fmt.Errorf("this session has already sent this prompt with these references %d times; change the prompt or the references, or stop and report what you have", sent)
+	}
+	return nil
+}
+
+func artSameRefs(refs []art.Ref, ids []string) bool {
+	if len(refs) != len(ids) {
+		return false
+	}
+	for i, r := range refs {
+		if r.ID != ids[i] {
+			return false
+		}
+	}
+	return true
+}
+
 type artStatusResult struct {
 	art.Status
 	Topics []string `json:"playbookTopics"`
@@ -252,23 +327,25 @@ type artStatusResult struct {
 
 // artJob is what an agent is told about a job.
 type artJob struct {
-	Job        string       `json:"job"`
-	State      string       `json:"state"`
-	Prompt     string       `json:"prompt,omitempty"`
-	Model      string       `json:"model"`
-	Quality    string       `json:"quality"`
-	Size       string       `json:"size"`
-	Background string       `json:"background"`
-	Count      int          `json:"pictures"`
-	Refs       int          `json:"references,omitempty"`
-	EstimateUS float64      `json:"estimateUsd"`
-	CostUSD    *float64     `json:"costUsd,omitempty"`
-	Message    string       `json:"message,omitempty"`
-	Found      []artPicture `json:"files,omitempty"`
-	Next       string       `json:"next,omitempty"`
-	Budget     *art.Budget  `json:"budget,omitempty"`
-	Sheet      string       `json:"sheet,omitempty"`
-	WaitedSecs int          `json:"waitedSeconds,omitempty"`
+	Job        string   `json:"job"`
+	State      string   `json:"state"`
+	Prompt     string   `json:"prompt,omitempty"`
+	Model      string   `json:"model"`
+	Quality    string   `json:"quality"`
+	Size       string   `json:"size"`
+	Background string   `json:"background"`
+	Count      int      `json:"pictures"`
+	Refs       int      `json:"references,omitempty"`
+	EstimateUS float64  `json:"estimateUsd"`
+	CostUSD    *float64 `json:"costUsd,omitempty"`
+	// CostFromEstimate is true when CostUSD is the estimate, because the endpoint reported no usage.
+	CostFromEstimate bool         `json:"costFromEstimate"`
+	Message          string       `json:"message,omitempty"`
+	Found            []artPicture `json:"files,omitempty"`
+	Next             string       `json:"next,omitempty"`
+	Budget           *art.Budget  `json:"budget,omitempty"`
+	Sheet            string       `json:"sheet,omitempty"`
+	WaitedSecs       int          `json:"waitedSeconds,omitempty"`
 }
 
 type artPicture struct {
@@ -280,7 +357,7 @@ type artPicture struct {
 
 func artJobView(j art.Job, next string) artJob {
 	v := artJob{Job: j.ID, State: j.State, Model: j.Model, Quality: j.Quality, Size: j.Size, Background: j.Background, Count: j.Count, Refs: len(j.Refs),
-		EstimateUS: j.EstimateUSD, CostUSD: j.CostUSD, Message: j.Message, Next: next}
+		EstimateUS: j.EstimateUSD, CostUSD: j.CostUSD, CostFromEstimate: j.CostFromEstimate, Message: j.Message, Next: next}
 	for _, p := range j.Candidates {
 		v.Found = append(v.Found, artPicture{Index: p.Index, Path: art.RelPath(j.ID, p.Index), Width: p.Width, Height: p.Height})
 	}
@@ -302,7 +379,7 @@ func (c *Coord) artJobsResult(mgr *art.Manager, session string, limit int) agent
 	}
 	var jobs []artJob
 	for _, j := range mgr.List(0) {
-		if j.SessionID != session {
+		if !artOwnsJob(j, session) {
 			continue
 		}
 		jobs = append(jobs, artJobView(j, ""))
@@ -331,7 +408,7 @@ func (c *Coord) artWait(ctx context.Context, mgr *art.Manager, req agentmsg.ArtR
 	var out agentmsg.ImageResult
 	switch job.State {
 	case art.StateReady:
-		view.Next = "Look at the sheet and pick a number; transparent areas show as the sheet's dark grey. Pass the file path above to relo_sprite. To change a picture, store it with action refs and generate again with a prompt that says what to change."
+		view.Next = "Look at the sheet and pick a number; transparent areas show as a white and light grey checker. Pass the file path above to relo_sprite. To change a picture, store it with action refs and generate again with a prompt that says what to change."
 		release, err := c.acquireImageSlot(ctx)
 		if err != nil {
 			return agentmsg.ImageResult{}, errors.New("art request timed out waiting for another picture to finish")
@@ -349,7 +426,11 @@ func (c *Coord) artWait(ctx context.Context, mgr *art.Manager, req agentmsg.ArtR
 	case art.StateCancelled:
 		view.Next = "This job was cancelled (" + job.Message + "). Do not start it again; carry on with what you have and tell the user."
 	default:
-		view.Next = "This job failed. Read the message: if it names a setting the user must fix, tell them and stop; otherwise change one thing and try once more, within the budget."
+		if len(job.Refs) > 0 {
+			view.Next = "This job failed with reference pictures. Stop and report the failure to the user. Do not retry it, and never retry it text-only without the references."
+		} else {
+			view.Next = "This job failed. Read the message: if it names a setting the user must fix, tell them and stop; otherwise change one thing and try once more, within the budget."
+		}
 	}
 	out.Text = view
 	return out, nil
@@ -412,7 +493,7 @@ func (c *Coord) artRefs(ctx context.Context, mgr *art.Manager, a agent.Agent, se
 		}
 		res.Refs = append(res.Refs, artRefInfo{ID: info.ID, Source: label, Width: info.Width, Height: info.Height})
 	}
-	res.Note = "Use these ids in generate's refs with a role: style, subject (one only) or composition."
+	res.Note = "Use these ids in generate's refs as an id or {id, role, weight}; role is style, subject (one only) or composition."
 	return agentmsg.ImageResult{Text: res}, nil
 }
 

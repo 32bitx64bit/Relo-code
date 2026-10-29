@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -149,7 +150,8 @@ func (c *Coord) spriteRequest(ctx context.Context, req agentmsg.SpriteRequest) (
 	}
 	defer release()
 
-	readFile := func(name string) ([]byte, error) { return readWorkspaceFile(roots, name) }
+	session := c.SessionID()
+	readFile := func(name string) ([]byte, error) { return c.readSpriteInput(session, sessionWorkspace, roots, name) }
 	data, err := readFile(req.Input.Path)
 	if err != nil {
 		return agentmsg.ImageResult{}, err
@@ -234,6 +236,88 @@ func readWorkspaceFile(roots []string, name string) ([]byte, error) {
 		return nil, fmt.Errorf("%s is larger than %d MiB", name, vision.MaxFileBytes>>20)
 	}
 	return data, nil
+}
+
+// readSpriteInput reads a picture a sprite pipeline names. A path under .relo is read only when it is a picture of one
+// of the caller's own art jobs, in the form an art job returns it (.relo/art/raw/<job>/<n>.png). Any other .relo path
+// is refused, and everything else is read from roots as before.
+func (c *Coord) readSpriteInput(session, sessionWorkspace string, roots []string, name string) ([]byte, error) {
+	rel, inRelo := spriteReloRel(roots, name)
+	if !inRelo {
+		return readWorkspaceFile(roots, name)
+	}
+	job, index, ok := artPictureRel(rel)
+	if !ok {
+		return nil, fmt.Errorf("%s: relo_sprite reads files under .relo only for pictures an art job returned (.relo/art/raw/<job>/<n>.png)", name)
+	}
+	mgr, err := c.artManager(sessionWorkspace)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := artOwnJob(mgr, session, job); err != nil {
+		return nil, err
+	}
+	data, err := mgr.CandidateData(job, index)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	return data, nil
+}
+
+// spriteReloRel reports whether name, resolved in one of roots, lies under .relo, and returns that path relative to the
+// root. It checks the path as written and with symlinks resolved, so a link into .relo does not get past the gate.
+func spriteReloRel(roots []string, name string) (string, bool) {
+	name = strings.TrimSpace(name)
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		path := name
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(root, path)
+		}
+		resolved := filepath.Clean(path)
+		if real, err := filepath.EvalSymlinks(path); err == nil {
+			resolved = real
+		}
+		bases := []string{filepath.Clean(root)}
+		if real, err := filepath.EvalSymlinks(root); err == nil {
+			bases = append(bases, real)
+		}
+		for _, p := range []string{filepath.Clean(path), resolved} {
+			for _, base := range bases {
+				rel, err := filepath.Rel(base, p)
+				if err != nil {
+					continue
+				}
+				if rel = filepath.ToSlash(rel); rel == ".relo" || strings.HasPrefix(rel, ".relo/") {
+					return rel, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+// artPictureRel parses a workspace-relative path of the form .relo/art/raw/<job>/<n>.png, the form an art job returns.
+func artPictureRel(rel string) (string, int, bool) {
+	rest, ok := strings.CutPrefix(rel, ".relo/art/raw/")
+	if !ok {
+		return "", 0, false
+	}
+	job, file, ok := strings.Cut(rest, "/")
+	if !ok || job == "" || strings.Contains(file, "/") {
+		return "", 0, false
+	}
+	stem, ok := strings.CutSuffix(file, ".png")
+	if !ok {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(stem)
+	if err != nil || n < 1 || strconv.Itoa(n) != stem {
+		return "", 0, false
+	}
+	return job, n, true
 }
 
 // writeSprites writes the pictures of a pipeline into root as PNG files. A single picture goes to output; several
