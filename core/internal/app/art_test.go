@@ -90,6 +90,35 @@ func TestApplySettingsTurnsPictureGenerationOnAndOff(t *testing.T) {
 	}
 }
 
+func TestArtEndpointNamesTheProviderSoOpenRouterRoutingApplies(t *testing.T) {
+	dir := t.TempDir()
+	core, err := New(Config{Workspace: dir, DBPath: filepath.Join(dir, "relo.db"), Runtime: "mock"}, logging.New(&bytes.Buffer{}, logging.Error))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+
+	// An OpenRouter provider behind a base URL whose host is not openrouter.ai (a proxy or a custom slug): only the
+	// provider name lets the art package route to POST /images instead of /images/edits.
+	core.applyProviders(map[string]any{
+		"providers": []any{
+			map[string]any{"id": "openrouter1", "kind": "openai", "baseURL": "https://api.example.test/v1", "models": []any{}},
+		},
+		"providerKeys": map[string]any{"openrouter1": "sk-or-TESTKEY1234"},
+	})
+
+	ep, err := core.artEndpoint("openrouter1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ep.Provider != "openrouter1" {
+		t.Fatalf("art endpoint drops the provider ID the art package detects OpenRouter with: %+v", ep)
+	}
+	if ep.BaseURL != "https://api.example.test/v1" || ep.Key != "sk-or-TESTKEY1234" {
+		t.Fatalf("art endpoint changed the base URL or key: %+v", ep)
+	}
+}
+
 func TestArtEndpointComesFromTheProviderSettingsAndOnlyFromOpenAIStyleOnes(t *testing.T) {
 	dir := t.TempDir()
 	core, err := New(Config{Workspace: dir, DBPath: filepath.Join(dir, "relo.db"), Runtime: "mock"}, logging.New(&bytes.Buffer{}, logging.Error))

@@ -40,6 +40,25 @@ func (a *App) safely(where string, fn func()) {
 	fn()
 }
 
+// goSafely starts a background turn that Close waits for. Use it for work whose writes must finish before the
+// store closes; a bare `go a.safely` is only for work that is harmless after Close.
+func (a *App) goSafely(where string, fn func()) bool {
+	// Under persistMu, so the closed check cannot race Close; Add happens before the goroutine starts so Close's
+	// Wait can never miss it.
+	a.persistMu.Lock()
+	if a.closed {
+		a.persistMu.Unlock()
+		return false
+	}
+	a.bgWG.Add(1)
+	a.persistMu.Unlock()
+	go func() {
+		defer a.bgWG.Done()
+		a.safely(where, fn)
+	}()
+	return true
+}
+
 // persistSoon schedules one write of the session. Many events in a burst cost one write.
 func (a *App) persistSoon() {
 	a.persistMu.Lock()
@@ -118,7 +137,7 @@ func summarize(s *orchestrator.Session, current bool) SessionSummary {
 }
 
 func (a *App) listSessions() ([]SessionSummary, error) {
-	raws, err := a.Store.List("sessions", a.Cfg.Workspace)
+	raws, err := a.storedSessions()
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +174,7 @@ func (a *App) sweepWorktrees() {
 			}
 		}
 	}
-	if raws, err := a.Store.List("sessions", a.Cfg.Workspace); err == nil {
+	if raws, err := a.storedSessions(); err == nil {
 		for _, raw := range raws {
 			var s orchestrator.Session
 			if json.Unmarshal(raw, &s) == nil {
@@ -199,6 +218,31 @@ func (a *App) deleteStored(id string) {
 	if err := a.Store.DeleteSession(id); err != nil {
 		a.Log.Warn("delete stored session", map[string]any{"sessionId": id, "error": err.Error()})
 	}
+	a.closeSessionDB(id)
+}
+
+// storedSessions lists the workspace's sessions from the catalog and closes every session DB except the current one.
+func (a *App) storedSessions() ([]json.RawMessage, error) {
+	raws, err := a.Store.ListSessions(a.Cfg.Workspace)
+	if err != nil {
+		return nil, err
+	}
+	cur := a.Coord.Current()
+	for _, raw := range raws {
+		var s orchestrator.Session
+		if json.Unmarshal(raw, &s) != nil || (cur != nil && s.ID == cur.ID) {
+			continue
+		}
+		a.closeSessionDB(s.ID)
+	}
+	return raws, nil
+}
+
+// closeSessionDB releases the handle of an idle session DB; it is reopened on next access.
+func (a *App) closeSessionDB(id string) {
+	if err := a.Store.CloseSession(id); err != nil {
+		a.Log.Warn("close session db", map[string]any{"sessionId": id, "error": err.Error()})
+	}
 }
 
 // openSession switches to a stored session.
@@ -210,7 +254,7 @@ func (a *App) openSession(ctx context.Context, id string) (any, error) {
 		return a.Coord.Snapshot(), nil
 	}
 	var s orchestrator.Session
-	if err := a.Store.Get("sessions", id, &s); err != nil {
+	if err := a.Store.GetIn("sessions", id, id, &s); err != nil {
 		return nil, ipc.Fail{C: "not_found", M: "session not found"}
 	}
 	if s.Workspace != a.Cfg.Workspace {
@@ -225,6 +269,9 @@ func (a *App) openSession(ctx context.Context, id string) (any, error) {
 	a.clearResolvingLoaded()
 	if old != nil && emptySession(old) {
 		a.deleteStored(old.ID)
+	}
+	if old != nil {
+		a.closeSessionDB(old.ID)
 	}
 	a.sessMu.Unlock()
 	a.sweepWorktrees()
@@ -244,7 +291,7 @@ func (a *App) deleteSession(ctx context.Context, id string) (any, error) {
 		a.sessMu.Lock()
 		s := a.Coord.CreateSession(a.Cfg.Workspace, "", cur.Mode)
 		a.deleteStored(id)
-		a.putJSON("sessions", s.ID, "", s.Workspace, s)
+		a.putSession(s)
 		a.sessMu.Unlock()
 	} else {
 		a.sessMu.Lock()

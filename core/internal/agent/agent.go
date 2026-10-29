@@ -55,6 +55,8 @@ type Agent struct {
 	Difficulty    string    `json:"difficulty"`
 	Attempt       int       `json:"attempt"`
 	EscalatedFrom string    `json:"escalatedFrom,omitempty"`
+	FallbackFrom  string    `json:"fallbackFrom,omitempty"`
+	FallbackClass string    `json:"fallbackClass,omitempty"`
 	Status        Status    `json:"status"`
 	Model         string    `json:"model"`
 	Scope         string    `json:"scope"`

@@ -107,6 +107,10 @@ type App struct {
 	persistMu    sync.Mutex
 	persistTimer *time.Timer
 	closed       bool
+
+	// bgWG tracks the background turns started by goSafely, so Close can wait for them: a submit that outlives
+	// Close would write the session after the store is shut and the workspace is gone.
+	bgWG sync.WaitGroup
 }
 
 func (a *App) setStatus(h runtime.Health) runtime.Health {
@@ -193,7 +197,7 @@ func (a *App) logCanvasAudit(rec orchestrator.CanvasAudit) {
 
 func New(cfg Config, log *logging.Logger) (*App, error) {
 	if cfg.DBPath == "" {
-		cfg.DBPath = filepath.Join(cfg.Workspace, ".relo", "relo.db")
+		cfg.DBPath = filepath.Join(cfg.Workspace, ".relo", "catalog.db")
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0o700); err != nil {
 		return nil, err
@@ -288,7 +292,7 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 		if a.Coord.Current() == nil {
 			a.Coord.CreateSession(a.Cfg.Workspace, text, orchestrator.ModeBuild)
 		}
-		go a.safely("submit", func() {
+		a.goSafely("submit", func() {
 			if err := a.Coord.Submit(context.Background(), text, refs); err != nil {
 				a.Log.Error("submit", map[string]any{"error": err.Error()})
 				if err := a.IPCEmit("log", map[string]any{"error": err.Error()}); err != nil {
@@ -313,7 +317,7 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 			if text == "" {
 				return map[string]any{"ok": true}, nil
 			}
-			go a.safely("retry", func() {
+			a.goSafely("retry", func() {
 				if err := a.Coord.Submit(context.Background(), text, nil); err != nil {
 					a.Log.Error("retry submit failed", map[string]any{"sessionId": s.ID, "error": err.Error()})
 				}
@@ -458,8 +462,11 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 			s.PrimaryModel = str(p, "primary", s.PrimaryModel)
 			s.Tier1Model = str(p, "tier1", s.Tier1Model)
 			s.Tier2Model = str(p, "tier2", s.Tier2Model)
+			s.PrimaryBackupModel = str(p, "primaryBackupModel", s.PrimaryBackupModel)
+			s.Tier1BackupModel = str(p, "tier1BackupModel", s.Tier1BackupModel)
+			s.Tier2BackupModel = str(p, "tier2BackupModel", s.Tier2BackupModel)
 		})
-		if err := a.Store.SetKV("models", fmt.Sprintf("%s|%s|%s", s.PrimaryModel, s.Tier1Model, s.Tier2Model)); err != nil {
+		if err := a.Store.SetKV("models", fmt.Sprintf("%s|%s|%s|%s|%s|%s", s.PrimaryModel, s.Tier1Model, s.Tier2Model, s.PrimaryBackupModel, s.Tier1BackupModel, s.Tier2BackupModel)); err != nil {
 			a.Log.Error("persist models failed", map[string]any{"error": err.Error()})
 		}
 		return s, nil
@@ -497,6 +504,35 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 			return nil, ipc.Fail{C: "canvas_reply_rejected", M: err.Error()}
 		}
 		return map[string]any{"ok": true}, nil
+	case "question.answer":
+		// Records the user's answer on the blocked task (source: user), then starts a run so the task executes.
+		taskID, answer := str(p, "taskId", ""), str(p, "answer", "")
+		if taskID == "" {
+			return nil, ipc.Fail{C: "invalid_task", M: "taskId is required"}
+		}
+		if err := a.Coord.AnswerQuestion(taskID, answer); err != nil {
+			return nil, ipc.Fail{C: "question_rejected", M: err.Error()}
+		}
+		text := "Answered blocked task " + taskID + ": " + strings.TrimSpace(answer)
+		a.goSafely("question.answer", func() {
+			if err := a.Coord.Submit(context.Background(), text, nil); err != nil {
+				a.Log.Error("question.answer submit", map[string]any{"error": err.Error()})
+				// The answer is recorded but no run started; say so once, without auth or token text.
+				a.Coord.Note("Your answer to task " + taskID + " was recorded, but the run did not start: " + resumeErrorText(err) + ". Send your next message to resume it.")
+			}
+			a.persist()
+		})
+		return map[string]any{"ok": true, "taskId": taskID}, nil
+	case "question.delegate":
+		enabled, ok := p["enabled"].(bool)
+		if !ok {
+			return nil, ipc.Fail{C: "invalid_enabled", M: "enabled must be a boolean"}
+		}
+		if a.Coord.Current() == nil {
+			return nil, ipc.Fail{C: "no_session", M: "no session to change"}
+		}
+		a.Coord.SetDelegateAnswers(enabled)
+		return map[string]any{"ok": true, "enabled": enabled}, nil
 	case "permission.respond":
 		response := str(p, "response", "reject")
 		if response != "once" && response != "always" && response != "reject" {
@@ -627,6 +663,28 @@ func (a *App) applySettings(p map[string]any) {
 	}
 	if v := str(p, "tier2Model", ""); v != "" {
 		s.Tier2Model = v
+	}
+	// A backup key present with "" clears that backup; a missing key leaves it unchanged.
+	if _, ok := p["primaryBackupModel"]; ok {
+		s.PrimaryBackupModel = str(p, "primaryBackupModel", "")
+	}
+	if _, ok := p["tier1BackupModel"]; ok {
+		s.Tier1BackupModel = str(p, "tier1BackupModel", "")
+	}
+	if _, ok := p["tier2BackupModel"]; ok {
+		s.Tier2BackupModel = str(p, "tier2BackupModel", "")
+	}
+	if raw, ok := p["backupByDifficulty"].(map[string]any); ok {
+		models := make(map[string]string, len(raw))
+		for level, model := range raw {
+			if value, ok := model.(string); ok && strings.TrimSpace(value) != "" {
+				models[level] = strings.TrimSpace(value)
+			}
+		}
+		s.BackupByDifficulty = nil
+		if len(models) > 0 {
+			s.BackupByDifficulty = models
+		}
 	}
 	if n := int(num(p, "maxConcurrentAgents", 0)); n > 0 {
 		s.MaxTotal = n
@@ -870,18 +928,22 @@ func (a *App) backendStatus() map[string]any {
 	ready := st.Healthy && rt != nil
 	cfg := a.Coord.SettingsSnapshot()
 	return map[string]any{
-		"core":         "ready",
-		"opencode":     st.Kind,
-		"version":      st.Version,
-		"error":        st.Error,
-		"models":       models,
-		"ready":        ready,
-		"primary":      cfg.PrimaryModel,
-		"tier1":        cfg.Tier1Model,
-		"tier2":        cfg.Tier2Model,
-		"routingMode":  routing.NormalizeMode(cfg.RoutingMode),
-		"contextLimit": cfg.ContextLimit,
-		"claudeCode":   a.claudeCodeStatus(),
+		"core":               "ready",
+		"opencode":           st.Kind,
+		"version":            st.Version,
+		"error":              st.Error,
+		"models":             models,
+		"ready":              ready,
+		"primary":            cfg.PrimaryModel,
+		"tier1":              cfg.Tier1Model,
+		"tier2":              cfg.Tier2Model,
+		"primaryBackupModel": cfg.PrimaryBackupModel,
+		"tier1BackupModel":   cfg.Tier1BackupModel,
+		"tier2BackupModel":   cfg.Tier2BackupModel,
+		"backupByDifficulty": cfg.BackupByDifficulty,
+		"routingMode":        routing.NormalizeMode(cfg.RoutingMode),
+		"contextLimit":       cfg.ContextLimit,
+		"claudeCode":         a.claudeCodeStatus(),
 	}
 }
 
@@ -897,7 +959,7 @@ func (a *App) persistLocked() {
 	if s == nil {
 		return
 	}
-	a.putJSON("sessions", s.ID, "", s.Workspace, s)
+	a.putSession(s)
 	for _, ag := range a.Coord.Agents.List() {
 		a.putJSON("agents", ag.ID, s.ID, "", ag)
 		if report, ok := a.Coord.Agents.Report(ag.ID); ok {
@@ -934,6 +996,13 @@ func (a *App) putJSON(table, id, session, extra string, v any) {
 	}
 }
 
+// putSession writes the session row to the catalog and its session DB.
+func (a *App) putSession(s *orchestrator.Session) {
+	if err := a.Store.PutSession(s.ID, s.Workspace, s); err != nil {
+		a.Log.Error("persist failed", map[string]any{"table": "sessions", "id": s.ID, "error": err.Error()})
+	}
+}
+
 func (a *App) emit(name string, payload any) {
 	if err := a.IPCEmit(name, payload); err != nil {
 		a.Log.Warn("ipc emit failed", map[string]any{"event": name, "error": err.Error()})
@@ -961,7 +1030,7 @@ func (a *App) restoreSession(sessionID string) {
 			}
 			a.Coord.Agents.Create(ag)
 			var report agent.Report
-			if err := a.Store.Get("reports", ag.ID, &report); err == nil {
+			if err := a.Store.GetIn("reports", ag.ID, sessionID, &report); err == nil {
 				a.Coord.Agents.SetReport(ag.ID, report)
 			}
 		}
@@ -1122,7 +1191,8 @@ func cachePayload(snapshot metrics.CacheSnapshot) map[string]any {
 func (a *App) Close() {
 	a.once.Do(func() {
 		a.stopAutoApply()
-		a.stopPersistTimer()
+		a.stopPersistTimer() // sets closed, so no new goSafely turns register from here on
+		a.bgWG.Wait()        // let in-flight submits finish their persist before the store and workspace go
 		a.persist()
 		a.Coord.StopAll(context.Background())
 		a.Coord.CloseMessages()
@@ -1218,6 +1288,28 @@ func str(m map[string]any, k, def string) string {
 		return v
 	}
 	return def
+}
+
+// resumeErrorText shortens a submit error for a system notice: one line, bounded, and without any
+// Bearer/API-key text that a provider error may echo.
+func resumeErrorText(err error) string {
+	msg := strings.Join(strings.Fields(err.Error()), " ")
+	if len(msg) > 200 {
+		msg = strings.TrimSpace(msg[:200]) + "…"
+	}
+	fields := strings.Fields(msg)
+	kept := fields[:0]
+	for i, w := range fields {
+		if strings.Contains(w, "Bearer") || strings.HasPrefix(w, "sk-") || (i > 0 && strings.Contains(fields[i-1], "Bearer")) {
+			continue
+		}
+		kept = append(kept, w)
+	}
+	msg = strings.Join(kept, " ")
+	if msg == "" {
+		return "unknown error"
+	}
+	return msg
 }
 
 // Limits for path-glob settings from the extension (relo.changes.*Paths). Entries past them are dropped.

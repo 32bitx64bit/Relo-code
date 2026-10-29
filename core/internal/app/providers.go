@@ -197,5 +197,7 @@ func (a *App) artEndpoint(providerID string) (art.Endpoint, error) {
 	case chosen.Kind != provider.KindOpenAI:
 		return art.Endpoint{}, fmt.Errorf("the provider %q speaks the Anthropic API, which cannot generate images: the user has to choose an OpenAI-style provider for pictures", chosen.ID)
 	}
-	return art.Endpoint{BaseURL: chosen.BaseURL, Key: a.providerKeys[chosen.ID]}, nil
+	// Provider is filled in because the art package detects OpenRouter from it (openai.go isOpenRouter): an OpenRouter
+	// config can have any base URL, so the host alone is not enough. The provider ID never holds a key.
+	return art.Endpoint{BaseURL: chosen.BaseURL, Key: a.providerKeys[chosen.ID], Provider: chosen.ID}, nil
 }
