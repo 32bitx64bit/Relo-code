@@ -61,7 +61,7 @@ The CLI's events map to Relo's: each model call starts and ends a step (with its
 calls follow), text streams into the reply, tool calls show with their command or path, and the turn ends with the
 reply text and its usage (input, cache read, cache write, output and thinking, from the CLI's turn total).
 **Cancel** sends the CLI an interrupt: the turn ends as interrupted and the session keeps its conversation.
-**A timeout** interrupts, then kills the process if the CLI does not stop within 10 seconds. **A peer message**
+**A stalled turn** is bounded only by the orchestrator's silence watchdog, which interrupts the model call and, if it stays silent, ends the turn with an error. **A peer message**
 reaches the running turn at its next step; with no turn running it waits for the agent's next task, as it does on
 OpenCode.
 
@@ -101,7 +101,7 @@ checks it) on Haiku in 17 seconds.
 
 - `core/internal/claudecode`: the test binary doubles as a scripted CLI that speaks the stream protocol as recorded
   from claude 2.1.304 (`fake_test.go`). The tests cover the command line and prompt file, tool lists per role,
-  usage and step events, permission allow and deny, cancel and the next turn, timeout, a crash with the CLI's
+  usage and step events, permission allow and deny, cancel and the next turn, a crash with the CLI's
   error, peer messages mid-turn, the hub secret's file, the model catalog, the signed-out case and finding the
   CLI. `TestTranslatorOnRecordedLines` runs the event mapping on lines recorded from the real CLI.
 - `core/internal/runtime/mux_test.go`: routing by provider and by session prefix.

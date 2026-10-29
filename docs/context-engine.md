@@ -66,9 +66,9 @@ Worker transcripts are compressed into **parent reports** before Primary sees th
 
 ## Garbage collection / refresh
 
-Indicators: high utilization, repeated tool signatures, repeated failed edits, stalled progress, obsolete phase material, transcript bloat.
+Indicators: high utilization, repeated tool signatures, repeated failed edits, stalled progress, obsolete phase material, transcript bloat. No indicator triggers a refresh by itself.
 
-When `relo.context.autoRefresh` is on:
+Refresh runs only when a turn fails with a context-limit error (`MaybeRefresh` in `core/internal/context/gc.go`, called from `core/internal/orchestrator/worker.go`). Then Relo refreshes the context:
 
 ```text
 extract durable state → persist findings → drop ephemeral/history → new generation → new OpenCode session → same Relo agent

@@ -63,7 +63,9 @@ With `relo.scheduler.pathLeases` on (setting `pathLeases`, default `false`), a t
 
 Clients may coalesce state posts: the VS Code extension posts state at most once per ~50 ms (trailing edge, always the latest state).
 
-`cache.updated` event and `cache.get` response payload: `{ "session": { "hitRate": 0, "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }, "agents": [{ "agentId": "…", "generation": 0, "model": "…", "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "hitRate": 0 }] }`.
+`cache.updated` event and `cache.get` response payload: `{ "session": { "hitRate": 0, "input": 0, "output": 0, "reasoning": 0, "cacheRead": 0, "cacheWrite": 0 }, "agents": [{ "agentId": "…", "generation": 0, "model": "…", "role": "…", "profile": "…", "hitRate": 0, "input": 0, "output": 0, "reasoning": 0, "cacheRead": 0, "cacheWrite": 0 }] }`. `input`, `output` and `reasoning` are uncached; `cacheRead` and `cacheWrite` are never folded into them. `hitRate` = `cacheRead / (input + cacheRead + cacheWrite)`.
+
+`usage.updated` event payload, two shapes. Streaming (roughly every tick while a reply grows): `{ "agentId": "…", "tokens": 0, "cacheRead": 0, "cacheWrite": 0 }`, where `tokens` is a rough count of the reply so far and the cache fields are the agent's totals so far. Per completed model call: `{ "agentId": "…", "usedTokens": 0, "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }`, where `usedTokens` = input + output + reasoning for the agent (cache excluded) and the other fields are the agent's cumulative totals. `reasoning` is not on this event; it is in the session totals of `cache.updated`.
 
 `agent.escalated` payload: `{ "taskId": "…", "from": "…", "to": "…", "attempt": 2, "reason": "…" }`. Reducer updates matching task agent model, `escalatedFrom`, and attempt.
 
