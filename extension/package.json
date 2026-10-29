@@ -384,6 +384,18 @@
           "default": "",
           "description": "Cheap model for trivial and easy tasks and for probes. Put your cheapest model here; a stronger model here is paid for on every small task."
         },
+        "relo.primaryBackupModel": {
+          "type": "string", "default": "",
+          "description": "Optional primary backup model (provider/model)."
+        },
+        "relo.tier1BackupModel": {
+          "type": "string", "default": "",
+          "description": "Optional tier 1 backup model (provider/model)."
+        },
+        "relo.tier2BackupModel": {
+          "type": "string", "default": "",
+          "description": "Optional tier 2 backup model (provider/model)."
+        },
         "relo.routing.mode": {
           "type": "string",
           "enum": [
@@ -478,6 +490,10 @@
           "type": "object",
           "default": {},
           "description": "Optional model overrides by task difficulty: trivial, easy, medium, complex, hard, expert. Without a complex entry, complex tasks use the hard model."
+        },
+        "relo.routing.backupByDifficulty": {
+          "type": "object", "default": {},
+          "description": "Optional backup models by task difficulty, specified as provider/model."
         },
         "relo.routing.escalate": {
           "type": "boolean",

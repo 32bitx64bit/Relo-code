@@ -4,6 +4,56 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { md, submit, handleKeyDown, handleKeydown, isRunning } = require("./main.js");
 
+test("question cards show options, custom answer, provenance and delegation", () => {
+  const { questionCards, questionAnswerMessage } = require("./main.js");
+  const task = { id: "q1", title: "Pick", status: "awaiting_answer", blockedOn: { question: "Which?", options: [{ label: "A", recommended: true }, { label: "B", detail: "alternative" }] } };
+  const html = questionCards({ tasks: [task], session: { delegateAnswers: true } });
+  assert.match(html, /class="q-opt rec"[^>]*data-answer="A"/);
+  assert.match(html, /Recommended/);
+  assert.match(html, /alternative/);
+  assert.match(html, /class="qcard asking"/);
+  assert.match(html, /placeholder="Type your own answer/);
+  assert.match(html, /data-question-option="q1"/);
+  assert.match(html, /data-question-custom="q1"/);
+  assert.match(html, /data-question-delegate checked/);
+  assert.deepEqual(questionAnswerMessage("q1", " A "), { type: "question.answer", taskId: "q1", answer: "A" });
+  assert.equal(questionAnswerMessage("q1", "  "), null);
+  for (const source of ["user", "primary", "delegated"]) {
+    const resolved = questionCards({ tasks: [{ ...task, status: "queued", blockedOn: { ...task.blockedOn, resolution: "A", answeredBy: source } }] });
+    assert.match(resolved, new RegExp(`Answered by ${source}`));
+    assert.doesNotMatch(resolved, /data-question-option/);
+  }
+  assert.match(questionCards({ tasks: [{ ...task, title: '<img>', blockedOn: { question: '<script>' } }] }), /&lt;script&gt;/);
+  assert.match(questionCards({ tasks: [{ ...task, status: "queued", blockedOn: { ...task.blockedOn, resolution: "A", answeredBy: "user" } }] }), /class="qcard answered"/);
+  assert.equal(questionCards({ tasks: [], session: { delegateAnswers: true } }), "");
+});
+
+test("question cards are chat messages, slotted into the log where they were asked", () => {
+  const { chatFeed, chatItemCount } = require("./main.js");
+  const msg = (id, createdAt) => ({ id, role: "assistant", text: `text-${id}`, createdAt });
+  const task = (id, blockedAt) => ({ id, title: id, status: "awaiting_answer", blockedOn: { question: `ask-${id}`, blockedAt } });
+  const state = {
+    messages: [msg("m1", "2026-10-28T10:00:00Z"), msg("m2", "2026-10-28T10:05:00Z"), msg("m3", "2026-10-28T10:10:00Z")],
+    tasks: [task("late", "2026-10-28T10:07:00Z"), task("early", "2026-10-28T09:00:00Z"), task("unknown", "0001-01-01T00:00:00Z")],
+  };
+  const order = chatFeed(state).map((h) => (h.match(/text-m\d|ask-\w+/) || [])[0]);
+  assert.deepEqual(order, ["ask-early", "text-m1", "text-m2", "ask-late", "text-m3", "ask-unknown"]);
+  assert.equal(chatItemCount(state), 6);
+});
+
+test("backup settings use model pickers in their routing modes", () => {
+  const { settingsPageHtml, settingsKeysOf } = require("./main.js");
+  const keys = settingsKeysOf().find((g) => g.id === "models").keys;
+  for (const key of ["relo.primaryBackupModel", "relo.tier1BackupModel", "relo.tier2BackupModel", "relo.routing.backupByDifficulty"]) assert.ok(keys.includes(key));
+  const schema = Object.fromEntries(keys.map((key) => [key, { type: key.includes("Difficulty") ? "object" : "string" }]));
+  const simple = settingsPageHtml({ schema, values: { "relo.routing.mode": "simple" }, models: [] });
+  assert.match(simple, /data-mkey="relo.tier1BackupModel"/);
+  assert.doesNotMatch(simple, /data-mkey="relo.routing.backupByDifficulty"/);
+  const advanced = settingsPageHtml({ schema, values: { "relo.routing.mode": "advanced" }, models: [] });
+  assert.match(advanced, /data-mkey="relo.routing.backupByDifficulty" data-mlevel="complex"/);
+  assert.match(advanced, /data-mkey="relo.primaryBackupModel"/);
+});
+
 test("webview source exists and is not empty", () => {
   const src = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
   assert.ok(src.includes("Relo Code"));
@@ -840,4 +890,19 @@ test("markdown: a fence indented inside a list item loses that indent", () => {
   const code = out.match(/<pre><code>([\s\S]*?)<\/code><\/pre>/)[1];
   assert.equal(code, "npm test\n  --watch");
   assert.ok(out.includes('<ol start="2"><li>Next</li></ol>'));
+});
+
+test("integer art limits render as number inputs that keep 0 (unlimited) and offer min 0", () => {
+  const { settingsPageHtml } = require("./main.js");
+  const props = JSON.parse(fs.readFileSync(path.join(__dirname, "../../extension/package.json"), "utf8")).contributes.configuration.properties;
+  const keys = ["relo.art.sessionJobLimit", "relo.art.sessionBudgetUSD", "relo.art.candidates"];
+  const schema = Object.fromEntries(keys.map((k) => [k, props[k]]));
+  const defaults = Object.fromEntries(keys.map((k) => [k, props[k].default]));
+  assert.equal(props["relo.art.sessionJobLimit"].type, "integer");
+  const html = settingsPageHtml({ schema, values: { ...defaults, "relo.art.sessionJobLimit": 0, "relo.art.sessionBudgetUSD": 0 }, defaults, models: [] });
+  assert.match(html, /<input id="s-relo-art-sessionJobLimit" type="number" step="1" data-key="relo.art.sessionJobLimit" data-type="number" value="0" min="0" max="100000"/);
+  assert.match(html, /<input id="s-relo-art-sessionBudgetUSD" type="number" step="any" data-key="relo.art.sessionBudgetUSD" data-type="number" value="0" min="0"/);
+  assert.match(html, /data-key="relo.art.candidates" data-type="number" value="2" min="1"/);
+  const unset = settingsPageHtml({ schema, values: defaults, defaults, models: [] });
+  assert.match(unset, /data-key="relo.art.sessionJobLimit" data-type="number" value="25"/);
 });

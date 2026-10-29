@@ -53,3 +53,10 @@ test("TypeScript protocol covers Go and documented methods and events", () => {
     assert.ok(protocol.includes(`"${event}"`), `TypeScript protocol missing event ${event}`);
   }
 });
+
+test("question and fallback contracts remain documented", () => {
+  for (const token of ["awaiting_answer", "answeredBy", "question.answer", "question.delegate", "agent.fallback"]) {
+    assert.ok(protocol.includes(token), `protocol missing ${token}`);
+    assert.ok(docs.includes(token), `documentation missing ${token}`);
+  }
+});

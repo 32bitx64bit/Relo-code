@@ -340,6 +340,11 @@
     };
   }
 
+  // Messages plus question cards: what the chat log is made of.
+  function chatItemCount(s) {
+    return (s.messages || []).length + questionItems(s).length;
+  }
+
   // Where .messages should scroll after render: bottom when the user was near it or just sent, else keep position.
   function scrollAfterRender(prev, newCount, scrollHeight) {
     if (!prev) return scrollHeight;
@@ -696,15 +701,83 @@
     </div>`;
   }
 
+  const pendingQuestions = new Set();
+  const questionErrors = {};
+
+  function questionAnswerMessage(id, answer) {
+    const text = typeof answer === "string" ? answer.trim() : "";
+    return id && text ? { type: "question.answer", taskId: id, answer: text } : null;
+  }
+
+  // A pending question is a yellow "Question" card: the question, numbered option cards, then a custom-answer box.
+  // Once answered it turns into a green "Answered" card that shows the answer and who gave it. Cards are chat messages:
+  // each carries the time it was raised so chatFeed can slot it into the log where it was asked.
+  function questionItems(s) {
+    const tasks = (s.tasks || []).filter((t) => t.blockedOn && (t.status === "awaiting_answer" || t.blockedOn.resolution || t.blockedOn.answer));
+    return tasks.map((t) => {
+      const b = t.blockedOn;
+      const answered = b.resolution || b.answer;
+      const pending = pendingQuestions.has(t.id);
+      const options = Array.isArray(b.options) ? b.options.slice(0, 4) : [];
+      const question = esc(b.question || "Decision needed");
+      const task = `<span class="q-task" title="${attr(t.title)}">${esc(t.title)}</span>`;
+      const label = `aria-label="Question for ${attr(t.title)}"`;
+      const at = Date.parse(b.blockedAt);
+      const item = (html) => ({ at: at > Date.UTC(2000, 0, 1) ? at : Infinity, html }); // Go's zero time means "unknown": newest
+      if (answered) {
+        return item(`<section class="qcard answered" data-key="question-${attr(t.id)}" ${label}>
+        <div class="q-head"><span class="q-badge"><span class="codicon codicon-check" aria-hidden="true"></span>Answered</span>${task}</div>
+        <div class="q-text q-text-done">${question}</div>
+        <div class="q-answer"><span class="q-answer-label">Answer</span><span class="q-answer-text">${esc(answered)}</span></div>
+        <div class="q-meta"><span>Answered by ${esc(b.answeredBy || "unknown")}</span><span>Task ${esc(t.status)}</span></div>
+      </section>`);
+      }
+      const optionButtons = options.map((o, i) => `<button type="button" class="q-opt${o.recommended ? " rec" : ""}" data-question-option="${attr(t.id)}" data-answer="${attr(o.label)}"${pending ? " disabled" : ""}>
+          <span class="q-opt-key" aria-hidden="true">${i + 1}</span>
+          <span class="q-opt-body"><span class="q-opt-label">${esc(o.label)}</span>${o.detail ? `<span class="q-opt-detail">${esc(o.detail)}</span>` : ""}</span>
+          ${o.recommended ? `<span class="q-rec"><span class="codicon codicon-star-full" aria-hidden="true"></span>Recommended</span>` : ""}
+        </button>`).join("");
+      return item(`<section class="qcard asking" data-key="question-${attr(t.id)}" ${label}>
+        <div class="q-head"><span class="q-badge"><span class="codicon codicon-question" aria-hidden="true"></span>Question</span>${task}</div>
+        <div class="q-text">${question}</div>
+        ${options.length ? `<div class="q-label">Pick an option</div><div class="q-opts" role="group" aria-label="Suggested answers">${optionButtons}</div>` : ""}
+        <div class="q-label">${options.length ? "Or write your own" : "Your answer"}</div>
+        <div class="q-custom">
+          <textarea rows="2" maxlength="4000" data-question-input placeholder="Type your own answer…" aria-label="Custom answer for ${attr(t.title)}"${pending ? " disabled" : ""}></textarea>
+          <div class="q-custom-foot"><span class="q-hint">Ctrl/Cmd + Enter to send</span><button type="button" class="q-send" data-question-custom="${attr(t.id)}"${pending ? " disabled" : ""}><span class="codicon codicon-send" aria-hidden="true"></span>Send answer</button></div>
+        </div>
+        ${pending ? `<div class="q-status" role="status"><span class="codicon codicon-loading codicon-modifier-spin" aria-hidden="true"></span>Sending answer; waiting for task update…</div>` : ""}
+        ${questionErrors[t.id] ? `<div class="q-error" role="alert"><span class="codicon codicon-error" aria-hidden="true"></span><span>${esc(questionErrors[t.id])}</span></div>` : ""}
+        <label class="q-delegate"><input type="checkbox" data-question-delegate${s.session && s.session.delegateAnswers ? " checked" : ""}> Allow Primary to answer without cited evidence</label>
+      </section>`);
+    });
+  }
+
+  function questionCards(s) {
+    return questionItems(s).map((q) => q.html).join("");
+  }
+
+  // The chat log: messages in order, each question card slotted in before the first message newer than the question.
+  function chatFeed(s) {
+    const cards = questionItems(s).sort((a, b) => a.at - b.at);
+    const out = [];
+    for (const m of s.messages || []) {
+      const t = Date.parse(m.createdAt);
+      while (cards.length && cards[0].at < t) out.push(cards.shift().html);
+      out.push(msgHtml(m));
+    }
+    return out.concat(cards.map((q) => q.html));
+  }
+
   function chat() {
     const mode = currentMode();
-    const msgs = state.messages || [];
-    const emptyEl = msgs.length === 0 ? empty("Describe a task to start.") : "";
+    const feed = chatFeed(state);
+    const emptyEl = feed.length === 0 ? empty("Describe a task to start.") : "";
     const running = isRunning(state);
     const eff = (state.efficiency && state.efficiency.preset) || "off";
     return `${toolbar(state)}
     ${strip(state)}
-    <div class="messages" role="log" aria-label="Chat messages">${emptyEl}${msgs.map(msgHtml).join("")}</div>
+    <div class="messages" role="log" aria-label="Chat messages">${emptyEl}${feed.join("")}</div>
     ${runPanelHtml(state, Date.now(), runUi)}
     <div class="composer">
       <textarea id="box" rows="1" placeholder="Ask Relo…" aria-label="Message"></textarea>
@@ -769,7 +842,7 @@
 
   // Groups in display order. Each setting key is listed explicitly so unknown keys never render.
   const SETTINGS_GROUPS = [
-    { id: "models", title: "Models", keys: ["relo.routing.mode", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.routing.byDifficulty", "relo.routing.escalate", "relo.models.contextLimit"] },
+    { id: "models", title: "Models", keys: ["relo.routing.mode", "relo.primaryModel", "relo.primaryBackupModel", "relo.tier1Model", "relo.tier1BackupModel", "relo.tier2Model", "relo.tier2BackupModel", "relo.routing.byDifficulty", "relo.routing.backupByDifficulty", "relo.routing.escalate", "relo.models.contextLimit"] },
     { id: "providers", title: "Providers", keys: [] },
     { id: "efficiency", title: "Token saving", keys: ["relo.efficiency.preset", "relo.efficiency.voice", "relo.efficiency.craft", "relo.efficiency.planLean", "relo.efficiency.roles"] },
     { id: "agents", title: "Agents", keys: ["relo.maxConcurrentAgents", "relo.maxTier1Agents", "relo.maxTier2Agents", "relo.maxHierarchyDepth", "relo.maxRetries"] },
@@ -785,6 +858,10 @@
   // Short labels for keys whose property name is not readable on its own.
   const SETTING_LABELS = {
     "relo.routing.byDifficulty": "Routing by difficulty",
+    "relo.routing.backupByDifficulty": "Backup by difficulty",
+    "relo.primaryBackupModel": "Primary backup model",
+    "relo.tier1BackupModel": "Tier 1 backup model",
+    "relo.tier2BackupModel": "Tier 2 backup model",
     "relo.routing.escalate": "Escalate on failure",
     "relo.routing.mode": "Routing mode",
     "relo.models.contextLimit": "Context limit",
@@ -821,9 +898,9 @@
   };
 
   // Rows whose control gets the full width under the label.
-  const WIDE_KEYS = ["relo.routing.mode", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.routing.byDifficulty"];
-  const SIMPLE_ONLY = ["relo.tier1Model", "relo.tier2Model"];
-  const ADVANCED_ONLY = ["relo.routing.byDifficulty"];
+  const WIDE_KEYS = ["relo.routing.mode", "relo.primaryModel", "relo.primaryBackupModel", "relo.tier1Model", "relo.tier1BackupModel", "relo.tier2Model", "relo.tier2BackupModel", "relo.routing.byDifficulty", "relo.routing.backupByDifficulty"];
+  const SIMPLE_ONLY = ["relo.tier1Model", "relo.tier2Model", "relo.tier1BackupModel", "relo.tier2BackupModel"];
+  const ADVANCED_ONLY = ["relo.routing.byDifficulty", "relo.routing.backupByDifficulty"];
 
   const DIFFICULTY_LEVELS = ["trivial", "easy", "medium", "complex", "hard", "expert"];
 
@@ -1009,7 +1086,7 @@
   function modelPickerHtml(key, level, current, blank) {
     const pid = "mp-" + (key + (level ? "-" + level : "")).replace(/[^a-zA-Z0-9]/g, "-");
     const dataAttrs = `data-pid="${pid}" data-mkey="${attr(key)}"${level ? ` data-mlevel="${attr(level)}"` : ""} data-blank="${attr(blank)}"`;
-    const label = level ? `Model for ${level} tasks` : settingLabel(key);
+    const label = level ? `${key === "relo.routing.backupByDifficulty" ? "Backup model" : "Model"} for ${level} tasks` : settingLabel(key);
     if (!openPicker || openPicker.id !== pid) return pickerClosedHtml(pid, dataAttrs, label, current || blank);
     return pickerOpenHtml(pid, dataAttrs, label, (settingsCache && settingsCache.models) || [], current, blank, openPicker, uiCollapsed);
   }
@@ -1197,15 +1274,15 @@
     const id = "s-" + key.replace(/[^a-zA-Z0-9]/g, "-");
     const label = `<span class="sr-only">${esc(settingLabel(key))}</span>`;
     if (key === "relo.routing.mode") return modeToggleHtml(value);
-    if (key === "relo.primaryModel" || key === "relo.tier1Model" || key === "relo.tier2Model") {
+    if (["relo.primaryModel", "relo.tier1Model", "relo.tier2Model", "relo.primaryBackupModel", "relo.tier1BackupModel", "relo.tier2BackupModel"].includes(key)) {
       const current = typeof value === "string" ? value : "";
       return modelPickerHtml(key, "", current, "(none)") + modelDetailHtml(current);
     }
-    if (key === "relo.routing.byDifficulty") {
+    if (key === "relo.routing.byDifficulty" || key === "relo.routing.backupByDifficulty") {
       const map = value && typeof value === "object" && !Array.isArray(value) ? value : {};
       return DIFFICULTY_LEVELS.map((lvl) => {
         const cur = typeof map[lvl] === "string" ? map[lvl] : "";
-        return `<div class="table-line"><span class="mini lvl">${esc(lvl)}</span>${modelPickerHtml(key, lvl, cur, "(default)")}</div>`;
+        return `<div class="table-line"><span class="mini lvl">${esc(lvl)}</span>${modelPickerHtml(key, lvl, cur, key === "relo.routing.backupByDifficulty" ? "(none)" : "(default)")}</div>`;
       }).join("");
     }
     if (key === "relo.efficiency.roles") {
@@ -1217,10 +1294,10 @@
     if (sc.enum) {
       return `<select id="${id}" data-key="${esc(key)}" aria-label="${esc(settingLabel(key))}">${sc.enum.map((o) => `<option value="${attr(o)}"${o === value ? " selected" : ""}>${esc(titleCase(o))}</option>`).join("")}</select>`;
     }
-    if (sc.type === "number") {
+    if (sc.type === "number" || sc.type === "integer") {
       const min = sc.minimum !== undefined ? ` min="${attr(sc.minimum)}"` : "";
       const max = sc.maximum !== undefined ? ` max="${attr(sc.maximum)}"` : "";
-      return `<input id="${id}" type="number" step="any" data-key="${esc(key)}" data-type="number" value="${attr(value ?? "")}"${min}${max} aria-label="${esc(settingLabel(key))}"/>`;
+      return `<input id="${id}" type="number" step="${sc.type === "integer" ? "1" : "any"}" data-key="${esc(key)}" data-type="number" value="${attr(value ?? "")}"${min}${max} aria-label="${esc(settingLabel(key))}"/>`;
     }
     if (key === "relo.routing.escalate") {
       return `<input id="${id}" type="checkbox" data-key="${esc(key)}"${value ? " checked" : ""} aria-label="${esc(settingLabel(key))}"/>`;
@@ -1496,6 +1573,7 @@
       runPanelHtml: (s, now, ui) => withState(s, () => runPanelHtml(s, now, ui)),
       msgHtml: (m) => msgHtml(m),
       chatHtml: (s) => withState(s, chat),
+      questionCards, questionItems, chatFeed, chatItemCount, questionAnswerMessage,
       dashboardHtml: (s) => withState(s, dashboard),
       agentRowsHtml: (agents) => agentRows(agents),
       efficiencyHtml: (eff) => efficiencyHtml(eff),
@@ -1583,10 +1661,18 @@
         runUi.cardOpen = {};
         runUi.showAll = false;
         for (const k of Object.keys(checkOpen)) delete checkOpen[k];
+        pendingQuestions.clear();
+        for (const k of Object.keys(questionErrors)) delete questionErrors[k];
+      }
+      for (const t of state.tasks || []) {
+        if (t.blockedOn && (t.blockedOn.resolution || t.blockedOn.answer)) pendingQuestions.delete(t.id);
       }
       // An open provider form keeps focus: streaming state must not rebuild the page under the cursor.
       if (page === "settings" && (providerForm || openPicker)) persist();
       else render();
+    } else if (msg.type === "question.error") {
+      if (msg.taskId) { pendingQuestions.delete(msg.taskId); questionErrors[msg.taskId] = msg.error || "Answer failed"; }
+      render();
     } else if (msg.type === "settings") {
       settingsCache = msg;
       if (!uiCollapsedLoaded) { uiCollapsed = cleanCollapsed(msg.collapsed); uiCollapsedLoaded = true; }
@@ -1632,6 +1718,7 @@
     }
     patchAttrs(a, b);
     if (a.tagName === "TEXTAREA") return; // what the user typed is theirs
+    if (a.matches("[data-question-delegate]")) a.checked = b.checked;
     const value = a.tagName === "SELECT" ? b.value : null;
     patchChildren(a, b);
     if (value !== null && document.activeElement !== a && a.value !== value) a.value = value;
@@ -1695,7 +1782,7 @@
       autosize();
     }
     const m = document.querySelector(".messages");
-    if (m) m.scrollTop = scrollAfterRender(prev, (state.messages || []).length, m.scrollHeight);
+    if (m) m.scrollTop = scrollAfterRender(prev, chatItemCount(state), m.scrollHeight);
   }
 
   // 1s ticker: only text nodes change, the DOM is never rebuilt for time.
@@ -1725,7 +1812,7 @@
     lastKind = kind;
     rendering = false;
     if (inChat) restoreChatView(prevView || { draft: null, selStart: 0, selEnd: 0, focused: false, scrollTop: 0, nearBottom: true, msgCount: 0 });
-    if (inChat) renderedMsgCount = (state.messages || []).length;
+    if (inChat) renderedMsgCount = chatItemCount(state);
     else autosize();
     if (page === "settings" && view === "chat") {
       bindSettings();
@@ -1792,6 +1879,7 @@
     if (!t || !t.closest) return;
     const at = (selector) => t.closest(selector);
     let el;
+    if ((el = at("[data-question-option], [data-question-custom]"))) { sendQuestionAnswer(el); return; }
     if (menuOpen && !at("#more-menu") && !at("#more")) setMenu(false, false); // a click elsewhere closes the menu
     if ((el = at("[data-menu-cmd]"))) { setMenu(false, false); post({ type: "command", command: el.getAttribute("data-menu-cmd") }); return; }
     if (at("#more")) { setMenu(!menuOpen, true); return; }
@@ -1844,6 +1932,20 @@
     if ((el = at(".code-copy"))) copyCode(el);
   }
 
+  // Posts the answer for a question card: an option button sends its label, the send button sends the custom text.
+  function sendQuestionAnswer(el) {
+    const id = el.getAttribute("data-question-option") || el.getAttribute("data-question-custom");
+    const card = el.closest("section");
+    const input = card && card.querySelector("[data-question-input]");
+    const message = questionAnswerMessage(id, el.hasAttribute("data-question-option") ? el.getAttribute("data-answer") : input && input.value);
+    if (!message) { if (input) input.focus(); return; } // an empty custom answer sends nothing; put the cursor where it goes
+    if (pendingQuestions.has(id)) return;
+    pendingQuestions.add(id);
+    delete questionErrors[id];
+    post(message);
+    render();
+  }
+
   function onRootKeydown(e) {
     const t = e.target;
     if (!t || !t.closest) return;
@@ -1852,6 +1954,14 @@
       if (act === "ignore") return;
       e.preventDefault();
       if (act === "send") { submit(t, post); composerDraft = ""; autosize(); }
+      return;
+    }
+    if (t.matches("[data-question-input]")) {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        const send = t.closest("section") && t.closest("section").querySelector("[data-question-custom]");
+        if (send) sendQuestionAnswer(send);
+      }
       return;
     }
     if (t.id === "more") {
@@ -1881,6 +1991,7 @@
   root.addEventListener("change", (e) => {
     if (e.target && e.target.id === "mode") post({ type: "mode", mode: e.target.value });
     if (e.target && e.target.matches("[data-auto-apply]")) post({ type: "settings.set", key: "relo.changes.autoApply", value: e.target.checked });
+    if (e.target && e.target.matches("[data-question-delegate]")) post({ type: "question.delegate", enabled: e.target.checked });
   });
 
   function bindSettings() {

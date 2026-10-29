@@ -11,6 +11,7 @@ export const Methods = {
   changesList: "changes.list", changesAccept: "changes.accept", changesReject: "changes.reject", changesAcceptAll: "changes.acceptAll", changesRejectAll: "changes.rejectAll", changesDiff: "changes.diff", changesUndo: "changes.undo", changesRebase: "changes.rebase", changesResolve: "changes.resolve", changesResolveConflicts: "changes.resolveConflicts", workspaceDirty: "workspace.dirty", verificationList: "verification.list",
   modelsList: "models.list", modelsSet: "models.set", backendStatus: "backend.status", backendRestart: "backend.restart", settingsApply: "settings.apply", providersDiscover: "providers.discover", modeSet: "mode.set",
   orchestratorPause: "orchestrator.pause", orchestratorResume: "orchestrator.resume", orchestratorStopAll: "orchestrator.stopAll",
+  questionAnswer: "question.answer", questionDelegate: "question.delegate",
   permissionRespond: "permission.respond", canvasReply: "canvas.reply", logsTail: "logs.tail", snapshot: "snapshot", cacheGet: "cache.get",
 } as const;
 
@@ -72,12 +73,29 @@ export interface AgentInfo {
   outputTokens?: number;
 }
 
+export type TaskStatus = "queued" | "blocked" | "running" | "completed" | "failed" | "cancelled" | "review_required" | "awaiting_answer";
+
+export interface BlockedOn {
+  question?: string;
+  family?: string;
+  resolution?: string;
+  blockedAt?: string;
+  resolvedAt?: string;
+  options?: { label: string; detail?: string; recommended?: boolean }[];
+  answer?: string;
+  answeredBy?: "user" | "primary" | "delegated";
+  cite?: string;
+  answeredAt?: string;
+  consumedAt?: string;
+}
+
 export interface TaskInfo {
   id: string;
   title: string;
   description: string;
   acceptance: string[];
-  status: string;
+  status: TaskStatus | (string & {});
+  blockedOn?: BlockedOn;
   difficulty?: string;
   attempts?: number;
   model?: string;
@@ -130,6 +148,13 @@ export interface AgentEscalatedPayload extends Partial<AgentInfo> {
   escalatedFrom?: string;
   model?: string;
   reason?: string;
+}
+
+export interface AgentFallbackPayload {
+  agentId: string;
+  from: string;
+  model: string;
+  class: string;
 }
 
 export interface ChangeInfo {
@@ -225,7 +250,7 @@ export interface ReloState {
     claudeCode?: { enabled?: boolean; ready?: boolean; error?: string; version?: string; plan?: string; path?: string };
   };
   routing?: RoutingState;
-  session?: { id: string; objective: string; mode: string; status: string; running?: boolean };
+  session?: { id: string; objective: string; mode: string; status: string; running?: boolean; delegateAnswers?: boolean };
   sessions?: SessionSummary[];
   agents: AgentInfo[];
   tasks: TaskInfo[];
@@ -243,6 +268,10 @@ export interface ReloState {
 export interface InitializeSettings {
   refreshThreshold: number;
   byDifficulty: Record<string, string>;
+  backupByDifficulty: Record<string, string>;
+  primaryBackupModel: string;
+  tier1BackupModel: string;
+  tier2BackupModel: string;
   escalate: boolean;
   reportMaxChars: number;
   efficiency: { preset: string; voice: string; craft: string; roles: Record<string, unknown>; planLean: boolean };
@@ -373,6 +402,12 @@ export function reduce(state: ReloState, event: string, payload: unknown): ReloS
       }
       break;
     }
+    case "agent.fallback": {
+      const fallback = payload as AgentFallbackPayload;
+      const agent = next.agents.find((item) => item.id === fallback.agentId);
+      if (agent && typeof fallback.model === "string") next.agents = upsertAgent(next.agents, { ...agent, model: fallback.model });
+      break;
+    }
     case "task.created":
     case "task.updated":
     case "task.completed":
@@ -437,7 +472,7 @@ function upsertAgent(list: AgentInfo[], item: AgentInfo): AgentInfo[] {
 }
 
 export const Events = [
-  "session.created", "session.opened", "session.updated", "agent.created", "agent.started", "agent.activity", "agent.updated", "agent.completed", "agent.failed", "agent.escalated",
+  "session.created", "session.opened", "session.updated", "agent.created", "agent.started", "agent.activity", "agent.updated", "agent.completed", "agent.failed", "agent.escalated", "agent.fallback",
   "context.created", "context.refreshed", "context.compressed", "context.stale", "context.replaced", "context.item.promoted", "context.item.dropped",
   "task.created", "task.updated", "task.completed", "task.failed", "finding.created", "finding.verified", "memory.updated",
   "usage.updated", "changes.updated", "verification.started", "verification.completed", "backend.status", "permission.asked",

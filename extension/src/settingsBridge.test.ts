@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
-import { CORE_SETTING_SECTIONS, checkCommand, checkSessionId, checkSetting, isAllowedCommand, modelsSignature, settingsReply, type SettingsSchema } from "./settingsBridge";
+import { CORE_SETTING_SECTIONS, checkCommand, checkQuestionMessage, checkSessionId, checkSetting, isAllowedCommand, modelsSignature, settingsReply, type SettingsSchema } from "./settingsBridge";
+import { emptyState, reduce } from "./protocol";
 
 const schema: SettingsSchema = {
   "relo.primaryModel": { type: "string", default: "" },
@@ -12,6 +13,36 @@ const schema: SettingsSchema = {
   "relo.providers": { type: "array", default: [] },
   "other.key": { type: "string", default: "" },
 };
+
+test("backup settings are declared, reapplied and sent to core", () => {
+  const actual: SettingsSchema = JSON.parse(readFileSync("package.json", "utf8")).contributes.configuration.properties;
+  const source = readFileSync("src/extension.ts", "utf8");
+  for (const name of ["primaryBackupModel", "tier1BackupModel", "tier2BackupModel"]) {
+    assert.equal(actual[`relo.${name}`].default, "");
+    assert.ok(CORE_SETTING_SECTIONS.includes(`relo.${name}`));
+    assert.ok(source.includes(`${name}: c.get<string>("${name}", "")`));
+    assert.equal(checkSetting(`relo.${name}`, "owner/model", actual).ok, true);
+  }
+  assert.deepEqual(actual["relo.routing.backupByDifficulty"].default, {});
+  assert.ok(source.includes('backupByDifficulty: c.get<Record<string, string>>("routing.backupByDifficulty", {})'));
+  assert.equal(checkSetting("relo.routing.backupByDifficulty", { complex: "owner/model" }, actual).ok, true);
+});
+
+test("question bridge validates answer and delegation payloads", () => {
+  assert.deepEqual(checkQuestionMessage({ type: "question.answer", taskId: "task1", answer: " yes " }), { method: "question.answer", params: { taskId: "task1", answer: "yes" } });
+  assert.deepEqual(checkQuestionMessage({ type: "question.delegate", enabled: false }), { method: "question.delegate", params: { enabled: false } });
+  assert.equal(checkQuestionMessage({ type: "question.answer", taskId: "task1", answer: "  " }), undefined);
+  assert.equal(checkQuestionMessage({ type: "question.delegate", enabled: "true" }), undefined);
+});
+
+test("fallback event updates the existing agent model", () => {
+  const state = emptyState();
+  state.agents = [{ id: "a", role: "worker", tier: "tier1", title: "task", status: "running", model: "main/model", scope: "", workspace: "", generation: 1, budget: 0, usedTokens: 0, activity: "running" }];
+  const updated = reduce(state, "agent.fallback", { agentId: "a", from: "main/model", model: "backup/model", class: "quota" });
+  assert.equal(updated.agents[0].model, "backup/model");
+  assert.equal(updated.agents[0].status, "running");
+  assert.equal(state.agents[0].model, "main/model");
+});
 
 test("workspace mode: the manifest default is virtual, and the extension fallback matches it", () => {
   const manifest = JSON.parse(readFileSync("package.json", "utf8"));
@@ -205,4 +236,22 @@ test("every setting sent to the core re-applies when it changes", () => {
   assert.ok(keys.length > 50, `the scan found only ${keys.length} settings`);
   const covered = (key: string) => CORE_SETTING_SECTIONS.some((section) => key === section || key.startsWith(`${section}.`));
   assert.deepEqual(keys.filter((key) => !covered(key)), []);
+});
+
+test("art limit settings accept 0 as unlimited and survive the bridge", () => {
+  const actual: SettingsSchema = JSON.parse(readFileSync("package.json", "utf8")).contributes.configuration.properties;
+  const source = readFileSync("src/extension.ts", "utf8");
+  for (const [key, def] of [["relo.art.sessionJobLimit", 25], ["relo.art.sessionBudgetUSD", 10]] as const) {
+    assert.equal(actual[key].minimum, 0, key);
+    assert.equal(actual[key].default, def, key);
+    assert.deepEqual(checkSetting(key, 0, actual), { ok: true, subkey: key.slice("relo.".length), value: 0 }, key);
+    assert.equal(checkSetting(key, 7, actual).ok, true, key);
+    assert.equal(checkSetting(key, -1, actual).ok, false, key);
+    assert.equal(checkSetting(key, "0", actual).ok, false, key);
+    assert.equal(settingsReply({ [key]: 0 }, actual, []).values[key], 0, key);
+  }
+  assert.equal(checkSetting("relo.art.sessionJobLimit", 1.5, actual).ok, false);
+  assert.equal(checkSetting("relo.art.sessionJobLimit", 100001, actual).ok, false);
+  assert.ok(source.includes('sessionJobLimit: c.get<number>("art.sessionJobLimit", 25)'));
+  assert.ok(CORE_SETTING_SECTIONS.includes("relo.art.sessionJobLimit") || CORE_SETTING_SECTIONS.includes("relo.art"));
 });

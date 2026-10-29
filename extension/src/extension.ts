@@ -5,7 +5,7 @@ import { repositoryInfo, snapRepository } from "./repository";
 import { CoreClient } from "./client";
 import { emptyState, reduce, routingFrom, type ReloState, type AgentInfo, type CacheInfo, type ChangeDiff, type SessionSummary, normalizeCache } from "./protocol";
 import { ChatView, openDashboard, openInspector } from "./webview";
-import { CORE_SETTING_SECTIONS, checkCommand, checkSessionId, checkSetting, modelsSignature, settingsReply, type SettingsSchema } from "./settingsBridge";
+import { CORE_SETTING_SECTIONS, checkCommand, checkQuestionMessage, checkSessionId, checkSetting, modelsSignature, settingsReply, type SettingsSchema } from "./settingsBridge";
 import { applyCollapse, cleanCollapsed, type Collapsed } from "./uiState";
 import { CrashBreaker } from "./crashBreaker";
 import { PROVIDER_ID_RE, sanitizeDiscovered, sanitizeProviderList, secretKey, validateBaseURL, validateProvider, MAX_PROVIDERS, type ProviderConfig } from "./providers";
@@ -254,6 +254,17 @@ function onWebviewMessage(ctx: vscode.ExtensionContext, m: unknown): void {
   const msg = (m ?? {}) as { type?: string; key?: unknown; value?: unknown; command?: unknown; id?: unknown; provider?: unknown; apiKey?: unknown; requestId?: unknown };
   const schema = settingsSchema(ctx);
   switch (msg.type) {
+    case "question.answer":
+    case "question.delegate": {
+      const request = checkQuestionMessage(m as { type?: unknown; taskId?: unknown; answer?: unknown; enabled?: unknown });
+      if (!request) return;
+      void client.request(request.method, request.params).catch((err) => {
+        const error = errorText(err);
+        chat.send({ type: "question.error", taskId: request.params.taskId, error });
+        void vscode.window.showErrorMessage(`Relo: ${request.method} failed: ${error}`);
+      });
+      return;
+    }
     case "settings.get":
       void postSettings(schema);
       return;
@@ -770,6 +781,9 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
       approval: c.get<string>("art.approval", "session"),
     },
     primaryModel: c.get("primaryModel"),
+    primaryBackupModel: c.get<string>("primaryBackupModel", ""),
+    tier1BackupModel: c.get<string>("tier1BackupModel", ""),
+    tier2BackupModel: c.get<string>("tier2BackupModel", ""),
     tier1Model: c.get("tier1Model"),
     tier2Model: c.get("tier2Model"),
     maxConcurrentAgents: c.get("maxConcurrentAgents"),
@@ -788,6 +802,7 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
     autoReview: c.get("autoReview"),
     logLevel: c.get("logLevel"),
     byDifficulty: c.get<Record<string, string>>("routing.byDifficulty", {}),
+    backupByDifficulty: c.get<Record<string, string>>("routing.backupByDifficulty", {}),
     escalate: c.get<boolean>("routing.escalate", true),
     reportMaxChars: c.get<number>("report.maxChars", 1200),
     efficiency: {

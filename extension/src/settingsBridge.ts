@@ -27,6 +27,7 @@ function jsonLength(value: unknown): number {
 // reaches the core when it next starts, so the Settings page appears to save it and the core goes on with the old value.
 export const CORE_SETTING_SECTIONS = [
   "relo.routing", "relo.models", "relo.providers", "relo.primaryModel", "relo.tier1Model", "relo.tier2Model",
+  "relo.primaryBackupModel", "relo.tier1BackupModel", "relo.tier2BackupModel",
   "relo.context", "relo.efficiency", "relo.permissions", "relo.report", "relo.logLevel",
   "relo.maxConcurrentAgents", "relo.maxTier1Agents", "relo.maxTier2Agents", "relo.maxHierarchyDepth", "relo.maxRetries",
   "relo.autoVerify", "relo.autoReview",
@@ -34,6 +35,14 @@ export const CORE_SETTING_SECTIONS = [
   "relo.changes.unionPaths", "relo.changes.takeLatestPaths", "relo.scheduler.pathLeases",
   "relo.workspace", "relo.claudeCode", "relo.art", "relo.runtime", "relo.openCode",
 ];
+
+export function checkQuestionMessage(msg: { type?: unknown; taskId?: unknown; answer?: unknown; enabled?: unknown }): { method: string; params: Record<string, unknown> } | undefined {
+  if (msg.type === "question.answer" && typeof msg.taskId === "string" && msg.taskId.length > 0 && msg.taskId.length <= 200 && typeof msg.answer === "string" && msg.answer.trim() && msg.answer.length <= 4000) {
+    return { method: "question.answer", params: { taskId: msg.taskId, answer: msg.answer.trim() } };
+  }
+  if (msg.type === "question.delegate" && typeof msg.enabled === "boolean") return { method: "question.delegate", params: { enabled: msg.enabled } };
+  return undefined;
+}
 
 // Commands the webview may trigger. Anything else is dropped.
 export const COMMAND_ALLOWLIST = new Set<string>([
@@ -125,7 +134,9 @@ export function checkSetting(key: unknown, value: unknown, schema: SettingsSchem
       if (typeof value !== "boolean") return { ok: false, reason: "expected boolean" };
       break;
     case "number":
+    case "integer":
       if (typeof value !== "number" || !Number.isFinite(value)) return { ok: false, reason: "expected finite number" };
+      if (entry.type === "integer" && !Number.isInteger(value)) return { ok: false, reason: "expected integer" };
       if (entry.minimum !== undefined && value < entry.minimum) return { ok: false, reason: "below minimum" };
       if (entry.maximum !== undefined && value > entry.maximum) return { ok: false, reason: "above maximum" };
       break;
