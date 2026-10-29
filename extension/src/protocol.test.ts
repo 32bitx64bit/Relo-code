@@ -64,6 +64,25 @@ test("cache reducer accepts metrics snapshot usage shape", () => {
   assert.equal(state.cache?.agents[0].input, 2);
 });
 
+test("usage.updated sets live usedTokens and per-agent cache apart from it", () => {
+  let state = reduce(emptyState(), "agent.updated", { id: "a", generation: 2, model: "sonnet", usedTokens: 100 });
+  state = reduce(state, "usage.updated", { agentId: "a", usedTokens: 1500, input: 1000, output: 500, cacheRead: 12000, cacheWrite: 3000 });
+  assert.equal(state.agents[0].usedTokens, 1500);
+  const row = state.cache?.agents[0];
+  assert.equal(row?.cacheRead, 12000);
+  assert.equal(row?.cacheWrite, 3000);
+  assert.equal(row?.hitRate, 12000 / 16000);
+  assert.equal(row?.generation, 2);
+  // Streaming tick: `tokens` is not usedTokens and cache totals only move forward on the payload.
+  state = reduce(state, "usage.updated", { agentId: "a", tokens: 7, cacheRead: 13000, cacheWrite: 3000 });
+  assert.equal(state.agents[0].usedTokens, 1500);
+  assert.equal(state.cache?.agents[0].cacheRead, 13000);
+  assert.equal(state.cache?.agents[0].input, 1000);
+  // Unknown agent: no partial agent is created.
+  state = reduce(state, "usage.updated", { agentId: "ghost", usedTokens: 9 });
+  assert.equal(state.agents.length, 1);
+});
+
 test("agent escalation updates agent from task event", () => {
   let state = reduce(emptyState(), "agent.created", { id: "a", taskId: "task-a", title: "Worker", role: "worker", tier: "tier1", model: "haiku", attempt: 1, status: "running" });
   state = reduce(state, "agent.escalated", { taskId: "task-a", from: "haiku", to: "sonnet", attempt: 2 });

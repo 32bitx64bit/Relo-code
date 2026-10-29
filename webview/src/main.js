@@ -477,7 +477,7 @@
     const rows = agents.map((a) => {
       const p = ctxFill(a) || 0;
       const ca = perAgent[a.id];
-      const agentHit = ca ? ` · cache ${Math.round((ca.hitRate || 0) * 100)}%` : "";
+      const agentHit = ca ? ` · cache ${Math.round((ca.hitRate || 0) * 100)}% · read ${fmtTokens(ca.cacheRead)} · write ${fmtTokens(ca.cacheWrite)}` : "";
       return `<div class="drawer-row" role="treeitem" aria-level="1" style="flex-wrap:wrap">
         <span class="grow">${esc(a.title || a.role || a.id)} <span class="mini">gen ${esc(a.generation || 0)}${esc(agentHit)}</span></span>
         <span class="mini" title="${attr(fmtTokens(a.usedTokens || 0) + " tokens used in total")}">${esc(ctxLabel(a))}</span>
@@ -649,11 +649,11 @@
     const total = (c.input || 0) + (c.cacheRead || 0) + (c.cacheWrite || 0);
     const given = typeof c.hitRate === "number" ? c.hitRate : null;
     const pct = given !== null ? given * 100 : (total ? (c.cacheRead || 0) * 100 / total : 0);
-    return [`Cache ${pct.toFixed(0)}%`, `In ${fmtTokens(c.input)}`, `Out ${fmtTokens(c.output)}`];
+    return [`Cache ${pct.toFixed(0)}%`, `In ${fmtTokens(c.input)}`, `Out ${fmtTokens(c.output)}`, `Read ${fmtTokens(c.cacheRead)}`, `Write ${fmtTokens(c.cacheWrite)}`];
   }
 
   function cacheTitle() {
-    return "Cache hit: cacheRead / (input + cacheRead + cacheWrite)";
+    return "Cache hit: cacheRead / (input + cacheRead + cacheWrite). Read and Write are cache tokens, not counted in tokens used.";
   }
 
   function currentMode() {
@@ -846,7 +846,7 @@
     { id: "providers", title: "Providers", keys: [] },
     { id: "efficiency", title: "Token saving", keys: ["relo.efficiency.preset", "relo.efficiency.voice", "relo.efficiency.craft", "relo.efficiency.planLean", "relo.efficiency.roles"] },
     { id: "agents", title: "Agents", keys: ["relo.maxConcurrentAgents", "relo.maxTier1Agents", "relo.maxTier2Agents", "relo.maxHierarchyDepth", "relo.maxRetries"] },
-    { id: "context", title: "Context", keys: ["relo.context.compactAt", "relo.context.autoRefresh", "relo.context.refreshThreshold", "relo.context.maxUtilization", "relo.context.compressionStrategy", "relo.context.keepRawHistory", "relo.context.projectMemory"] },
+    { id: "context", title: "Context", keys: ["relo.context.compactAt", "relo.context.maxUtilization", "relo.context.compressionStrategy", "relo.context.keepRawHistory", "relo.context.projectMemory"] },
     { id: "changes", title: "Changes", keys: ["relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics"] },
     { id: "verification", title: "Verification", keys: ["relo.autoVerify", "relo.autoReview", "relo.report.maxChars"] },
     { id: "permissions", title: "Permissions", keys: ["relo.permissions.read", "relo.permissions.write", "relo.permissions.test", "relo.permissions.build", "relo.permissions.install", "relo.permissions.delete", "relo.permissions.gitCommit", "relo.permissions.gitPush", "relo.permissions.network", "relo.permissions.outside", "relo.permissions.destructive", "relo.permissions.yolo"] },
@@ -871,8 +871,6 @@
     "relo.efficiency.planLean": "Fewer agents",
     "relo.efficiency.roles": "Per-role overrides",
     "relo.context.compactAt": "Compact at",
-    "relo.context.autoRefresh": "Auto refresh",
-    "relo.context.refreshThreshold": "Refresh threshold",
     "relo.context.maxUtilization": "Max utilization",
     "relo.context.compressionStrategy": "Compression strategy",
     "relo.context.keepRawHistory": "Keep raw history",
@@ -1489,11 +1487,13 @@
     const verification = (state.verification || []).length;
     const mode = currentMode();
     const tokens = agents.reduce((n, a) => n + (a.usedTokens || 0), 0);
+    const cacheSession = (state.cache && state.cache.session) || {};
+    const cacheNote = ` · cache read ${fmtTokens(cacheSession.cacheRead)}, write ${fmtTokens(cacheSession.cacheWrite)} (not in tokens used)`;
     return `<header class="header">
       <span class="status-dot ${statusCls()}"></span>
       <span class="header-title">Relo Code</span>
       <span class="header-meta">${esc(statusLabel())}</span>
-      ${agents.length ? `<span class="header-spacer"></span><span class="header-meta header-counts" title="${esc(plural(agents.length, "agent") + " · " + plural(tasks.length, "task") + " · " + fmtTokens(tokens) + " tokens used in total, counting every model call")}">${esc(plural(agents.length, "agent"))} · ${esc(plural(tasks.length, "task"))} · ${esc(fmtTokens(tokens))} tokens</span>` : ""}
+      ${agents.length ? `<span class="header-spacer"></span><span class="header-meta header-counts" title="${esc(plural(agents.length, "agent") + " · " + plural(tasks.length, "task") + " · " + fmtTokens(tokens) + " tokens used in total, counting every model call" + cacheNote)}">${esc(plural(agents.length, "agent"))} · ${esc(plural(tasks.length, "task"))} · ${esc(fmtTokens(tokens))} tokens</span>` : ""}
     </header>
     <div class="dashboard-grid">
       <div class="col">

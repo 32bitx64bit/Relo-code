@@ -138,6 +138,18 @@ export interface CacheInfo {
   agents: CacheAgentInfo[];
 }
 
+// usage.updated: streaming ticks carry `tokens` (reply so far); per completed call carry `usedTokens` plus agent totals.
+// cacheRead/cacheWrite/input/output are the agent's cumulative totals; usedTokens = input + output + reasoning (cache excluded).
+export interface UsageUpdatedPayload {
+  agentId: string;
+  tokens?: number;
+  usedTokens?: number;
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+}
+
 export interface AgentEscalatedPayload extends Partial<AgentInfo> {
   id?: string;
   agentId?: string;
@@ -266,7 +278,6 @@ export interface ReloState {
 }
 
 export interface InitializeSettings {
-  refreshThreshold: number;
   byDifficulty: Record<string, string>;
   backupByDifficulty: Record<string, string>;
   primaryBackupModel: string;
@@ -384,6 +395,18 @@ export function reduce(state: ReloState, event: string, payload: unknown): ReloS
     case "cache.updated":
       next.cache = normalizeCache(payload);
       break;
+    case "usage.updated": {
+      const usage = payload as UsageUpdatedPayload;
+      const id = typeof usage?.agentId === "string" ? usage.agentId : "";
+      if (!id) break;
+      const agent = next.agents.find((a) => a.id === id);
+      // Only a known agent gets a usedTokens update; a partial agent must not be created here.
+      if (agent && typeof usage.usedTokens === "number") next.agents = upsertAgent(next.agents, { ...agent, usedTokens: usage.usedTokens });
+      if (typeof usage.cacheRead === "number" || typeof usage.cacheWrite === "number" || typeof usage.input === "number" || typeof usage.output === "number") {
+        next.cache = withAgentUsage(next.cache, id, agent, usage);
+      }
+      break;
+    }
     case "agent.created":
     case "agent.started":
     case "agent.completed":
@@ -514,4 +537,27 @@ export function normalizeCache(value: unknown): CacheInfo {
     };
   };
   return { session: row(raw?.session), agents: (raw?.agents ?? []).map(row) };
+}
+
+// Merges one agent's cumulative totals from usage.updated into the cache view; session totals stay with cache.updated.
+function withAgentUsage(cache: CacheInfo | undefined, agentId: string, agent: AgentInfo | undefined, usage: UsageUpdatedPayload): CacheInfo {
+  const base: CacheInfo = cache ?? { session: { hitRate: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, agents: [] };
+  const old = base.agents.find((a) => a.agentId === agentId);
+  const num = (value: number | undefined, fallback: number | undefined) => (typeof value === "number" ? value : fallback ?? 0);
+  const input = num(usage.input, old?.input);
+  const cacheRead = num(usage.cacheRead, old?.cacheRead);
+  const cacheWrite = num(usage.cacheWrite, old?.cacheWrite);
+  const total = input + cacheRead + cacheWrite;
+  const row: CacheAgentInfo = {
+    agentId,
+    generation: agent?.generation ?? old?.generation ?? 0,
+    model: agent?.model ?? old?.model ?? "",
+    input,
+    output: num(usage.output, old?.output),
+    cacheRead,
+    cacheWrite,
+    hitRate: total ? cacheRead / total : 0,
+  };
+  const agents = old ? base.agents.map((a) => (a.agentId === agentId ? row : a)) : [...base.agents, row];
+  return { session: base.session, agents };
 }

@@ -793,8 +793,6 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
     maxRetries: c.get("maxRetries"),
     maxUtilization: c.get("context.maxUtilization"),
     compactAt: c.get("context.compactAt"),
-    refreshThreshold: c.get("context.refreshThreshold"),
-    autoRefresh: c.get("context.autoRefresh"),
     keepRawHistory: c.get("context.keepRawHistory"),
     projectMemory: c.get("context.projectMemory"),
     compressionStrategy: c.get("context.compressionStrategy"),

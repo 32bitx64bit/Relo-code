@@ -328,6 +328,23 @@ test("context drawer: per-agent used/budget and cache hit rate from state.cache"
   assert.ok(html.includes('class="agent-bar" style="width:42%"'));
 });
 
+test("cache read and write show apart from tokens used, in drawer, cache line and header", () => {
+  const s = {
+    agents: [{ id: "a1", title: "Primary", usedTokens: 1500, contextTokens: 1000, window: 100000, generation: 1 }],
+    cache: {
+      session: { hitRate: 0.8, input: 1000, output: 500, cacheRead: 12000, cacheWrite: 3000 },
+      agents: [{ agentId: "a1", input: 1000, output: 500, cacheRead: 12000, cacheWrite: 3000, hitRate: 0.8 }],
+    },
+  };
+  const drawer = mainApi.drawerHtml("context", s);
+  assert.ok(drawer.includes("read 12.0k · write 3.0k"));
+  assert.ok(drawer.includes("1.5k tokens used in total"));
+  const dash = mainApi.dashboardHtml(s);
+  assert.ok(dash.includes("Read 12.0k  Write 3.0k"));
+  assert.ok(dash.includes("cache read 12.0k, write 3.0k (not in tokens used)"));
+  assert.ok(dash.includes("1.5k tokens"));
+});
+
 const modelsFx = [
   { id: "claude-opus-4", provider: "anthropic", context: 200000, efforts: ["low", "medium", "high"] },
   { id: "acme-mini", provider: "acme", context: 32000 },

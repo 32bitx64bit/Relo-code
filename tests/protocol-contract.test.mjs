@@ -60,3 +60,12 @@ test("question and fallback contracts remain documented", () => {
     assert.ok(docs.includes(token), `documentation missing ${token}`);
   }
 });
+
+test("usage.updated reducer case and payload fields match the documented contract", () => {
+  assert.match(protocol, /case "usage\.updated"/);
+  assert.match(protocol, /export interface UsageUpdatedPayload/);
+  for (const field of ["usedTokens", "input", "output", "cacheRead", "cacheWrite"]) {
+    assert.ok(docs.includes(`"${field}"`), `documentation missing usage.updated field ${field}`);
+    assert.match(protocol, new RegExp(`\\b${field}\\?: number`), `UsageUpdatedPayload missing ${field}`);
+  }
+});
