@@ -157,3 +157,60 @@ func mustTime(t *testing.T) time.Time {
 	}
 	return ts
 }
+
+func TestNearCopy(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b Task
+		want bool
+	}{
+		{"reworded stage 2",
+			Task{Title: "SPT stage 2 per spt-impl-plan contract", Role: "worker", Scope: "core"},
+			Task{Title: "SPT stage 2", Role: "worker", Scope: "core"}, false},
+		{"S-shorthand stage 3",
+			Task{Title: "SPT S3 per the impl plan", Role: "worker"},
+			Task{Title: "SPT stage 3 (retry)", Role: "worker"}, false},
+		{"different login work", Task{Title: "Fix login bug", Role: "worker"}, Task{Title: "Fix logout bug", Role: "worker"}, false},
+		{"different response work", Task{Title: "Parse request body", Role: "worker"}, Task{Title: "Parse response body", Role: "worker"}, false},
+		{"different sub-id", Task{Title: "SPT S3d Implement diplomacy interactions", Role: "worker"}, Task{Title: "SPT S3e Implement diplomacy interactions", Role: "worker"}, false},
+		{"reworded sub-id", Task{Title: "SPT S3d Implement diplomacy interactions", Role: "worker"}, Task{Title: "SPT S3d Build diplomacy interactions", Role: "worker"}, true},
+		{"sub-id after parent stage differs",
+			Task{Title: "SPT stage 3 batch S3a: Implement diplomacy interactions", Role: "worker"},
+			Task{Title: "SPT stage 3 batch S3c: Implement diplomacy interactions", Role: "worker"}, false},
+		{"sub-id after parent stage, other sub-id",
+			Task{Title: "SPT stage 3 batch S3d: Implement diplomacy interactions", Role: "worker"},
+			Task{Title: "SPT stage 3 batch S3e: Implement diplomacy interactions", Role: "worker"}, false},
+		{"reworded copy with same sub-id after parent stage",
+			Task{Title: "SPT stage 3 batch S3a: Implement diplomacy interactions", Role: "worker"},
+			Task{Title: "SPT stage 3 batch S3a: Build diplomacy interactions", Role: "worker"}, true},
+		{"same stage different content", Task{Title: "SPT stage 3 diplomacy", Role: "worker"}, Task{Title: "SPT stage 3 combat", Role: "worker"}, false},
+		{"different stage",
+			Task{Title: "Widget stage 2", Role: "worker", Scope: "core"},
+			Task{Title: "Widget stage 3", Role: "worker", Scope: "core"}, false},
+		{"unrelated same role",
+			Task{Title: "Fix parser", Role: "worker", Scope: "core"},
+			Task{Title: "Redesign settings page", Role: "worker", Scope: "ui"}, false},
+		{"same title other role",
+			Task{Title: "Widget stage 2", Role: "worker"},
+			Task{Title: "Widget stage 2", Role: "probe"}, false},
+		{"close title",
+			Task{Title: "Refactor the dispatch retry loop", Role: "worker"},
+			Task{Title: "Refactor dispatch retry loop", Role: "worker"}, true},
+		{"loose title with same scope",
+			Task{Title: "alpha beta gamma delta epsilon", Role: "worker", Scope: "core"},
+			Task{Title: "alpha beta gamma zeta eta", Role: "worker", Scope: "core"}, true},
+		{"loose title with other scope",
+			Task{Title: "alpha beta gamma delta epsilon", Role: "worker", Scope: "core"},
+			Task{Title: "alpha beta gamma zeta eta", Role: "worker", Scope: "ui"}, false},
+		{"empty titles",
+			Task{Role: "worker"}, Task{Role: "worker"}, false},
+	}
+	for _, tc := range cases {
+		if got := NearCopy(tc.a, tc.b); got != tc.want {
+			t.Errorf("%s: NearCopy = %v, want %v", tc.name, got, tc.want)
+		}
+		if got := NearCopy(tc.b, tc.a); got != tc.want {
+			t.Errorf("%s: NearCopy reversed = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

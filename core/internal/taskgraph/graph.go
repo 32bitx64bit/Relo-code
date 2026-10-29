@@ -19,16 +19,49 @@ const (
 	Failed   Status = "failed"
 	Canceled Status = "cancelled"
 	Review   Status = "review_required"
+	// Asking: an open question for the user. It is neither failed nor done, and the graph is not settled while any task asks.
+	Asking Status = "awaiting_answer"
 )
+
+// AnswerSource names who answered a BlockedOn question.
+type AnswerSource string
+
+const (
+	AnsweredByUser      AnswerSource = "user"
+	AnsweredByPrimary   AnswerSource = "primary"
+	AnsweredByDelegated AnswerSource = "delegated"
+)
+
+// Option is one suggested answer to a blocked question. The user may also give a custom answer.
+type Option struct {
+	Label       string `json:"label"`
+	Detail      string `json:"detail,omitempty"`
+	Recommended bool   `json:"recommended,omitempty"`
+}
 
 // BlockedOn records why a task is parked waiting on a human answer. A task is
 // unresolved while Resolution is empty; clearing Resolution releases it.
 type BlockedOn struct {
-	Question   string    `json:"question,omitempty"` // the pinned question awaiting an answer
-	Family     string    `json:"family,omitempty"`   // family key of the respawn loop this question belongs to
-	Resolution string    `json:"resolution,omitempty"`
-	BlockedAt  time.Time `json:"blockedAt,omitempty"`
-	ResolvedAt time.Time `json:"resolvedAt,omitempty"`
+	Question   string       `json:"question,omitempty"` // the pinned question awaiting an answer
+	Family     string       `json:"family,omitempty"`   // family key of the respawn loop this question belongs to
+	Resolution string       `json:"resolution,omitempty"`
+	BlockedAt  time.Time    `json:"blockedAt,omitempty"`
+	ResolvedAt time.Time    `json:"resolvedAt,omitempty"`
+	Options    []Option     `json:"options,omitempty"` // 2-4 suggested answers
+	Answer     string       `json:"answer,omitempty"`  // the answer text, custom or picked from Options
+	AnsweredBy AnswerSource `json:"answeredBy,omitempty"`
+	Cite       string       `json:"cite,omitempty"` // where the answer comes from, such as a plan section or the user's message
+	AnsweredAt time.Time    `json:"answeredAt,omitempty"`
+	ConsumedAt time.Time    `json:"consumedAt,omitempty"` // when a run-limit grant paid for its one launch
+}
+
+// Migrate brings a task loaded from an older store up to the current model. A
+// Failed task with an unresolved BlockedOn was parked on a question, not failed:
+// it becomes Asking.
+func (t *Task) Migrate() {
+	if t.Status == Failed && t.BlockedOn.Unresolved() {
+		t.Status = Asking
+	}
 }
 
 // Unresolved reports whether the block is still open. A nil block is not unresolved.
@@ -89,6 +122,7 @@ func (g *Graph) Add(t Task) Task {
 	if t.MaxAttempts == 0 {
 		t.MaxAttempts = 3
 	}
+	t.Migrate()
 	g.tasks[t.ID] = &t
 	g.recomputeLocked()
 	return *g.tasks[t.ID]
@@ -130,6 +164,7 @@ func (g *Graph) AddChecked(t Task) (Task, error) {
 	if t.MaxAttempts == 0 {
 		t.MaxAttempts = 3
 	}
+	t.Migrate()
 	g.tasks[t.ID] = &t
 	g.recomputeLocked()
 	return *g.tasks[t.ID], nil
@@ -283,9 +318,23 @@ func (g *Graph) Retry(id string) (Task, error) {
 	})
 }
 
+// Settled reports whether every task has finished, one way or another. A task
+// that is Asking waits on the user, so it keeps the graph unsettled.
+func (g *Graph) Settled() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, t := range g.tasks {
+		switch t.Status {
+		case Queued, Running, Blocked, Asking:
+			return false
+		}
+	}
+	return true
+}
+
 func (g *Graph) recomputeLocked() {
 	for _, t := range g.tasks {
-		if t.Status == Done || t.Status == Failed || t.Status == Canceled || t.Status == Running || t.Status == Review {
+		if t.Status == Done || t.Status == Failed || t.Status == Canceled || t.Status == Running || t.Status == Review || t.Status == Asking {
 			continue
 		}
 		ready := true

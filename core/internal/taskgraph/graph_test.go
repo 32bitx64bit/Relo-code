@@ -1,6 +1,7 @@
 package taskgraph
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -96,4 +97,64 @@ func has(xs []string, v string) bool {
 		}
 	}
 	return false
+}
+
+func TestLegacyBlockedOnRoundTrip(t *testing.T) {
+	const stored = `{"id":"task-3","title":"Widget","status":"blocked","dependencies":[],"children":[],"blockedOn":{"question":"which?","family":"widget:2","blockedAt":"2026-10-23T12:00:00Z"}}`
+	var got Task
+	if err := json.Unmarshal([]byte(stored), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.BlockedOn == nil || !got.BlockedOn.Unresolved() || got.BlockedOn.Options != nil || got.BlockedOn.AnsweredBy != "" {
+		t.Fatalf("legacy blockedOn changed: %+v", got.BlockedOn)
+	}
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// answeredAt is left out: time.Time ignores omitempty, as resolvedAt already does.
+	for _, key := range []string{"options", "answer", "answeredBy", "cite"} {
+		if strings.Contains(string(raw), `"`+key+`"`) {
+			t.Fatalf("empty %s written to json: %s", key, raw)
+		}
+	}
+}
+
+func TestLegacyFailedWithOpenBlockLoadsAsking(t *testing.T) {
+	g := New()
+	legacy := Task{ID: "f1", Title: "Widget", Role: "worker", Status: Failed,
+		BlockedOn: &BlockedOn{Question: "which?", Family: "widget:2", BlockedAt: mustTime(t)}}
+	got := g.Add(legacy)
+	if got.Status != Asking {
+		t.Fatalf("status = %q, want %q", got.Status, Asking)
+	}
+	answered := Task{ID: "f2", Title: "Widget", Role: "worker", Status: Failed,
+		BlockedOn: &BlockedOn{Question: "which?", Resolution: "the new one", ResolvedAt: mustTime(t)}}
+	if got := g.Add(answered); got.Status != Failed {
+		t.Fatalf("answered failed task status = %q, want %q", got.Status, Failed)
+	}
+}
+
+func TestAskingKeepsGraphUnsettled(t *testing.T) {
+	g := New()
+	g.Add(Task{ID: "a", Title: "first", Status: Asking, BlockedOn: &BlockedOn{Question: "which?", BlockedAt: mustTime(t)}})
+	if g.Settled() {
+		t.Fatal("graph settled while a task is Asking")
+	}
+	g.Add(Task{ID: "b", Title: "second", Depends: []string{"a"}})
+	if got, _ := g.Get("a"); got.Status != Asking {
+		t.Fatalf("recompute changed Asking to %q", got.Status)
+	}
+	if _, err := g.Update("a", func(t *Task) { t.Status = Done }); err != nil {
+		t.Fatal(err)
+	}
+	if g.Settled() {
+		t.Fatal("graph settled while task b is queued")
+	}
+	if _, err := g.Update("b", func(t *Task) { t.Status = Done }); err != nil {
+		t.Fatal(err)
+	}
+	if !g.Settled() {
+		t.Fatal("graph not settled once every task is done")
+	}
 }
