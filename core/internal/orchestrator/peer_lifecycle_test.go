@@ -225,18 +225,64 @@ func TestPeerTextCannotChangeConstraintsGraphToolsOrAuthority(t *testing.T) {
 	}
 }
 
-// Messages to a terminal recipient are rejected and never stored.
-func TestSendToTerminalTargetRejectedAndNotQueued(t *testing.T) {
-	for _, status := range []agent.Status{agent.Completed, agent.Failed, agent.Cancelled} {
+// Finished workers can reply; failed and cancelled workers settle messages with a notice.
+func TestSendToTerminalTargetWakesOrSettles(t *testing.T) {
+	for _, status := range []agent.Status{agent.Completed, agent.ReviewReq, agent.Failed, agent.Cancelled} {
 		t.Run(string(status), func(t *testing.T) {
-			c, _, _, _, key := newPeerCoord(t)
+			c, _, sender, _, key := newPeerCoord(t)
+			c.SetRuntime(&wakeRuntime{Mock: rt.NewMock()})
 			dead := c.Agents.Create(agent.Agent{ID: "dead-target", Role: agent.Worker, Status: status})
-			if _, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: dead.ID, Text: "hello"}); err == nil {
-				t.Fatal("message to terminal agent accepted")
+			v, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: dead.ID, Text: "hello"})
+			if err != nil {
+				t.Fatal(err)
 			}
-			if n := len(c.Current().PeerMessages); n != 0 {
-				t.Fatalf("rejected message stored: %d", n)
+			if status == agent.Completed || status == agent.ReviewReq {
+				d := wakeDispatcher(c)
+				d.wakePeers()
+				d.wg.Wait()
+				messages := c.Current().PeerMessages
+				if len(messages) != 2 || messages[0].State != "read" || messages[1].ReplyTo != v.(PeerMessage).ID || messages[1].To != sender.ID {
+					t.Fatalf("finished recipient did not reply: %+v", messages)
+				}
+			} else if m := v.(PeerMessage); m.State != "undelivered" || m.Reason == "" || len(c.Current().Messages) < 2 {
+				t.Fatalf("terminal recipient not settled with notice: %+v", m)
 			}
 		})
+	}
+}
+
+// finishingDeliveryRuntime finishes the sender while the reply delivery is in flight, as a turn ending would.
+type finishingDeliveryRuntime struct {
+	*wakeRuntime
+	c      *Coord
+	sender string
+}
+
+func (r *finishingDeliveryRuntime) ConfigureMessages(context.Context, string, rt.MessageTools) error {
+	return nil
+}
+
+func (r *finishingDeliveryRuntime) DeliverMessage(context.Context, rt.SessionID, string, string) error {
+	r.c.Agents.Update(r.sender, func(a *agent.Agent) { a.Status = agent.Completed })
+	return nil
+}
+
+func TestReplyToSenderFinishingDuringDeliveryIsShown(t *testing.T) {
+	c, _, sender, target, key := newPeerCoord(t)
+	c.SetRuntime(&finishingDeliveryRuntime{wakeRuntime: &wakeRuntime{Mock: rt.NewMock()}, c: c, sender: sender.ID})
+	primary := c.Agents.Create(agent.Agent{ID: "primary", Role: agent.Primary, Status: agent.Running})
+	c.Agents.Update(target.ID, func(a *agent.Agent) { a.Status = agent.Completed })
+	if _, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: target.ID, Text: "Where is it?"}); err != nil {
+		t.Fatal(err)
+	}
+	d := wakeDispatcher(c)
+	d.wakePeers()
+	d.wg.Wait()
+	s := c.Current()
+	if len(s.PeerMessages) != 2 || s.PeerMessages[1].State != "delivered" {
+		t.Fatalf("reply left unsettled: %+v", s.PeerMessages)
+	}
+	if !poolHas(c, primary.ID, "Here is the answer.") {
+		t.Fatal("reply missing from Primary context")
 	}
 }

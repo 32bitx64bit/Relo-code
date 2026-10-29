@@ -146,7 +146,7 @@ func TestPeerMessagingRejectsInvalidRecipientsAndOversizedMessages(t *testing.T)
 	c, _, sender, _, key := newPeerCoord(t)
 	c.Agents.Create(agent.Agent{ID: "dead", Status: agent.Completed})
 	for _, req := range []agentmsg.Request{
-		{To: "unknown", Text: "x"}, {To: "dead", Text: "x"}, {To: sender.ID, Text: "x"},
+		{To: "unknown", Text: "x"}, {To: sender.ID, Text: "x"},
 		{To: "target", Text: " "}, {To: "target", Text: strings.Repeat("x", maxPeerText+1)},
 	} {
 		req.Key, req.Action = key, "send"

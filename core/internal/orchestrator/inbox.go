@@ -188,7 +188,7 @@ func (c *Coord) stepQueued(ctx context.Context) {
 	if turn.UserMessage != "" {
 		c.chat("assistant", turn.UserMessage, p.ID)
 	}
-	c.applyTurn(p, turn)
+	c.applyTurn(p, turn, text)
 	c.honorRefreshSelf(p.ID, turn)
 	c.primaryWaits()
 }
