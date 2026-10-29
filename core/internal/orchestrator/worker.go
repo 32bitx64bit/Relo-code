@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -361,7 +362,6 @@ func claimSnapshotNotice(k snapshotNoticeKey) bool {
 func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent) error {
 	// Registered first so it runs last: the agent's session is closed before its directory is imported and removed.
 	defer c.settleDirectory(a)
-	defer c.finishPeerTurn(c.SessionID(), a.ID)
 	defer c.closeAgentSession(a.ID)
 	defer func() {
 		if a.EscalatedFrom != "" {
@@ -501,8 +501,47 @@ func taskBrief(t taskgraph.Task) string {
 	if len(t.Paths) > 0 {
 		b.WriteString("\nFiles in scope: " + strings.Join(t.Paths, ", ") + "\n")
 	}
+	if t.BlockedOn != nil && !t.BlockedOn.Unresolved() {
+		b.WriteString("\nAnswered question: " + t.BlockedOn.Question + "\nAnswer (" + string(t.BlockedOn.AnsweredBy) + "): " + t.BlockedOn.Resolution + "\n")
+	}
 	b.WriteString("\nDo this task, then return the report as JSON.")
 	return b.String()
+}
+
+// questionOptions preserves usable model suggestions and supplies safe fallbacks for legacy reports.
+func questionOptions(options []taskgraph.Option) []taskgraph.Option {
+	var out []taskgraph.Option
+	for _, option := range options {
+		option.Label = strings.TrimSpace(option.Label)
+		if option.Label == "" {
+			continue
+		}
+		out = append(out, option)
+		if len(out) == 4 {
+			break
+		}
+	}
+	for len(out) < 2 {
+		if len(out) == 0 {
+			out = append(out, taskgraph.Option{Label: "Provide more context"})
+		} else {
+			out = append(out, taskgraph.Option{Label: "Change the plan"})
+		}
+	}
+	recommended := false
+	for i := range out {
+		if out[i].Recommended {
+			if recommended {
+				out[i].Recommended = false
+			} else {
+				recommended = true
+			}
+		}
+	}
+	if !recommended {
+		out[0].Recommended = true
+	}
+	return out
 }
 
 // workerReport turns the model's final message into a report. One repair round is spent only when the reply looks
@@ -951,7 +990,7 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		st = agent.Failed
 	}
 	// A blocked agent stopped on purpose to ask. It is not retried, since a retry would meet the same question; the
-	// Primary reads the question in the report and answers it in a replacement task, or asks the user.
+	// Primary answers the question or asks the user; the same task resumes.
 	blocked := strings.EqualFold(rep.Status, "blocked")
 	if blocked {
 		st = agent.Interrupted
@@ -1041,8 +1080,11 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 	}
 	c.recordChanges(t, a, changes)
 	gst := taskgraph.Done
-	if st == agent.Failed || blocked || checksFailed {
+	if st == agent.Failed || checksFailed {
 		gst = taskgraph.Failed
+	}
+	if blocked {
+		gst = taskgraph.Asking
 	}
 	updated, err := c.Graph.Update(t.ID, func(x *taskgraph.Task) {
 		x.Status = gst
@@ -1050,7 +1092,7 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		x.Report = report
 		if blocked {
 			// The question stays on the task until the Primary records an answer; its family cannot be re-planned meanwhile.
-			x.BlockedOn = &taskgraph.BlockedOn{Question: rep.Question, Family: taskgraph.FamilyKey(*x), BlockedAt: time.Now().UTC()}
+			x.BlockedOn = &taskgraph.BlockedOn{Question: rep.Question, Options: questionOptions(rep.Options), Family: taskgraph.FamilyKey(*x), BlockedAt: time.Now().UTC()}
 		}
 	})
 	if err != nil {
@@ -1067,8 +1109,12 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		}
 		return
 	}
-	c.emit("task.failed", updated)
-	c.emit("agent.failed", c.freshAgent(a))
+	if blocked {
+		c.emit("task.updated", updated)
+	} else {
+		c.emit("task.failed", updated)
+		c.emit("agent.failed", c.freshAgent(a))
+	}
 	switch {
 	case blocked:
 		// The question is in the report the Primary reads next.
@@ -1357,13 +1403,76 @@ func plural(n int, word string) string {
 // spelled out. The list comes from the role policy (core/internal/agent/canvas_policy.go), so it can never drift from
 // what the core refuses.
 func canvasScopeText(role agent.Role, actions []string) string {
-	if agent.CanvasAuthoringRole(role) || len(actions) == 0 {
+	if len(actions) == 0 || agent.CanvasAuthoringRole(role) && len(actions) == len(agent.CanvasActionsForRole(role)) {
 		return ""
 	}
 	return "\n- Your canvas actions are: " + strings.Join(actions, ", ") + "."
 }
 
 func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts, ask string, schema map[string]any) (string, error) {
+	a = c.freshAgent(a)
+	generation := c.Engine.CurrentNumber(a.ID)
+	body, err := c.runAgentWith(ctx, a, parts, ask, schema, false)
+	if err == nil || ctx.Err() != nil || a.Role == agent.Primary || a.FallbackFrom != "" {
+		return body, err
+	}
+	var stalled *stalledError
+	class := runtime.Classify(err)
+	if errors.As(err, &stalled) || class == runtime.ClassUnknown {
+		return body, err
+	}
+	backup := c.routing().BackupFor(a.Difficulty, a.Model, a.Model)
+	provider, model := routing.Split(backup)
+	if provider == "" || model == "" || backup == a.Model {
+		return body, err
+	}
+	// Mux sends an unregistered provider to the base runtime without error, so the switch would only relabel the agent.
+	if !runtimeServes(ctx, c.RuntimeSnapshot(), provider) {
+		c.logWarn("backup model", fmt.Errorf("agent %s: backup %s has no registered runtime for provider %q; not switching", a.ID, backup, provider))
+		return body, err
+	}
+	// The failed runtime session may still be live if SendTask failed before streaming.
+	c.closeAgentSession(a.ID)
+	from := a.Model
+	c.Agents.Update(a.ID, func(x *agent.Agent) {
+		x.FallbackFrom, x.FallbackClass, x.Model = from, string(class), backup
+		x.RuntimeID = ""
+		x.Window = c.settings().Window(backup)
+	})
+	a = c.freshAgent(a)
+	c.emit("agent.fallback", map[string]any{"agentId": a.ID, "from": from, "model": backup, "class": class})
+	// Context-limit handling may have rebuilt the pack while the failing turn ended.
+	if current := c.Engine.CurrentNumber(a.ID); current != generation {
+		if gen := c.Engine.Generation(a.ID, current); gen != nil {
+			parts = prompt.ComposePartsWith(a.Role, *gen, "", c.styleFor(a).Profile.Fragment(a.Role))
+		}
+	}
+	// A later repair turn normally relies on conversation history, which the new session does not have.
+	if task, ok := c.Graph.Get(a.TaskID); ok {
+		brief := taskBrief(task)
+		if brief != ask {
+			ask = brief + "\n\n" + ask
+		}
+	}
+	return c.runAgentWith(ctx, a, parts, ask, schema, false)
+}
+
+// runtimeServes reports whether rt can run sessions for provider. A Mux answers by its routes and base catalog.
+// A single runtime is the only backend, so it serves every provider it is given.
+func runtimeServes(ctx context.Context, rt runtime.AgentRuntime, provider string) bool {
+	if rt == nil || provider == "" {
+		return false
+	}
+	s, ok := rt.(interface {
+		Serves(context.Context, string) bool
+	})
+	if !ok {
+		return true
+	}
+	return s.Serves(ctx, provider)
+}
+
+func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Parts, ask string, schema map[string]any, peerWake bool) (string, error) {
 	rt := c.RuntimeSnapshot()
 	if rt == nil {
 		return "", fmt.Errorf("no runtime")
@@ -1386,7 +1495,7 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 		session = nil
 	}
 	if session == nil {
-		sid, err := rt.StartSession(ctx, runtime.SessionConfig{Title: a.Title, Directory: a.Workspace, ReadOnly: !agent.Mutating(a.Role) || sess.Mode != ModeBuild, Provider: prov})
+		sid, err := rt.StartSession(ctx, runtime.SessionConfig{Title: a.Title, Directory: a.Workspace, ReadOnly: peerWake || !agent.Mutating(a.Role) || sess.Mode != ModeBuild, Provider: prov})
 		if err != nil {
 			c.runtimeMu.Unlock()
 			return "", err
@@ -1404,12 +1513,14 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 	previousDynamic := session.lastDynamic
 	c.runtimeMu.Unlock()
 	defer c.revokePeer(a.ID)
-	c.Agents.Update(a.ID, func(x *agent.Agent) {
-		x.RuntimeID = string(sid)
-		x.Status = agent.Running
-		x.Phase, x.Activity = "model", "Waiting for model"
-		x.Generation = gen
-	})
+	if !peerWake {
+		c.Agents.Update(a.ID, func(x *agent.Agent) {
+			x.RuntimeID = string(sid)
+			x.Status = agent.Running
+			x.Phase, x.Activity = "model", "Waiting for model"
+			x.Generation = gen
+		})
+	}
 	system := parts.Static + schemaContract(schema)
 	dynamic := parts.Dynamic
 	if previousDynamic != "" {
@@ -1426,8 +1537,8 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 	canvasTools, imageTools, spriteTools, artTools := false, false, false, false
 	// The canvas tool is scoped to the role: the policy names the actions this agent may use, and the core refuses
 	// any action outside it (core/internal/orchestrator/canvas.go), so the turn never offers more than it may use.
-	canvasActions := agent.CanvasActionsForRole(a.Role)
-	if messenger, ok := rt.(runtime.MessageRuntime); ok {
+	canvasActions := canvasActionsFor(a.Role, sess.Mode)
+	if messenger, ok := rt.(runtime.MessageRuntime); ok && !peerWake {
 		if err := c.StartMessages(); err != nil {
 			return "", fmt.Errorf("start agent messaging: %w", err)
 		}
@@ -1458,10 +1569,13 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 			canvasTools = true
 			// The canvas guidance follows the role: a builder role authors artifacts, every other role may only
 			// inspect one. The core refuses the actions a role may not perform, so this text never promises more.
-			promptText += "\n\n" + prompt.CanvasGuidanceFor(a.Role) + canvasScopeText(a.Role, canvasActions) + " Your Canvas key is the same private key: pass it as key to relo_canvas. Never copy it into artifacts or reports."
+			promptText += "\n\n" + prompt.CanvasGuidanceForMode(a.Role, sess.Mode == ModeBuild) + canvasScopeText(a.Role, canvasActions) + " Your Canvas key is the same private key: pass it as key to relo_canvas. Never copy it into artifacts or reports."
 		}
 	}
-	peerText, peerIDs := c.peerTurnText(a.ID)
+	peerText, peerIDs := "", []string(nil)
+	if !peerWake {
+		peerText, peerIDs = c.peerTurnText(a.ID)
+	}
 	if peerText != "" {
 		promptText += "\n\n" + peerText
 	}
@@ -1469,6 +1583,9 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 	tools = runtime.WithImages(tools, string(a.Role), imageTools)
 	tools = runtime.WithSprite(tools, string(a.Role), spriteTools)
 	tools = runtime.WithArt(tools, string(a.Role), artTools)
+	if peerWake {
+		tools = map[string]bool{"*": false}
+	}
 	send := func(text string) error {
 		return rt.SendTask(ctx, sid, runtime.AgentTask{
 			AgentID: a.ID, Role: string(a.Role), Model: model, Provider: prov,

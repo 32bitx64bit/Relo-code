@@ -9,6 +9,7 @@ import (
 	"github.com/relocode/relo/internal/agentmsg"
 
 	"github.com/relocode/relo/internal/agent"
+	"github.com/relocode/relo/internal/art"
 	ctxeng "github.com/relocode/relo/internal/context"
 	"github.com/relocode/relo/internal/logging"
 	"github.com/relocode/relo/internal/memory"
@@ -148,32 +149,38 @@ func LegacyConflictKind(reason string) string {
 }
 
 type Settings struct {
-	PrimaryModel   string            `json:"primaryModel"`
-	Tier1Model     string            `json:"tier1Model"`
-	Tier2Model     string            `json:"tier2Model"`
-	MaxTotal       int               `json:"maxConcurrentAgents"`
-	MaxTier1       int               `json:"maxTier1Agents"`
-	MaxTier2       int               `json:"maxTier2Agents"`
-	MaxDepth       int               `json:"maxHierarchyDepth"`
-	MaxRetries     int               `json:"maxRetries"`
-	PathLeases     bool              `json:"pathLeases"`
-	MaxUtil        float64           `json:"maxUtilization"`
-	CompactAt      float64           `json:"compactAt"`
-	AutoRefresh    bool              `json:"autoRefresh"`
-	Threshold      float64           `json:"refreshThreshold"`
-	KeepHistory    bool              `json:"keepRawHistory"`
-	Memory         bool              `json:"projectMemory"`
-	Strategy       string            `json:"compressionStrategy"`
-	AutoVerify     bool              `json:"autoVerify"`
-	AutoReview     bool              `json:"autoReview"`
-	Escalate       bool              `json:"escalate"`
-	EscalateSet    bool              `json:"-"`
-	ReportMaxChars int               `json:"reportMaxChars"`
-	Budget         int               `json:"budget"`
-	ByDifficulty   map[string]string `json:"byDifficulty,omitempty"`
-	RoutingMode    string            `json:"routingMode"`
-	ContextLimit   int               `json:"contextLimit"`
-	Efficiency     style.Prefs       `json:"-"`
+	PrimaryModel string `json:"primaryModel"`
+	Tier1Model   string `json:"tier1Model"`
+	Tier2Model   string `json:"tier2Model"`
+	// Optional backup models ("owner/model") per difficulty level, used after quota, rate, or runtime failures.
+	// Missing keys mean no backup, so settings saved before backups existed load unchanged.
+	PrimaryBackupModel string            `json:"primaryBackupModel,omitempty"`
+	Tier1BackupModel   string            `json:"tier1BackupModel,omitempty"`
+	Tier2BackupModel   string            `json:"tier2BackupModel,omitempty"`
+	BackupByDifficulty map[string]string `json:"backupByDifficulty,omitempty"`
+	MaxTotal           int               `json:"maxConcurrentAgents"`
+	MaxTier1           int               `json:"maxTier1Agents"`
+	MaxTier2           int               `json:"maxTier2Agents"`
+	MaxDepth           int               `json:"maxHierarchyDepth"`
+	MaxRetries         int               `json:"maxRetries"`
+	PathLeases         bool              `json:"pathLeases"`
+	MaxUtil            float64           `json:"maxUtilization"`
+	CompactAt          float64           `json:"compactAt"`
+	AutoRefresh        bool              `json:"autoRefresh"`
+	Threshold          float64           `json:"refreshThreshold"`
+	KeepHistory        bool              `json:"keepRawHistory"`
+	Memory             bool              `json:"projectMemory"`
+	Strategy           string            `json:"compressionStrategy"`
+	AutoVerify         bool              `json:"autoVerify"`
+	AutoReview         bool              `json:"autoReview"`
+	Escalate           bool              `json:"escalate"`
+	EscalateSet        bool              `json:"-"`
+	ReportMaxChars     int               `json:"reportMaxChars"`
+	Budget             int               `json:"budget"`
+	ByDifficulty       map[string]string `json:"byDifficulty,omitempty"`
+	RoutingMode        string            `json:"routingMode"`
+	ContextLimit       int               `json:"contextLimit"`
+	Efficiency         style.Prefs       `json:"-"`
 	// Models is the catalog snapshot used for per-model windows and efforts. Not persisted or sent to the UI here.
 	Models map[string]runtime.Model `json:"-"`
 	// ModelsKnown is true once the runtime's catalog has been read successfully. Only then does an empty or
@@ -196,19 +203,21 @@ type Session struct {
 	Workspace string `json:"workspace"`
 	Objective string `json:"objective"`
 	// Constraints are the Primary's reading of what the request and context require of every sub agent.
-	Constraints  []string              `json:"constraints,omitempty"`
-	Decisions    []string              `json:"decisions,omitempty"` // current interpreted plan, persisted independently of generations
-	PeerMessages []PeerMessage         `json:"peerMessages,omitempty"`
-	Mode         Mode                  `json:"mode"`
-	Status       string                `json:"status"`
-	Created      time.Time             `json:"createdAt"`
-	Updated      time.Time             `json:"updatedAt"`
-	Messages     []Chat                `json:"messages,omitempty"`
-	Changes      []Change              `json:"changes,omitempty"`
-	Verify       []verification.Result `json:"verification,omitempty"`
-	Usage        map[string]any        `json:"usage,omitempty"`
-	Paused       bool                  `json:"paused"`
-	Running      bool                  `json:"running"` // a Submit is in flight; the UI's single source for "busy"
+	Constraints     []string              `json:"constraints,omitempty"`
+	Decisions       []string              `json:"decisions,omitempty"` // current interpreted plan, persisted independently of generations
+	DelegateAnswers bool                  `json:"delegateAnswers,omitempty"`
+	PeerMessages    []PeerMessage         `json:"peerMessages,omitempty"`
+	PeerWakes       map[string]int        `json:"peerWakes,omitempty"`
+	Mode            Mode                  `json:"mode"`
+	Status          string                `json:"status"`
+	Created         time.Time             `json:"createdAt"`
+	Updated         time.Time             `json:"updatedAt"`
+	Messages        []Chat                `json:"messages,omitempty"`
+	Changes         []Change              `json:"changes,omitempty"`
+	Verify          []verification.Result `json:"verification,omitempty"`
+	Usage           map[string]any        `json:"usage,omitempty"`
+	Paused          bool                  `json:"paused"`
+	Running         bool                  `json:"running"` // a Submit is in flight; the UI's single source for "busy"
 }
 
 type PendingPerm struct {
@@ -307,6 +316,8 @@ func New(log *logging.Logger) *Coord {
 		Emit:            func(string, any) {},
 	}
 	c.Agents = c.newRegistry()
+	// Until the user's art settings arrive the limits are the defaults: the zero Settings would read as "no limit".
+	c.art.settings = art.Settings{BudgetUSD: art.DefaultBudgetUSD, SessionJobLimit: art.DefaultJobLimit}
 	return c
 }
 

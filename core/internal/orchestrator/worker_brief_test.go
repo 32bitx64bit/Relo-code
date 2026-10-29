@@ -131,8 +131,8 @@ func TestBlockedWorkerAsksTheQuestionAndIsNotRetried(t *testing.T) {
 		t.Fatalf("a blocked worker was run %d times, want once", calls)
 	}
 	got, _ := c.Graph.Get(task.ID)
-	if got.Status != taskgraph.Failed {
-		t.Fatalf("task = %s; it must end so dependents do not wait on it", got.Status)
+	if got.Status != taskgraph.Asking {
+		t.Fatalf("task = %s; it must wait for an answer", got.Status)
 	}
 	rep, ok := got.Report.(agent.Report)
 	if !ok || rep.Question != "Which Load should the CLI call, config.Load or settings.Load?" || !strings.HasPrefix(rep.Summary, "Blocked, needs a decision:") {
@@ -170,7 +170,7 @@ func TestBlockedWorkerLeavesTheQuestionOnItsTask(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ := c.Graph.Get(task.ID)
-	if got.Status != taskgraph.Failed {
+	if got.Status != taskgraph.Asking {
 		t.Fatalf("task = %s; a blocked worker is not done, but it must not stay runnable either", got.Status)
 	}
 	if got.BlockedOn == nil || !got.BlockedOn.Unresolved() {
@@ -221,7 +221,7 @@ func TestABlockedFamilyRefusesEveryReplanUntilItIsAnswered(t *testing.T) {
 		{ID: "s6", Title: "SPT stage 3", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"},
 	}
 	got := c.admitTasks(specs)
-	if len(got) != 2 || got[0].ID != "s5" || got[1].ID != "s6" {
+	if len(got) != 3 || got[0].ID != "s2" || got[1].ID != "s5" || got[2].ID != "s6" {
 		t.Fatalf("admitted = %+v, want only the tasks outside the blocked family", got)
 	}
 	if open := c.openQuestions(); len(open) != 1 || open[0].ID != blocked.ID {
@@ -229,23 +229,22 @@ func TestABlockedFamilyRefusesEveryReplanUntilItIsAnswered(t *testing.T) {
 	}
 }
 
-// The cap counts launches, not task records: three runs of one family, whether one record retried three times or
-// three records under different ids and titles, is the whole budget. The fourth launch never reaches an agent.
+// There is no run limit: prior launches of one family, whether one record retried three times or three records under
+// different ids and titles, never park the next launch. It spawns, runs and finishes.
 // "SPT stage 2 per spt-impl-plan contract" is the incident's verified task title; "SPT stage 2" is a HYPOTHETICAL
 // reworded fragment of the same family, reconstructed for the test.
-func TestTheFamilyCapCountsLaunchesAcrossIdsAndRetries(t *testing.T) {
+func TestTheFamilyLaunchesWithoutARunLimit(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		launches []int // Attempts already spent by the family's earlier task records
-		wantCap  bool
 	}{
-		{"two launches across two ids", []int{1, 1}, false},
-		{"three launches across three ids", []int{1, 1, 1}, true},
-		{"one record retried to its third launch", []int{3}, true},
-		{"two records, one of them retried", []int{1, 2}, true},
+		{"two launches across two ids", []int{1, 1}},
+		{"three launches across three ids", []int{1, 1, 1}},
+		{"one record retried to its third launch", []int{3}},
+		{"two records, one of them retried", []int{1, 2}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c, r, _ := briefFixture(t, `{"status":"completed","summary":"done"}`)
+			c, _, _ := briefFixture(t, `{"status":"completed","summary":"done"}`)
 			for i, n := range tc.launches {
 				c.Graph.Add(taskgraph.Task{
 					ID: fmt.Sprintf("task-run-%d", i), Title: "SPT stage 2 per spt-impl-plan contract",
@@ -254,40 +253,15 @@ func TestTheFamilyCapCountsLaunchesAcrossIdsAndRetries(t *testing.T) {
 				})
 			}
 			next := c.Graph.Add(taskgraph.Task{
-				ID: "task-next", Title: "SPT stage 2", Role: string(agent.Worker),
+				ID: "task-next", Title: "SPT stage 2 per spt-impl-plan contract", Role: string(agent.Worker),
 				Paths: []string{"pax_game_ai.c"}, Scope: "ai", Model: "mock/t1", MaxAttempts: 3,
 			})
-			if started := c.dispatch(context.Background(), c.scheduler()); tc.wantCap && started != 0 {
-				t.Fatalf("dispatch started %d workers for a family at its cap", started)
+			if started := c.dispatch(context.Background(), c.scheduler()); started != 1 {
+				t.Fatalf("dispatch started %d workers, want 1", started)
 			}
 			got, _ := c.Graph.Get(next.ID)
-			if capped := got.BlockedOn.Unresolved(); capped != tc.wantCap {
-				t.Fatalf("capped = %v, want %v (status %s after %d attempts)", capped, tc.wantCap, got.Status, got.Attempts)
-			}
-			if !tc.wantCap {
-				if got.Status != taskgraph.Done {
-					t.Fatalf("a launch inside the cap ended %s", got.Status)
-				}
-				return
-			}
-			if got.Status != taskgraph.Failed {
-				t.Fatalf("a capped launch is %s, want failed", got.Status)
-			}
-			if !strings.Contains(got.BlockedOn.Question, "limit 3") {
-				t.Fatalf("the cap did not say what the limit is: %q", got.BlockedOn.Question)
-			}
-			if want := taskgraph.FamilyKey(next); got.BlockedOn.Family != want {
-				t.Fatalf("family = %q, want %q", got.BlockedOn.Family, want)
-			}
-			for _, a := range c.Agents.List() {
-				if a.TaskID == next.ID {
-					t.Fatalf("agent %s was spawned for a capped task", a.ID)
-				}
-			}
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			if len(r.tasks) != 0 {
-				t.Fatalf("a capped task cost %d model calls", len(r.tasks))
+			if got.Status != taskgraph.Done || got.BlockedOn != nil {
+				t.Fatalf("launch ended %s with block %+v, want done without a question", got.Status, got.BlockedOn)
 			}
 		})
 	}
@@ -317,12 +291,12 @@ func TestAnUnansweredQuestionKeepsTheSessionFromCompleting(t *testing.T) {
 	if got := c.Current().Status; got != "blocked" {
 		t.Fatalf("session = %q, want blocked while the question is open", got)
 	}
-	c.applyResolvedBlocks([]ResolvedBlock{{TaskID: task.ID, Answer: "Follow spt-staged-plan.md lines 67-78."}})
-	if err := c.loopPrimary(context.Background(), primary, ""); err != nil {
+	if err := c.AnswerQuestion(task.ID, "Follow spt-staged-plan.md lines 67-78."); err != nil {
 		t.Fatal(err)
 	}
-	if got := c.Current().Status; got != "completed" {
-		t.Fatalf("session = %q, want completed once the question is answered", got)
+	resumed, _ := c.Graph.Get(task.ID)
+	if resumed.Status != taskgraph.Queued || c.Current().Status != "active" {
+		t.Fatalf("task = %s, session = %s; answer must queue the original task", resumed.Status, c.Current().Status)
 	}
 }
 

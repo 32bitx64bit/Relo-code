@@ -25,44 +25,6 @@ import (
 // wait as tasks and get their agent when a place in the queue opens.
 const maxQueued = 4
 
-// maxFamilyAttempts is how many launches one family of tasks may take before the family is blocked for the user.
-const maxFamilyAttempts = 3
-
-// familyAttempts sums the launches of every task in t's family, across ids and titles, made since the family's last
-// answered block. A block that the user answered starts the count again.
-func (c *Coord) familyAttempts(t taskgraph.Task) int {
-	key := taskgraph.FamilyKey(t)
-	all := c.Graph.List()
-	var since time.Time
-	for _, o := range all {
-		if o.BlockedOn != nil && !o.BlockedOn.Unresolved() && taskgraph.FamilyKey(o) == key && o.BlockedOn.ResolvedAt.After(since) {
-			since = o.BlockedOn.ResolvedAt
-		}
-	}
-	n := 0
-	for _, o := range all {
-		if taskgraph.FamilyKey(o) == key && !o.Created.Before(since) {
-			n += o.Attempts
-		}
-	}
-	return n
-}
-
-// capBlock fails a queued task whose family has used up its launches. The family stays blocked until the user answers.
-func (c *Coord) capBlock(t taskgraph.Task, launches int) {
-	question := fmt.Sprintf("This work has already run %d times (limit %d). Answer whether to allow more runs, or change the plan.", launches, maxFamilyAttempts)
-	updated, err := c.Graph.Update(t.ID, func(x *taskgraph.Task) {
-		x.Status = taskgraph.Failed
-		x.Finished = time.Now().UTC()
-		x.BlockedOn = &taskgraph.BlockedOn{Question: question, Family: taskgraph.FamilyKey(*x), BlockedAt: time.Now().UTC()}
-	})
-	if err != nil {
-		c.logWarn("cap task family", err)
-		return
-	}
-	c.emit("task.failed", updated)
-}
-
 // dispatchTick is how often a dispatcher looks again when nothing woke it. Workers wake it as they finish; this
 // covers a change it could not have been told about.
 var dispatchTick = time.Second
@@ -86,17 +48,19 @@ type dispatcher struct {
 
 	mu      sync.Mutex
 	running map[string]bool // task ID -> a worker goroutine for it is still alive
+	waking  map[string]bool // agent ID -> a peer reply turn is still alive
 	errs    []error
 }
 
 // dispatch starts every runnable task as the limits allow and returns when no worker is left, with the number of
 // workers it started. It looks at the queue again whenever a worker finishes, not when a whole batch has.
 func (c *Coord) dispatch(ctx context.Context, sched *scheduler.Scheduler) int {
-	d := &dispatcher{c: c, ctx: ctx, sched: sched, wake: make(chan struct{}, 1), queued: map[string]waiting{}, running: map[string]bool{}}
+	d := &dispatcher{c: c, ctx: ctx, sched: sched, wake: make(chan struct{}, 1), queued: map[string]waiting{}, running: map[string]bool{}, waking: map[string]bool{}}
 	tick := time.NewTicker(dispatchTick)
 	defer tick.Stop()
 	for sched.Wait(ctx) == nil {
 		held := d.admit()
+		d.wakePeers()
 		if d.alive() == 0 {
 			if held {
 				continue // the worker that held a task has gone since; it can start now
@@ -139,13 +103,97 @@ func (c *Coord) dispatch(ctx context.Context, sched *scheduler.Scheduler) int {
 func (d *dispatcher) alive() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return len(d.running)
+	return len(d.running) + len(d.waking)
 }
 
 func (d *dispatcher) working(taskID string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.running[taskID]
+}
+
+// wakePeers starts bounded reply-only turns for finished workers with unanswered messages.
+func (d *dispatcher) wakePeers() {
+	c := d.c
+	for _, a := range c.Agents.List() {
+		if a.Role == agent.Primary || (a.Status != agent.Completed && a.Status != agent.ReviewReq) || d.working(a.TaskID) {
+			continue
+		}
+		d.mu.Lock()
+		if d.waking[a.ID] {
+			d.mu.Unlock()
+			continue
+		}
+		d.mu.Unlock()
+		c.mu.Lock()
+		if c.sess == nil {
+			c.mu.Unlock()
+			return
+		}
+		sid := c.sess.ID
+		answered := map[string]bool{}
+		for _, m := range c.sess.PeerMessages {
+			if m.ReplyTo != "" {
+				answered[m.ReplyTo] = true
+			}
+		}
+		// Replies (ReplyTo set) are what wake turns produce, so they never wake anyone: a finished pair cannot ping-pong.
+		var messages []PeerMessage
+		for _, m := range c.sess.PeerMessages {
+			if m.To == a.ID && m.ReplyTo == "" && !answered[m.ID] && (m.State == "queued" || m.State == "injected" || m.State == "delivered") {
+				messages = append(messages, m)
+			}
+		}
+		if len(messages) == 0 {
+			c.mu.Unlock()
+			continue
+		}
+		if c.sess.PeerWakes == nil {
+			c.sess.PeerWakes = map[string]int{}
+		}
+		total := 0
+		for _, n := range c.sess.PeerWakes {
+			total += n
+		}
+		if c.sess.PeerWakes[a.ID] >= 2 || total >= 40 || d.ctx.Err() != nil {
+			c.mu.Unlock()
+			ids := map[string]bool{}
+			for _, m := range messages {
+				ids[m.ID] = true
+			}
+			c.settlePeerWake(sid, a.ID, ids, "peer wake limit reached or session stopped")
+			continue
+		}
+		c.sess.PeerWakes[a.ID]++
+		c.mu.Unlock()
+		d.mu.Lock()
+		if d.waking == nil {
+			d.waking = map[string]bool{}
+		}
+		d.waking[a.ID] = true
+		d.mu.Unlock()
+		d.wg.Add(1)
+		go func(a agent.Agent, messages []PeerMessage) {
+			defer d.wg.Done()
+			defer func() {
+				d.mu.Lock()
+				delete(d.waking, a.ID)
+				d.mu.Unlock()
+				select {
+				case d.wake <- struct{}{}:
+				default:
+				}
+			}()
+			if err := c.guard("peer wake "+a.ID, func() error { c.peerReplyTurn(d.ctx, sid, a, messages); return nil }); err != nil {
+				c.closeAgentSession(a.ID)
+				ids := map[string]bool{}
+				for _, m := range messages {
+					ids[m.ID] = true
+				}
+				c.settlePeerWake(sid, a.ID, ids, "peer wake failed: "+err.Error())
+			}
+		}(a, messages)
+	}
 }
 
 // admit starts what fits now, the agents that waited longest first, and queues what does not. It reports whether it
@@ -179,15 +227,6 @@ func (d *dispatcher) admit() (held bool) {
 		}
 		role := parseRole(task.Role)
 		wait, queued := d.queued[task.ID]
-		// The family cap is checked before any agent is spawned for the task; a waiting agent is retired instead.
-		if launches := c.familyAttempts(task); launches >= maxFamilyAttempts {
-			if queued {
-				delete(d.queued, task.ID)
-				d.discard(wait.agent, "Not started: family run limit reached")
-			}
-			c.capBlock(task, launches)
-			continue
-		}
 		a := wait.agent
 		if !queued {
 			if ok, why := d.sched.CanReserve(c.Agents, agent.Agent{Role: role, Tier: agent.TierFor(role), Depth: 1}); !ok && (!scheduler.Full(why) || len(d.queued) >= maxQueued) {
@@ -417,6 +456,9 @@ func (d *dispatcher) launch(t taskgraph.Task, a agent.Agent) {
 				x.Status, x.Activity = agent.Failed, err.Error()
 			}
 		})
+		if current, ok := c.Agents.Get(a.ID); ok && (current.Status == agent.Cancelled || current.Status == agent.Failed || current.Status == agent.Interrupted) {
+			c.finishPeerTurn(c.SessionID(), a.ID, "recipient is "+string(current.Status))
+		}
 		if err != nil {
 			d.mu.Lock()
 			d.errs = append(d.errs, err)
@@ -441,6 +483,7 @@ func (d *dispatcher) discard(a agent.Agent, note string) {
 			x.Status, x.Activity = agent.Cancelled, note
 		}
 	})
+	d.c.finishPeerTurn(d.c.SessionID(), a.ID, note)
 	if ws := d.c.workspace(); ws != nil {
 		_ = ws.Release(a.ID)
 	}

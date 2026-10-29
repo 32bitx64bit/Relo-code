@@ -10,7 +10,11 @@ import (
 
 // RouteConfig builds the routing config for these settings.
 func (s Settings) RouteConfig() routing.Config {
-	return routing.Config{Primary: s.PrimaryModel, Tier1: s.Tier1Model, Tier2: s.Tier2Model, ByDifficulty: s.ByDifficulty, Mode: s.RoutingMode}
+	return routing.Config{
+		Primary: s.PrimaryModel, Tier1: s.Tier1Model, Tier2: s.Tier2Model, ByDifficulty: s.ByDifficulty, Mode: s.RoutingMode,
+		PrimaryBackupModel: s.PrimaryBackupModel, Tier1BackupModel: s.Tier1BackupModel, Tier2BackupModel: s.Tier2BackupModel,
+		BackupByDifficulty: s.BackupByDifficulty,
+	}
 }
 
 // Window is the context window planned for model ("provider/id"): the smaller of the global limit and the
