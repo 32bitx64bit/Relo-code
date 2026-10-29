@@ -29,14 +29,11 @@ type session struct {
 
 	mu        sync.Mutex
 	proc      *process
-	ended     bool   // the process has exited; the conversation is gone
-	key       string // the process's flags, fixed for its life
-	hub       bool   // the process was given Relo's hub as an SDK-hosted MCP server
-	turn      bool   // a Relo turn is running
-	interrupt bool   // Cancel asked for an interrupt; the turn's result confirms it
-	timedOut  string // the turn timer fired; the result reports it
-	timer     *time.Timer
-	turns     int                        // counts the session's turns, so a late timer can tell its turn has ended
+	ended     bool                       // the process has exited; the conversation is gone
+	key       string                     // the process's flags, fixed for its life
+	hub       bool                       // the process was given Relo's hub as an SDK-hosted MCP server
+	turn      bool                       // a Relo turn is running
+	interrupt bool                       // Cancel asked for an interrupt; the turn's result confirms it
 	perms     map[string]json.RawMessage // open permission requests: request id -> the tool input
 	seq       int
 	tr        translator
@@ -146,20 +143,14 @@ func (s *session) sendTask(ctx context.Context, task runtime.AgentTask) error {
 		// generation changes, so this is a setting edited mid-run; it applies from the agent's next session.
 		s.rt.logf("claude code session %s keeps its flags; the changed model, effort, prompt or tools apply from its next session", s.id)
 	}
-	s.turn, s.interrupt, s.timedOut = true, false, ""
-	s.turns++
+	s.turn, s.interrupt = true, false
 	s.tr.startTurn()
-	if task.TimeoutSec > 0 {
-		turn, limit := s.turns, task.TimeoutSec
-		s.timer = time.AfterFunc(time.Duration(limit)*time.Second, func() { s.expire(turn, limit) })
-	}
 	p := s.proc
 	s.mu.Unlock()
 	// Written without the lock: a large prompt can fill the pipe, and the output reader needs the lock meanwhile.
 	if err := p.write(userMessage(task.Prompt)); err != nil {
 		s.mu.Lock()
 		s.turn = false
-		s.stopTimerLocked()
 		s.mu.Unlock()
 		return fmt.Errorf("send the task to Claude Code: %w", err)
 	}
@@ -274,7 +265,6 @@ func (s *session) read(p *process, stdout io.Reader) {
 	s.ended = true
 	if s.turn && !s.closed {
 		s.turn = false
-		s.stopTimerLocked()
 		msg := "Claude Code exited"
 		if p.exit != nil {
 			msg += " (" + p.exit.Error() + ")"
@@ -323,14 +313,11 @@ func (s *session) handle(p *process, line []byte) {
 
 func (s *session) finishLocked(end *turnEnd) {
 	s.turn = false
-	s.stopTimerLocked()
 	clear(s.perms)
-	interrupted, timedOut := s.interrupt, s.timedOut
-	s.interrupt, s.timedOut = false, ""
+	interrupted := s.interrupt
+	s.interrupt = false
 	usage := end.usage
 	switch {
-	case timedOut != "":
-		s.emitLocked(runtime.Event{Type: "session.error", Done: true, Error: timedOut, Usage: &usage})
 	case interrupted:
 		// Not terminal: the conversation is intact and the next task carries on from it.
 		s.emitLocked(runtime.Event{Type: "session.execution.interrupted", Interrupted: true})
@@ -515,39 +502,6 @@ func (s *session) interruptRequestLocked() func() error {
 	return func() error { return p.write(req) }
 }
 
-// expire ends a turn that ran past its time limit. When the CLI does not answer the interrupt, the process goes.
-func (s *session) expire(turn, limit int) {
-	s.mu.Lock()
-	if s.turns != turn || !s.turn {
-		s.mu.Unlock()
-		return
-	}
-	s.timedOut = fmt.Sprintf("agent timed out after %ds", limit)
-	p, interrupt := s.proc, s.interruptRequestLocked()
-	s.mu.Unlock()
-	if interrupt() == nil {
-		select {
-		case <-p.done:
-			return
-		case <-time.After(10 * time.Second):
-		}
-		s.mu.Lock()
-		stillOpen := s.turn && s.timedOut != ""
-		s.mu.Unlock()
-		if !stillOpen {
-			return
-		}
-	}
-	_ = p.cmd.Process.Kill()
-}
-
-func (s *session) stopTimerLocked() {
-	if s.timer != nil {
-		s.timer.Stop()
-		s.timer = nil
-	}
-}
-
 // deliver puts a peer message into the running turn. The CLI reads it at the next step, the way OpenCode's steering
 // message is read. With no turn running it is left for Relo to carry in the next task.
 func (s *session) deliver(text string) error {
@@ -569,7 +523,6 @@ func (s *session) close() error {
 	}
 	s.closed = true
 	s.turn = false
-	s.stopTimerLocked()
 	p := s.proc
 	files := s.files
 	s.files = nil

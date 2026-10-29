@@ -228,7 +228,9 @@ func (t *translator) assistant(raw json.RawMessage) []runtime.Event {
 	var out []runtime.Event
 	for _, c := range m.Content {
 		if c.Type == "tool_use" || c.Type == "server_tool_use" {
-			out = append(out, runtime.Event{Type: "session.tool", Phase: "tool", Tool: reloTool(c.Name), ToolID: c.ID, ToolInput: describe(c.Name, c.Input)})
+			// Raw carries the complete input for the loop detector; ToolInput is only a summary for display.
+			out = append(out, runtime.Event{Type: "session.tool", Phase: "tool", Tool: reloTool(c.Name), ToolID: c.ID, ToolInput: describe(c.Name, c.Input),
+				Raw: map[string]any{"input": c.Input}})
 		}
 	}
 	return out

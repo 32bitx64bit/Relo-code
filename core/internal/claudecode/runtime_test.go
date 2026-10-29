@@ -308,20 +308,6 @@ func TestCancelInterruptsAndTheSessionCarriesOn(t *testing.T) {
 	}
 }
 
-func TestATurnPastItsTimeLimitEnds(t *testing.T) {
-	rt, _ := fakeRuntime(t, "ok")
-	sid, evs := start(t, rt, runtime.SessionConfig{Directory: t.TempDir()})
-	tk := task("slow")
-	tk.TimeoutSec = 1
-	if err := rt.SendTask(context.Background(), sid, tk); err != nil {
-		t.Fatal(err)
-	}
-	got := collect(t, evs, nil)
-	if end := got[len(got)-1]; !end.Done || end.Error != "agent timed out after 1s" {
-		t.Fatalf("turn end = %+v", end)
-	}
-}
-
 func TestACrashEndsTheTurnWithTheCLIsError(t *testing.T) {
 	rt, _ := fakeRuntime(t, "ok")
 	sid, evs := start(t, rt, runtime.SessionConfig{Directory: t.TempDir()})

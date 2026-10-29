@@ -36,7 +36,7 @@ func TestLiveClaudeCode(t *testing.T) {
 	}
 	evs, _ := rt.Events(ctx, sid)
 	tk := func(prompt string) runtime.AgentTask {
-		return runtime.AgentTask{AgentID: "live", Role: "worker", Provider: ProviderID, Model: "claude-haiku-5-5", Effort: "low", TimeoutSec: 120,
+		return runtime.AgentTask{AgentID: "live", Role: "worker", Provider: ProviderID, Model: "claude-haiku-5-5", Effort: "low",
 			System: "You are a Relo worker agent in a scratch directory. Do exactly what the task says, nothing more. End every turn with one line of JSON: {\"status\":\"completed\",\"summary\":\"...\"}.",
 			Prompt: prompt, Tools: runtime.ToolsFor("worker", "build", true)}
 	}
