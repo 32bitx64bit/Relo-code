@@ -473,7 +473,7 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 	case "backend.status":
 		return a.backendStatus(), nil
 	case "cache.get":
-		return cachePayload(a.Coord.Cache.Snapshot()), nil
+		return a.Coord.Cache.Snapshot().Payload(), nil
 	case "backend.restart":
 		return a.restartRuntime(ctx)
 	case "settings.apply":
@@ -1175,17 +1175,6 @@ func (a *App) restoreSession(sessionID string) {
 	} else {
 		a.Log.Error("restore generations failed", map[string]any{"sessionId": sessionID, "error": err.Error()})
 	}
-}
-
-func cachePayload(snapshot metrics.CacheSnapshot) map[string]any {
-	row := func(v metrics.CacheRow) map[string]any {
-		return map[string]any{"hitRate": v.HitRate, "input": v.Usage.Input, "output": v.Usage.Output, "cacheRead": v.Usage.CacheRead, "cacheWrite": v.Usage.CacheWrite}
-	}
-	agents := make([]map[string]any, 0, len(snapshot.Agents))
-	for _, v := range snapshot.Agents {
-		agents = append(agents, map[string]any{"agentId": v.AgentID, "generation": v.Generation, "model": v.Model, "input": v.Usage.Input, "output": v.Usage.Output, "cacheRead": v.Usage.CacheRead, "cacheWrite": v.Usage.CacheWrite, "hitRate": v.HitRate})
-	}
-	return map[string]any{"session": row(snapshot.Session), "agents": agents}
 }
 
 func (a *App) Close() {

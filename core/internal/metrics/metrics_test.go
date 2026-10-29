@@ -41,3 +41,22 @@ func TestWeightedInput(t *testing.T) {
 		t.Fatalf("default weighted input = %v", got)
 	}
 }
+
+func TestUsedTokensExcludesCacheAndPayloadKeepsLabels(t *testing.T) {
+	u := Usage{Input: 10, Output: 5, Reasoning: 2, CacheRead: 100, CacheWrite: 20}
+	if got := u.UsedTokens(); got != 17 {
+		t.Fatalf("UsedTokens=%d, want uncached input+output+reasoning 17", got)
+	}
+	var stats CacheStats
+	stats.AddLabeled("a", 1, "m", "worker", "v:full", u)
+	row := stats.Snapshot().Payload()["agents"].([]map[string]any)[0]
+	for key, want := range map[string]any{"role": "worker", "profile": "v:full", "reasoning": 2, "cacheRead": 100, "cacheWrite": 20} {
+		if row[key] != want {
+			t.Fatalf("agent row %s=%v, want %v", key, row[key], want)
+		}
+	}
+	session := stats.Snapshot().Payload()["session"].(map[string]any)
+	if session["reasoning"] != 2 || session["cacheRead"] != 100 || session["cacheWrite"] != 20 || len(session) != 6 {
+		t.Fatalf("session payload = %#v", session)
+	}
+}

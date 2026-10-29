@@ -119,6 +119,25 @@ func addUsage(a, b Usage) Usage {
 	return Usage{Input: a.Input + b.Input, Output: a.Output + b.Output, Reasoning: a.Reasoning + b.Reasoning, CacheRead: a.CacheRead + b.CacheRead, CacheWrite: a.CacheWrite + b.CacheWrite}
 }
 
+// UsedTokens is what a call spends: uncached input, output and reasoning. CacheRead and CacheWrite are
+// reported separately and never counted here.
+func (u Usage) UsedTokens() int { return u.Input + u.Output + u.Reasoning }
+
+// Payload is the cache.updated and cache.get shape: session totals plus one row per agent.
+func (s CacheSnapshot) Payload() map[string]any {
+	agents := make([]map[string]any, 0, len(s.Agents))
+	for _, r := range s.Agents {
+		row := usagePayload(r)
+		row["agentId"], row["generation"], row["model"], row["role"], row["profile"] = r.AgentID, r.Generation, r.Model, r.Role, r.Profile
+		agents = append(agents, row)
+	}
+	return map[string]any{"session": usagePayload(s.Session), "agents": agents}
+}
+
+func usagePayload(r CacheRow) map[string]any {
+	return map[string]any{"hitRate": r.HitRate, "input": r.Usage.Input, "output": r.Usage.Output, "reasoning": r.Usage.Reasoning, "cacheRead": r.Usage.CacheRead, "cacheWrite": r.Usage.CacheWrite}
+}
+
 // Hit rate = CacheRead / (Input + CacheRead + CacheWrite); zero denominator yields zero.
 func hitRate(u Usage) float64 {
 	total := u.Input + u.CacheRead + u.CacheWrite

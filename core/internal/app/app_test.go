@@ -198,7 +198,7 @@ func TestCacheGetAndRestore(t *testing.T) {
 	session := core.Coord.CreateSession(dir, "", "build")
 	core.Coord.Cache.Add("agent-1", 2, "model", metrics.Usage{Input: 10, CacheRead: 40, CacheWrite: 5})
 	core.AttachIPC(ipc.New(strings.NewReader(""), &bytes.Buffer{}, core.Handle))
-	core.Coord.Notify("cache.updated", cachePayload(core.Coord.Cache.Snapshot()))
+	core.Coord.Notify("cache.updated", core.Coord.Cache.Snapshot().Payload())
 	got, err := core.Handle("cache.get", json.RawMessage(`{}`))
 	if err != nil {
 		t.Fatal(err)
