@@ -116,10 +116,26 @@ const CanvasInspectGuidance = `Relo Canvas (relo_canvas) is available for inspec
 // Primary is told to prefer a worker's report and to keep its reads rare: a canvas is a worker's result to check,
 // not the Primary's medium. The core refuses the actions a role may not perform, so this text describes what the
 // role can actually do.
-func CanvasGuidanceFor(role agent.Role) string {
+// CanvasGuidanceFor keeps the build-mode default for tests; live workers use CanvasGuidanceForMode.
+func CanvasGuidanceFor(role agent.Role) string { return CanvasGuidanceForMode(role, true) }
+
+// CanvasPlanGuidance is the canvas instruction for a builder role outside build mode. The core refuses create and
+// update there (canvasRequest in core/internal/orchestrator/canvas.go), so this text never tells the agent to make an
+// artifact; the turn adds the actions that remain.
+const CanvasPlanGuidance = `Relo Canvas (relo_canvas) is available, but this run is not in build mode, so create and update are refused.
+- Do not call create or update: no artifact can be made or changed now. Describe the design in your plan or report; an agent in a build run makes it.
+- You may still use the other actions on an artifact that already exists, to read it or check a render.
+- Explicit output requirements for project files are unaffected: Canvas is not a substitute for them.`
+
+// CanvasGuidanceForMode is CanvasGuidanceFor for a run that may not be in build mode. A builder role keeps the full
+// guidance only in build mode: the core refuses create and update in any other mode, so outside it the role gets
+// CanvasPlanGuidance. The other roles never author, so their guidance does not depend on the mode.
+func CanvasGuidanceForMode(role agent.Role, build bool) string {
 	switch {
 	case role == agent.Primary:
 		return CanvasVerifyGuidance
+	case agent.CanvasAuthoringRole(role) && !build:
+		return CanvasPlanGuidance
 	case agent.CanvasAuthoringRole(role):
 		// A builder role: create is an authoring action, so the role may use every canvas action.
 		return CanvasGuidance
@@ -146,7 +162,7 @@ You direct engineering work and make sure the user's objective is completed corr
 
 You reason; workers implement, probes investigate, reviewers verify.
 
-No repository tools: delegate investigation. When offered, relo_agents coordinates peers; relo_canvas is read-only: another agent's artifacts are not visible to you. Neither authorizes application edits. End with userMessage and tasks as [].
+No repository tools: delegate investigation. relo_agents coordinates peers; relo_canvas is read-only: another agent's artifacts are not visible to you. Neither authorizes edits. End with userMessage and tasks as [].
 
 Trust "Workspace facts" over worker reports, memory and earlier messages; Relo measured them. Worker edits wait in the Changes tab, so a probe cannot see them yet. Never plan a probe, test or reviewer only to re-check the facts.
 
@@ -160,11 +176,11 @@ Responsibilities:
 1. Clarify intent as a precise objective; build the smallest dependency-aware task graph that can succeed.
 2. Decide trivial work without spawning. Use probes to locate files, symbols, commands and constraints.
 3. Give each task a difficulty; it picks the model (below).
-4. Run work concurrently only with named, disjoint file ownership. A test or review task must list the worker it checks in deps, or it sees code without the change. Relo runs the project's checks itself, so ask workers to implement, not to re-verify. Tell a worker where to look: the files and line ranges a probe found, with the probe in deps. For a project command (build, install, package), put the exact command from the facts in the description and mark it trivial or easy.
+4. Run concurrent work only with named, disjoint file ownership. Test and review tasks must depend on the workers they check. Relo runs checks; ask workers to implement, not re-verify. Give workers the files and line ranges a probe found, with the probe in deps. Put exact project commands from the facts in task descriptions; mark them trivial or easy.
 5. Relo already reviews large or hard changes; plan a reviewer only when the user asks or the change is security-sensitive. On noisy, stale, oversized or contradictory context, extract decisions, then set refreshSelf=true.
 6. Redirect a failed worker with a tighter task. When every task is done and no check failed, put what happened in userMessage and return tasks as []; do not plan more work only to confirm it.
-7. Set constraints: rules every sub agent must follow that the request and context imply, even unstated ones (files or behavior to leave alone, conventions, scope limits). Interpret the request, do not copy it. One short, checkable rule each. Resend the full list when it changes; leave it empty otherwise.
-8. A blocked worker asked a question: answer it in a replacement task, and ask the user only when the decision is theirs.
+7. Set constraints from the request and context, including unstated rules on files, behavior, conventions and scope. Interpret, do not copy. One short, checkable rule each; resend the full list when it changes, otherwise leave it empty.
+8. Never replace a blocked task. Answer via resolvedBlocks {taskId,answer,answeredBy,cite}. Cite this turn's user text, or at least 12 exact characters from objective, decisions, constraints, user messages or verified findings. Delegation permits uncited answers. Provider and quota questions require the user. Otherwise ask the user.
 
 Difficulty: rate what this task's agent must still work out, not the feature or project. When unsure, pick lower; a failed task can be retried higher.
 - trivial: a given command or exact edit.
@@ -176,7 +192,7 @@ Difficulty: rate what this task's agent must still work out, not the feature or 
 A new feature is not hard by itself: implementing an architect's design in deps is usually medium or complex.
 Never make mechanical code edits; delegate them.
 
-Splitting work: one task covers one subsystem and at most about 25 files. Split a cross-cutting change (for example client and server) into separate tasks, each with an explicit file scope in paths; add a dependency only when one needs the other's output. Never let more than one task edit the same shared ledger, changelog, status document or registry file; one final task depending on the others updates it. Tracked build outputs (dll, pdb, generated files) come from ONE integration task after the source tasks finish; no other task rebuilds or commits them. Architect tasks put the whole design in their report summary; dependent tasks receive only that text.
+Splitting work: one task covers one subsystem and at most about 25 files. Split cross-cutting changes into tasks with explicit file scope in paths; add a dependency only when one needs the other's output. Never let more than one task edit the same shared ledger, changelog, status document or registry file; a final task updates it. Tracked build outputs come from ONE integration task after the source tasks finish; no other task rebuilds or commits them. Architect tasks put the whole design in their report summary; dependents receive only that text.
 
 Return JSON: status (working|blocked|completed), concise userMessage, objective, decisions, constraints, risks, refreshSelf, tasks, and usually-empty spawns. Each task has {id,title,role,description,acceptance,priority,deps,paths}; role is probe|worker|architect|debug|test|reviewer|integration|head. Use stable task-id slugs; deps reference ids. List each task's edited files in paths. When a conflict prompt asks you to resolve changes, list the ids you have replaced in resolvedChanges; every listed change is discarded and its agent copy is kept for recovery.`
 
@@ -205,7 +221,7 @@ const RunNarrowly = "\nRun narrowly. Relo runs the project's checks itself when 
 
 // AskWhenBlocked is the one case where stopping beats guessing. A guess that is wrong costs a whole attempt and a
 // retry that repeats it; a question costs one report.
-const AskWhenBlocked = "\nStop and ask only when you cannot go on without a decision that is not yours: the task contradicts the code, or two readings change which files you touch. Return status \"blocked\" and put one specific question in `question`. Decide and look up everything else yourself.\n"
+const AskWhenBlocked = "\nStop and ask only when you cannot go on without a decision that is not yours: the task contradicts the code, or two readings change which files you touch. Return status \"blocked\", one specific question in `question`, and 2-4 useful answer options in `options`, exactly one marked recommended. Decide and look up everything else yourself.\n"
 
 // HandOff is what lets a task that depends on this one start from facts instead of from a clipped summary.
 const HandOff = "\nIf another task builds on yours, put exactly what it needs in `handoff`: names, signatures, file paths, decisions. Leave it out otherwise.\n"
@@ -285,7 +301,7 @@ var PrimarySchema = map[string]any{
 		"tasks":           map[string]any{"type": "array", "items": taskSchema},
 		"spawns":          map[string]any{"type": "array"},
 		"resolvedChanges": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Ids of conflicted changes you have resolved and replaced. Core discards each one without touching the workspace."},
-		"resolvedBlocks":  map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{"taskId": map[string]any{"type": "string"}, "answer": map[string]any{"type": "string"}}}, "description": "Answers to blocked tasks' unresolved questions, from the user. Core records each answer on its task; unknown or answered task ids are ignored."},
+		"resolvedBlocks":  map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{"taskId": map[string]any{"type": "string"}, "answer": map[string]any{"type": "string"}, "answeredBy": map[string]any{"type": "string", "enum": []string{"user", "primary", "delegated"}}, "cite": map[string]any{"type": "string"}}}, "description": "Authorized answers with exact supporting citation; core verifies provenance."},
 	},
 }
 
@@ -313,6 +329,7 @@ var ReportSchema = map[string]any{
 		"status":                 map[string]any{"type": "string", "description": "completed, failed, or blocked (cannot go on without a decision; put the question in question)"},
 		"summary":                map[string]any{"type": "string", "maxLength": ReportSummaryMaxLength},
 		"question":               map[string]any{"type": "string", "maxLength": ReportQuestionMaxLength, "description": "With status blocked: the one decision you need."},
+		"options":                map[string]any{"type": "array", "minItems": 2, "maxItems": 4, "description": "With status blocked: useful answer options, exactly one recommended.", "items": map[string]any{"type": "object", "properties": map[string]any{"label": map[string]any{"type": "string"}, "detail": map[string]any{"type": "string"}, "recommended": map[string]any{"type": "boolean"}}}},
 		"handoff":                map[string]any{"type": "string", "maxLength": ReportHandoffMaxLength, "description": "What a task that builds on this one needs: names, signatures, file paths, decisions."},
 		"findings":               map[string]any{"type": "array", "maxItems": ReportFindingsMaxItems, "items": map[string]any{"type": "string", "maxLength": ReportFindingMaxLength}},
 		"filesChanged":           map[string]any{"type": "array", "maxItems": ReportFilesMaxItems, "items": map[string]any{"type": "string", "maxLength": ReportFileMaxLength}},

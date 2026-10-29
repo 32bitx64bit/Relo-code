@@ -185,7 +185,7 @@ func (c *Coord) canvasStatus(role agent.Role) map[string]any {
 	if !c.canvasOn() {
 		return map[string]any{"available": false, "reason": canvasUnsupported + ", so relo_canvas is not offered to any agent in this session; do not wait for it or plan canvas work"}
 	}
-	return map[string]any{"available": true, "authoring": agent.CanvasAuthoringRole(role), "actions": agent.CanvasActionsForRole(role)}
+	return map[string]any{"available": true, "authoring": agent.CanvasAuthoringRole(role), "actions": canvasActionsFor(role, c.CurrentMode())}
 }
 
 // SetCanvasAudit installs the audit sink for canvas calls. The sink receives one metadata-only record for
@@ -213,6 +213,25 @@ func (c *Coord) auditCanvas(rec CanvasAudit) {
 		return
 	}
 	fn(rec)
+}
+
+// canvasModeAllows is the mode half of the canvas gate: create and update write artifact source, so they need build
+// mode, and every other action works in any mode. canvasRequest applies it after the role check, and canvasActionsFor
+// applies it to what a turn offers, so the prompt and the refusal read the same rule.
+func canvasModeAllows(mode Mode, action string) bool {
+	return mode == ModeBuild || (action != agent.CanvasActionCreate && action != agent.CanvasActionUpdate)
+}
+
+// canvasActionsFor lists the canvas actions an agent of the role may use in the mode: those the role gate
+// (agent.CanvasActionAllowed) and the mode gate (canvasModeAllows) in canvasRequest both let through.
+func canvasActionsFor(role agent.Role, mode Mode) []string {
+	var out []string
+	for _, action := range agent.CanvasActionsForRole(role) {
+		if canvasModeAllows(mode, action) {
+			out = append(out, action)
+		}
+	}
+	return out
 }
 
 // canvasRequest services one relo_canvas call. The key is validated the same way as peerRequest: it must be bound to
@@ -244,7 +263,7 @@ func (c *Coord) canvasRequest(ctx context.Context, req agentmsg.CanvasRequest) (
 		return nil, refusal
 	}
 	// Creating or changing source is a build-mode operation. Read-style actions stay available in every mode.
-	if (req.Action == "create" || req.Action == "update") && mode != ModeBuild {
+	if !canvasModeAllows(mode, req.Action) {
 		refusal := fmt.Errorf("canvas %s is available only in build mode", req.Action)
 		audit.Outcome = "denied"
 		audit.Reason = canvasAuditReason(refusal.Error())

@@ -88,3 +88,28 @@ func TestCanvasGuidanceAgreesWithTheRolePolicy(t *testing.T) {
 		}
 	}
 }
+
+// A builder gets the authoring guidance only in build mode; the core refuses create and update in any other mode, so
+// outside it the guidance says so and never tells the agent to make an artifact. Other roles ignore the mode.
+func TestCanvasGuidanceFollowsTheMode(t *testing.T) {
+	if got := CanvasGuidanceForMode(agent.Worker, true); got != CanvasGuidance || got != CanvasGuidanceFor(agent.Worker) {
+		t.Errorf("a builder in build mode got %q", got)
+	}
+	plan := CanvasGuidanceForMode(agent.Worker, false)
+	if plan != CanvasPlanGuidance {
+		t.Fatalf("a builder outside build mode got %q", plan)
+	}
+	for _, text := range []string{"create an artifact", "Design, prototype"} {
+		if strings.Contains(plan, text) {
+			t.Errorf("plan guidance still says %q: %s", text, plan)
+		}
+	}
+	if !strings.Contains(plan, "create and update are refused") {
+		t.Errorf("plan guidance does not say create and update are refused: %s", plan)
+	}
+	for _, role := range []agent.Role{agent.Primary, agent.Head, agent.Probe, agent.Reviewer} {
+		if CanvasGuidanceForMode(role, false) != CanvasGuidanceForMode(role, true) {
+			t.Errorf("%s guidance depends on the mode", role)
+		}
+	}
+}
