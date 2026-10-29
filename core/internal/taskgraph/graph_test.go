@@ -158,3 +158,29 @@ func TestAskingKeepsGraphUnsettled(t *testing.T) {
 		t.Fatal("graph not settled once every task is done")
 	}
 }
+
+// Attempt is the only counter, and MaxAttempts the only bound: automatic retries stop after MaxAttempts+1 runs, and a
+// manual retry grants exactly one run beyond that.
+func TestManualRetryGrantsOneAttemptPastMaxAttempts(t *testing.T) {
+	g := New()
+	g.Add(Task{ID: "t", Title: "change", Status: Failed, MaxAttempts: 3})
+	for _, tt := range []struct {
+		attempt int
+		auto    bool
+		status  Status
+	}{
+		{3, true, Queued},
+		{4, false, Queued},
+		{5, false, Failed},
+	} {
+		g.Update("t", func(x *Task) { x.Attempt, x.Status = tt.attempt, Failed })
+		got, _ := g.Get("t")
+		if got.CanRetry() != tt.auto {
+			t.Fatalf("attempt %d CanRetry = %t, want %t", tt.attempt, got.CanRetry(), tt.auto)
+		}
+		manual, err := g.Retry("t")
+		if err != nil || manual.Status != tt.status {
+			t.Fatalf("attempt %d manual retry = %s (err %v), want %s", tt.attempt, manual.Status, err, tt.status)
+		}
+	}
+}

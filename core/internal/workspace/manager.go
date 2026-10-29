@@ -510,6 +510,31 @@ func (m *Manager) Patch(agentID string) (string, error) {
 	return gitRaw(t.Path, "diff", "--cached", "--binary", t.Base)
 }
 
+// ApplyRetry applies a prior attempt's diff as uncommitted work. A conflicting patch changes nothing.
+func (m *Manager) ApplyRetry(agentID, patch string) (bool, error) {
+	t, ok := m.Tree(agentID)
+	if !ok || t.Path == m.root || t.Direct {
+		return false, fmt.Errorf("no isolated worktree for agent %q", agentID)
+	}
+	if strings.TrimSpace(patch) == "" {
+		return true, nil
+	}
+	dir, err := m.Materialize(agentID)
+	if err != nil {
+		return false, err
+	}
+	if _, err := gitStdin(dir, patch, "apply", "--check", "--whitespace=nowarn"); err != nil {
+		return false, nil
+	}
+	if _, err := gitStdin(dir, patch, "apply", "--whitespace=nowarn"); err != nil {
+		return false, fmt.Errorf("apply retry changes: %w", err)
+	}
+	if err := m.Sync(agentID); err != nil {
+		return false, fmt.Errorf("capture retry changes: %w", err)
+	}
+	return true, nil
+}
+
 func (m *Manager) PatchPath(agentID, rel string) (string, error) {
 	t, ok := m.Tree(agentID)
 	if !ok {

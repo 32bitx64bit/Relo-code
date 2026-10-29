@@ -85,15 +85,17 @@ type Task struct {
 	Difficulty  string     `json:"difficulty"`
 	Vision      bool       `json:"vision,omitempty"` // the agent must look at images; routing prefers a model that sees
 	Art         bool       `json:"art,omitempty"`    // the agent makes image assets and is offered the sprite tools; implies Vision
-	Attempts    int        `json:"attempts"`
 	Model       string     `json:"model"`
 	Role        string     `json:"role"`
-	Attempt     int        `json:"attempt"`
+	Attempt     int        `json:"attempt"` // the one attempt counter: incremented once per dispatch
 	Created     time.Time  `json:"createdAt"`
 	Started     time.Time  `json:"startedAt,omitempty"`
 	Finished    time.Time  `json:"finishedAt,omitempty"`
 	Report      any        `json:"report,omitempty"`
 	MaxAttempts int        `json:"maxAttempts"`
+	NotBefore   time.Time  `json:"notBefore,omitempty"` // earliest automatic retry dispatch
+	RetryPatch  string     `json:"-"`                   // prior attempt's uncommitted work, never sent in task events
+	RetryState  string     `json:"-"`                   // carry-over outcome for the next attempt's prompt
 	Scope       string     `json:"scope,omitempty"`     // declared work area; part of the family key
 	BlockedOn   *BlockedOn `json:"blockedOn,omitempty"` // pending question gating completion
 }
@@ -306,15 +308,24 @@ func (g *Graph) Cancel(id string) error {
 	return err
 }
 
+// CanRetry reports whether an automatic retry may follow the attempt that just failed. Attempt counts dispatches,
+// so the first run plus MaxAttempts retries: the last automatic attempt is MaxAttempts+1.
+func (t Task) CanRetry() bool {
+	return t.Attempt <= t.MaxAttempts
+}
+
+// Retry requeues a task by hand. It grants one attempt beyond the automatic bound, so the task is refused only once
+// Attempt is past MaxAttempts+1.
 func (g *Graph) Retry(id string) (Task, error) {
 	return g.Update(id, func(t *Task) {
-		if t.Attempt >= t.MaxAttempts {
+		if t.Attempt > t.MaxAttempts+1 {
 			t.Status = Failed
 			return
 		}
 		t.Status = Queued
 		t.Finished = time.Time{}
 		t.Started = time.Time{}
+		t.RetryPatch, t.RetryState = "", ""
 	})
 }
 
