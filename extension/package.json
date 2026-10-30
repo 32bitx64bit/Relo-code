@@ -258,6 +258,14 @@
       {
         "command": "relo.changes.undo",
         "title": "Relo: Undo Accepted Change"
+      },
+      {
+        "command": "relo.web.redetect",
+        "title": "Relo: Re-detect search provider"
+      },
+      {
+        "command": "relo.web.status",
+        "title": "Relo: Web status"
       }
     ],
     "menus": {
@@ -810,6 +818,72 @@
           "default": "session",
           "scope": "application",
           "description": "When Relo asks you before an agent spends money on pictures. YOLO mode skips the question but never the budget."
+        },
+        "relo.web.mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "hidden",
+            "background",
+            "visible"
+          ],
+          "enumDescriptions": [
+            "Hidden browser by default, with a real window in the background only when a site challenges the hidden one. Recommended.",
+            "Hidden browser only. Pages that challenge a headless browser fail.",
+            "A real agent browser window, kept behind your other windows.",
+            "A real agent browser window, shown in front so you can watch it."
+          ],
+          "default": "auto",
+          "scope": "application",
+          "description": "How agents open web pages. They always use the browser installed on this machine, in a separate agent profile, never your own profile or another browser download. Agents cannot change this."
+        },
+        "relo.web.searchProvider": {
+          "type": "string",
+          "enum": [
+            "duckduckgo",
+            "brave",
+            "bing",
+            "custom"
+          ],
+          "enumDescriptions": [
+            "DuckDuckGo. The built-in default.",
+            "Brave Search.",
+            "Bing.",
+            "A search URL or search page you choose below."
+          ],
+          "default": "duckduckgo",
+          "scope": "application",
+          "description": "Which search engine agents use for relo_web search. Agents cannot change this."
+        },
+        "relo.web.customSearchUrl": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Search URL for the custom provider. Type a search page or a URL with %s where the query goes, then run \"Relo: Re-detect search provider\" to find its template. Only this site's origin is allowed to be on your local network."
+        },
+        "relo.web.customSearchTemplate": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Template confirmed from the detected search URL, with %s where the query goes. Only a confirm you press writes it; run \"Relo: Re-detect search provider\" to test and confirm again."
+        },
+        "relo.web.customFallback": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "When your custom search fails, fall back to DuckDuckGo so an agent is not left without search. The result says it did."
+        },
+        "relo.web.autoCheckbox": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Let an agent make at most one slow, human-paced click on a \"not a robot\" checkbox that a site shows. Picture and sound puzzles are still always handed to you. Agents cannot change this."
+        },
+        "relo.web.browserPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Path to the Chromium-family browser (Chrome, Chromium or Edge). Empty finds the installed one."
         },
         "relo.logLevel": {
           "type": "string",

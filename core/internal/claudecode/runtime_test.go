@@ -190,7 +190,7 @@ func TestATurnRunsWithReloPromptToolsAndModel(t *testing.T) {
 		t.Errorf("system prompt = %q", e.System)
 	}
 	want := map[string]string{"--model": "claude-sonnet-5-5", "--effort": "high", "--tools": "Bash,Edit,Glob,Grep,Read,Write",
-		"--allowedTools": "Edit,Glob,Grep,Read,Write,mcp__relo__agents", "--disallowedTools": "mcp__relo__art,mcp__relo__canvas,mcp__relo__image,mcp__relo__sprite",
+		"--allowedTools": "Edit,Glob,Grep,Read,Write,mcp__relo__agents", "--disallowedTools": "mcp__relo__art,mcp__relo__canvas,mcp__relo__image,mcp__relo__sprite,mcp__relo__web",
 		"--input-format": "stream-json", "--permission-prompt-tool": "stdio"}
 	for name, value := range want {
 		if got, _ := flag(e.Args, name); got != value {

@@ -13,6 +13,7 @@ export const Methods = {
   orchestratorPause: "orchestrator.pause", orchestratorResume: "orchestrator.resume", orchestratorStopAll: "orchestrator.stopAll",
   questionAnswer: "question.answer", questionDelegate: "question.delegate",
   permissionRespond: "permission.respond", canvasReply: "canvas.reply", logsTail: "logs.tail", snapshot: "snapshot", cacheGet: "cache.get",
+  webStatus: "web.status", webDiscover: "web.discover",
 } as const;
 
 export type Method = (typeof Methods)[keyof typeof Methods];

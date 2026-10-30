@@ -44,7 +44,10 @@ func (c *Coord) SetYolo(on bool) {
 		return
 	}
 	c.mu.Lock()
-	for _, pending := range c.pending {
+	for id, pending := range c.pending {
+		if strings.HasPrefix(id, webPermPrefix) { // a browser challenge needs the user's own answer
+			continue
+		}
 		select {
 		case pending.Reply <- "once":
 		default:

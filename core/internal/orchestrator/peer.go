@@ -58,6 +58,9 @@ func (c *Coord) StartMessages() error {
 	if c.CanvasEnabled {
 		opts = append(opts, agentmsg.WithCanvas(c.canvasRequest))
 	}
+	// relo_web is registered always: the handler refuses until an engine is installed (SetWebEngine), and the
+	// runtime offers it only then.
+	opts = append(opts, agentmsg.WithWeb(c.webRequest))
 	if c.artOn() {
 		opts = append(opts, agentmsg.WithSprite(c.spriteRequest))
 		opts = append(opts, agentmsg.WithArt(c.artRequest))

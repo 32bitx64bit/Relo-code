@@ -273,6 +273,8 @@ type Coord struct {
 	canvasPending map[string]*canvasCall // request ID -> in-flight canvas call; guarded by canvasMu
 	canvasMu      sync.Mutex
 	canvasRate    map[string][]time.Time // agent ID -> recent canvas request times; guarded by canvasMu
+	// web is the relo_web browsing state: the engine and the agents' running ops. See web.go.
+	web webState
 	// canvasAuditFn receives one metadata-only record per canvas request and per canvas reply, so the event
 	// log can prove which role called canvas. It never receives artifact content; guarded by canvasAuditMu.
 	canvasAuditFn   func(CanvasAudit)

@@ -18,6 +18,8 @@ NODE_MAJOR=$(node -p 'process.versions.node.split(".")[0]')
 
 echo "==> core (host platform)"
 make core
+CORE_BIN="extension/bin/relo-core-$(go env GOOS)-$(go env GOARCH)$(go env GOEXE)"
+[ -f "$CORE_BIN" ] || die "core binary $CORE_BIN missing after make core; the vsix would not contain it"
 
 echo "==> extension dependencies"
 if [ ! -d extension/node_modules ]; then

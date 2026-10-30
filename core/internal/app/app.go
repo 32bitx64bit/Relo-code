@@ -36,6 +36,7 @@ import (
 	"github.com/relocode/relo/internal/style"
 	"github.com/relocode/relo/internal/taskgraph"
 	"github.com/relocode/relo/internal/verification"
+	"github.com/relocode/relo/internal/web"
 	"github.com/relocode/relo/internal/workspace"
 )
 
@@ -111,6 +112,12 @@ type App struct {
 	// bgWG tracks the background turns started by goSafely, so Close can wait for them: a submit that outlives
 	// Close would write the session after the store is shut and the workspace is gone.
 	bgWG sync.WaitGroup
+
+	// webMu guards web; webCfgMu guards webCfg, the last relo.web.* section the extension sent.
+	webMu    sync.Mutex
+	web      *web.Engine
+	webCfgMu sync.Mutex
+	webCfg   map[string]any
 }
 
 func (a *App) setStatus(h runtime.Health) runtime.Health {
@@ -480,6 +487,12 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 		return a.settingsApply(ctx, p)
 	case "providers.discover":
 		return a.providersDiscover(ctx, p)
+	case "web.status":
+		// What the engine would launch, without starting a browser. The Settings page reads it to show the user.
+		return a.webStatus(ctx)
+	case "web.discover":
+		// Tests a custom search URL the way a browser would; the Settings page shows the template for the user to keep.
+		return a.webDiscover(ctx, p)
 	case "mode.set":
 		a.Coord.SetMode(orchestrator.Mode(str(p, "mode", "build")))
 		return map[string]any{"mode": a.Coord.CurrentMode()}, nil
@@ -644,6 +657,10 @@ func (a *App) applySettings(p map[string]any) {
 	// The art tools only change which hub tools are offered, so they apply to a running backend without a restart.
 	if raw, ok := p["art"].(map[string]any); ok {
 		a.Coord.SetArtSettings(artSettings(raw))
+	}
+	// The web engine only changes which hub tools are offered, so it takes the user's section without a restart.
+	if raw, ok := p["web"].(map[string]any); ok {
+		a.applyWebSettings(raw)
 	}
 	if enabled, ok := p["lazyConflicts"].(bool); ok {
 		a.lazy.Store(enabled)
@@ -1180,6 +1197,7 @@ func (a *App) Close() {
 		a.Coord.StopAll(context.Background())
 		a.Coord.CloseMessages()
 		a.Coord.CloseArt()
+		a.closeWeb()
 		if ws := a.Coord.WS; ws != nil {
 			_ = ws.Close()
 		}

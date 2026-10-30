@@ -923,3 +923,17 @@ test("integer art limits render as number inputs that keep 0 (unlimited) and off
   const unset = settingsPageHtml({ schema, values: defaults, defaults, models: [] });
   assert.match(unset, /data-key="relo.art.sessionJobLimit" data-type="number" value="25"/);
 });
+
+test("settings page shows a Web group with every relo.web setting from package.json", () => {
+  const { settingsPageHtml, settingsKeysOf } = require("./main.js");
+  const props = JSON.parse(fs.readFileSync(path.join(__dirname, "../../extension/package.json"), "utf8")).contributes.configuration.properties;
+  const webKeys = Object.keys(props).filter((k) => k.startsWith("relo.web."));
+  assert.equal(webKeys.length, 7);
+  const group = settingsKeysOf().find((g) => g.id === "web");
+  assert.ok(group, "web group missing");
+  assert.deepEqual(group.keys.slice().sort(), webKeys.sort());
+  const schema = Object.fromEntries(webKeys.map((k) => [k, props[k]]));
+  const defaults = Object.fromEntries(webKeys.map((k) => [k, props[k].default]));
+  const html = settingsPageHtml({ schema, values: defaults, defaults, models: [] });
+  for (const k of webKeys) assert.ok(html.includes(`data-key="${k}"`), `missing row for ${k}`);
+});

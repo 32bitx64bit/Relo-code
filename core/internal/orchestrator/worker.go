@@ -363,6 +363,7 @@ func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent)
 	// Registered first so it runs last: the agent's session is closed before its directory is imported and removed.
 	defer c.settleDirectory(a)
 	defer c.closeAgentSession(a.ID)
+	defer c.forgetWebAgent(a.ID)
 	defer func() {
 		if a.EscalatedFrom != "" {
 			c.mu.Lock()
@@ -1572,7 +1573,7 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 		}
 	}
 	promptText := ""
-	canvasTools, imageTools, spriteTools, artTools := false, false, false, false
+	canvasTools, imageTools, spriteTools, artTools, webTools := false, false, false, false, false
 	// The canvas tool is scoped to the role: the policy names the actions this agent may use, and the core refuses
 	// any action outside it (core/internal/orchestrator/canvas.go), so the turn never offers more than it may use.
 	canvasActions := canvasActionsFor(a.Role, sess.Mode)
@@ -1602,6 +1603,11 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 				artTools = true
 				promptText += "\n\n" + artGuidance
 			}
+			// relo_web goes to a worker, probe or architect in plan or build mode, once a browsing engine is installed.
+			if c.webOn() && webOffered(a.Role, sess.Mode) {
+				webTools = true
+				promptText += "\n\n" + webGuidance
+			}
 		}
 		if c.canvasOn() && len(canvasActions) > 0 {
 			canvasTools = true
@@ -1630,6 +1636,7 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 	tools = runtime.WithImages(tools, string(a.Role), imageTools)
 	tools = runtime.WithSprite(tools, string(a.Role), spriteTools)
 	tools = runtime.WithArt(tools, string(a.Role), artTools)
+	tools = runtime.WithWeb(tools, string(a.Role), webTools)
 	if peerWake {
 		tools = map[string]bool{"*": false}
 	}

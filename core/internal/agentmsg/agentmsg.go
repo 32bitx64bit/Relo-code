@@ -1,6 +1,6 @@
 // Package agentmsg implements a minimal, loopback-only, authenticated
 // streamable-HTTP MCP server exposing the "agents" tool to Relo agents, plus the
-// optional "canvas" and "image" tools when their handlers are registered.
+// optional "canvas", "image" and "web" tools when their handlers are registered.
 //
 // Security model:
 //   - Listens on 127.0.0.1 only, on an ephemeral port.
@@ -151,6 +151,7 @@ type Server struct {
 	images    ImageHandler
 	sprite    SpriteHandler
 	art       ArtHandler
+	web       WebHandler
 	listener  net.Listener
 	httpSrv   *http.Server
 	closeOnce sync.Once
@@ -376,6 +377,9 @@ func (s *Server) route(ctx context.Context, req rpcRequest) (any, *rpcError) {
 		if s.art != nil {
 			tools = append(tools, artToolDescriptor())
 		}
+		if s.web != nil {
+			tools = append(tools, webToolDescriptor())
+		}
 		return map[string]any{"tools": tools}, nil
 	case "tools/call":
 		return s.callTool(ctx, req.Params)
@@ -494,6 +498,9 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	}
 	if p.Name == artToolName && s.art != nil {
 		return s.callArt(ctx, p.Arguments)
+	}
+	if p.Name == webToolName && s.web != nil {
+		return s.callWeb(ctx, p.Arguments)
 	}
 	if p.Name != toolName {
 		return nil, invalidParams("unknown tool")

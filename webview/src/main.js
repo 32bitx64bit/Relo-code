@@ -852,6 +852,7 @@
     { id: "permissions", title: "Permissions", keys: ["relo.permissions.read", "relo.permissions.write", "relo.permissions.test", "relo.permissions.build", "relo.permissions.install", "relo.permissions.delete", "relo.permissions.gitCommit", "relo.permissions.gitPush", "relo.permissions.network", "relo.permissions.outside", "relo.permissions.destructive", "relo.permissions.yolo"] },
     { id: "claudeCode", title: "Claude Code", keys: ["relo.claudeCode.enabled", "relo.claudeCode.path"] },
     { id: "art", title: "Sprites", keys: ["relo.art.enabled", "relo.art.provider", "relo.art.model", "relo.art.quality", "relo.art.size", "relo.art.candidates", "relo.art.sessionBudgetUSD", "relo.art.sessionJobLimit", "relo.art.approval"] },
+    { id: "web", title: "Web", keys: ["relo.web.mode", "relo.web.searchProvider", "relo.web.customSearchUrl", "relo.web.customSearchTemplate", "relo.web.customFallback", "relo.web.autoCheckbox", "relo.web.browserPath"] },
     { id: "advanced", title: "Advanced", keys: ["relo.runtime", "relo.openCode.path", "relo.logLevel"] },
   ];
 
@@ -888,6 +889,13 @@
     "relo.art.sessionBudgetUSD": "Session budget (USD, 0 = unlimited)",
     "relo.art.sessionJobLimit": "Jobs per session (0 = unlimited)",
     "relo.art.approval": "Ask before spending",
+    "relo.web.mode": "Browser mode",
+    "relo.web.searchProvider": "Search provider",
+    "relo.web.customSearchUrl": "Custom search URL",
+    "relo.web.customSearchTemplate": "Custom search template",
+    "relo.web.customFallback": "Fall back to DuckDuckGo",
+    "relo.web.autoCheckbox": "Click one challenge checkbox",
+    "relo.web.browserPath": "Browser path",
     "relo.permissions.yolo": "YOLO mode",
     "relo.logLevel": "Log level",
     "relo.primaryModel": "Primary model",

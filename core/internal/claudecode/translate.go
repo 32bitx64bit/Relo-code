@@ -312,6 +312,7 @@ var reloMCPTools = map[string]string{
 	runtime.ReloCanvasTool: "mcp__" + mcpServer + "__canvas",
 	runtime.ReloSpriteTool: "mcp__" + mcpServer + "__sprite",
 	runtime.ReloArtTool:    "mcp__" + mcpServer + "__art",
+	runtime.ReloWebTool:    "mcp__" + mcpServer + "__web",
 }
 
 func reloTool(name string) string {

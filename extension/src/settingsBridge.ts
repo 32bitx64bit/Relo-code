@@ -33,7 +33,7 @@ export const CORE_SETTING_SECTIONS = [
   "relo.autoVerify", "relo.autoReview",
   "relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics", "relo.changes.ignorePaths",
   "relo.changes.unionPaths", "relo.changes.takeLatestPaths", "relo.scheduler.pathLeases",
-  "relo.workspace", "relo.claudeCode", "relo.art", "relo.runtime", "relo.openCode",
+  "relo.workspace", "relo.claudeCode", "relo.art", "relo.web", "relo.runtime", "relo.openCode",
 ];
 
 export function checkQuestionMessage(msg: { type?: unknown; taskId?: unknown; answer?: unknown; enabled?: unknown }): { method: string; params: Record<string, unknown> } | undefined {

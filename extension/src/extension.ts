@@ -7,7 +7,9 @@ import { emptyState, reduce, routingFrom, type ReloState, type AgentInfo, type C
 import { ChatView, openDashboard, openInspector } from "./webview";
 import { CORE_SETTING_SECTIONS, checkCommand, checkQuestionMessage, checkSessionId, checkSetting, modelsSignature, settingsReply, type SettingsSchema } from "./settingsBridge";
 import { applyCollapse, cleanCollapsed, type Collapsed } from "./uiState";
+import { askWebChallenge, redetectSearchProvider, showWebStatus, type WebDeps } from "./webFlows";
 import { CrashBreaker } from "./crashBreaker";
+import { locateCore } from "./coreLocate";
 import { PROVIDER_ID_RE, sanitizeDiscovered, sanitizeProviderList, secretKey, validateBaseURL, validateProvider, MAX_PROVIDERS, type ProviderConfig } from "./providers";
 import { dirtyPathsFor } from "./dirtyGate";
 import { CanvasManager } from "./canvas/manager";
@@ -65,6 +67,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
         return;
       }
       if (CORE_SETTING_SECTIONS.some((section) => e.affectsConfiguration(section))) scheduleCoreApply();
+      if (e.affectsConfiguration("relo.web.customSearchUrl")) discoverAfterUrlChange(ctx);
     }),
     vscode.workspace.onDidChangeTextDocument(() => scheduleDirtyPush()),
     vscode.workspace.onDidSaveTextDocument(() => scheduleDirtyPush()),
@@ -87,7 +90,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     dashboard?.webview.postMessage({ type: "state", state });
     updateStatus();
     if (method === "backend.status") syncModels();
-    if (method === "permission.asked") void askPermission(params as { id: string; title: string; command: string });
+    if (method === "permission.asked") void askPermission(params as { id: string; title: string; command: string; kind?: unknown });
     if (method === "agent.escalated") {
       const p = params as { from?: string; to?: string; fromModel?: string; model?: string; attempt?: number; agent?: AgentInfo };
       const from = p.fromModel || p.from || "previous model";
@@ -198,6 +201,8 @@ function registerCommands(ctx: vscode.ExtensionContext): void {
   });
   cmd("relo.settings", () => openSettingsPage());
   cmd("relo.selectRepository", () => selectRepository());
+  cmd("relo.web.redetect", () => redetectSearchProvider(webDeps()));
+  cmd("relo.web.status", () => showWebStatus(webDeps()));
   cmd("relo.askSelection", () => fromEditor("Explain this selection and related constraints."));
   cmd("relo.fixSelection", () => fromEditor("Fix the selected code. Stay in scope."));
   cmd("relo.refactorSelection", () => fromEditor("Refactor the selection without changing behavior."));
@@ -608,7 +613,35 @@ async function writeSetting(key: string, value: unknown): Promise<void> {
   if (config.inspect(key)?.workspaceValue !== undefined) await config.update(key, undefined, vscode.ConfigurationTarget.Workspace);
 }
 
-async function askPermission(p: { id: string; title: string; command: string }): Promise<void> {
+// The web flows reach the core and settings through these; the discovery confirm only ever writes through writeSetting.
+function webDeps(): WebDeps {
+  return {
+    client,
+    config: () => cfg(),
+    writeSetting: (key, value) => writeSetting(key, value),
+  };
+}
+
+// A changed custom search URL is tested after the debounced settings.apply, so web.discover tests the URL the core now
+// has. A URL the user is still typing fails through web.discover's error reply; a blank one asks nothing.
+let pendingWebDiscover: ReturnType<typeof setTimeout> | undefined;
+function discoverAfterUrlChange(ctx: vscode.ExtensionContext): void {
+  void resendSettings(ctx);
+  if (pendingWebDiscover) clearTimeout(pendingWebDiscover);
+  pendingWebDiscover = setTimeout(() => {
+    pendingWebDiscover = undefined;
+    if (!cfg().get<string>("web.customSearchUrl", "").trim()) return;
+    if (!client.ready) return;
+    void redetectSearchProvider(webDeps()).catch((err: unknown) => log(`web.redetect failed: ${errorText(err)}`));
+  }, 1500);
+}
+
+async function askPermission(p: { id: string; title: string; command: string; kind?: unknown }): Promise<void> {
+  // A browser challenge is the user's own step, so YOLO never answers it and it gets its own two-answer prompt.
+  if (p.kind === "web-challenge") {
+    await askWebChallenge(webDeps(), p);
+    return;
+  }
   const choice = await vscode.window.showWarningMessage(`Relo needs approval: ${p.title || p.command}`, { modal: true }, "Allow once", "Always", "Reject");
   const response = choice === "Allow once" ? "once" : choice === "Always" ? "always" : "reject";
   await client.request("permission.respond", { id: p.id, response }).catch(() => {});
@@ -647,7 +680,7 @@ async function startCoreNow(ctx: vscode.ExtensionContext, maxAttempts = 5, showF
     await client.dispose();
    }
    try {
-    const bin = locateCore(ctx, ws);
+    const bin = locateCoreFor(ctx, ws);
     const args = ["-workspace", ws, "-runtime", cfg().get<string>("runtime") || "opencode", "-log-level", cfg().get<string>("logLevel") || "info"];
     const oc = cfg().get<string>("openCode.path");
     if (oc) args.push("-opencode", oc);
@@ -730,18 +763,8 @@ function giveUpOnCore(ctx: vscode.ExtensionContext): void {
   });
 }
 
-function locateCore(ctx: vscode.ExtensionContext, ws: string): { cmd: string; cwd?: string } {
-  const osName = process.platform === "win32" ? "windows" : process.platform;
-  const arch = process.arch === "x64" ? "amd64" : process.arch;
-  const ext = process.platform === "win32" ? ".exe" : "";
-  const name = `relo-core-${osName}-${arch}${ext}`;
-  const bundled = path.join(ctx.extensionPath, "bin", name);
-  if (fs.existsSync(bundled)) return { cmd: bundled };
-  const local = path.join(ctx.extensionPath, "..", "core");
-  if (fs.existsSync(path.join(local, "cmd", "relo-core"))) return { cmd: "go", cwd: local };
-  const repo = path.join(ws, "core", "cmd", "relo-core");
-  if (fs.existsSync(repo)) return { cmd: "go", cwd: path.join(ws, "core") };
-  throw new Error("Relo Core binary not found. Run `make core` from the Relo repository.");
+function locateCoreFor(ctx: vscode.ExtensionContext, ws: string): { cmd: string; cwd?: string } {
+  return locateCore(ctx.extensionPath, ws, process.platform, process.arch, fs.existsSync);
 }
 
 // Payload for initialize and settings.apply. Includes provider API keys, which go to core only.
@@ -779,6 +802,15 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
       sessionBudgetUSD: c.get<number>("art.sessionBudgetUSD", 10),
       sessionJobLimit: c.get<number>("art.sessionJobLimit", 25),
       approval: c.get<string>("art.approval", "session"),
+    },
+    web: {
+      mode: c.get<string>("web.mode", "auto"),
+      searchProvider: c.get<string>("web.searchProvider", "duckduckgo"),
+      customSearchUrl: c.get<string>("web.customSearchUrl", ""),
+      customSearchTemplate: c.get<string>("web.customSearchTemplate", ""),
+      customFallback: c.get<boolean>("web.customFallback", true),
+      autoCheckbox: c.get<boolean>("web.autoCheckbox", true),
+      browserPath: c.get<string>("web.browserPath", ""),
     },
     primaryModel: c.get("primaryModel"),
     primaryBackupModel: c.get<string>("primaryBackupModel", ""),
