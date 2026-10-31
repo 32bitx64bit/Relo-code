@@ -654,6 +654,8 @@ func (e *Engine) buildLocked(req BuildRequest, boundary bool) (*Generation, erro
 	scope := st.Scope
 	dependencies := st.DependencyTaskIDs
 	var scopeDropped []Dropped
+	// Scope and freshness drop items by ID and class, so they run before dedupe: a newer out-of-scope or stale copy
+	// must not win the duplicate and take the in-scope, fresh copy with it.
 	items := st.Pool
 	if scope != nil {
 		items, scopeDropped = applyScopeToItems(items, scope, dependencies)
@@ -666,6 +668,8 @@ func (e *Engine) buildLocked(req BuildRequest, boundary bool) (*Generation, erro
 		items, staleDropped = applyFreshness(items, stale)
 		scopeDropped = append(scopeDropped, staleDropped...)
 	}
+	// Pool order is the ingestion-order tie-break when callers create several copies in the same timestamp tick.
+	items = dedupeItems(items)
 	pool := Retrieve(items, req.Query)
 	if len(pool) == 0 {
 		pool = items
@@ -681,7 +685,6 @@ func (e *Engine) buildLocked(req BuildRequest, boundary bool) (*Generation, erro
 		previous := liveItems(prior.Items, st.Pool)
 		if !boundary {
 			sel.Included = appendNewInOrder(previous, sel.Included)
-			deferred = carryDeferred(prior, sel.Included)
 		} else {
 			if scope != nil {
 				previous, _ = applyScopeToItems(previous, scope, dependencies)
@@ -689,6 +692,12 @@ func (e *Engine) buildLocked(req BuildRequest, boundary bool) (*Generation, erro
 			previous, _ = applyFreshness(previous, stale)
 			sel.Included = retainWithinHysteresis(previous, sel.Included, st.Budget)
 		}
+		sel.Included = dedupeItems(sel.Included)
+		if !boundary {
+			deferred = carryDeferred(prior, sel.Included)
+		}
+	} else {
+		sel.Included = dedupeItems(sel.Included)
 	}
 	gen := &Generation{
 		Number:         nextNumber(st),
@@ -902,6 +911,52 @@ func (e *Engine) gcPool(st *state) {
 func fingerprint(s string) string {
 	sum := sha1.Sum([]byte(strings.ToLower(strings.TrimSpace(s))))
 	return hex.EncodeToString(sum[:6])
+}
+
+// dedupeItems removes repeated IDs and exact content within one built generation. PAW generation snapshots held
+// 0.240M tokens of same-content repeats; pinned, history and ephemeral copies always remain. Rank order: a Verified
+// copy beats an unverified one, then the newest copy (latest Created, then latest position). Callers filter scope and
+// freshness first, so a copy that survives here is one the build can still send. Later builds remain full contexts.
+func dedupeItems(items []Item) []Item {
+	newestID := make(map[string]int, len(items))
+	newestContent := make(map[[sha256.Size]byte]int, len(items))
+	for i, it := range items {
+		if it.Class == ClassHistory || it.Class == ClassEphemeral {
+			continue // Repeated actions are loop-detection signals, not redundant durable context.
+		}
+		if it.ID != "" {
+			if previous, ok := newestID[it.ID]; !ok || duplicateWins(it, items[previous]) {
+				newestID[it.ID] = i
+			}
+		}
+		digest := sha256.Sum256([]byte(it.Content))
+		if previous, ok := newestContent[digest]; !ok || duplicateWins(it, items[previous]) {
+			newestContent[digest] = i
+		}
+	}
+	out := make([]Item, 0, len(items))
+	for i, it := range items {
+		if it.Pinned || it.Class == ClassHistory || it.Class == ClassEphemeral {
+			out = append(out, it)
+			continue
+		}
+		if it.ID != "" && newestID[it.ID] != i {
+			continue
+		}
+		if newestContent[sha256.Sum256([]byte(it.Content))] != i {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+// duplicateWins reports whether candidate should survive instead of kept: Verified first, then newest.
+func duplicateWins(candidate, kept Item) bool {
+	if candidate.Verified != kept.Verified {
+		return candidate.Verified
+	}
+	return !kept.Created.After(candidate.Created)
 }
 
 func appendNewInOrder(prior, selected []Item) []Item {

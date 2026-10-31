@@ -496,6 +496,160 @@ func TestIngestStillCountsRepeatedHistory(t *testing.T) {
 	}
 }
 
+func TestBuildDeduplicatesContentKeepingNewestUniqueAndPinned(t *testing.T) {
+	e := New()
+	e.Bind("a", "t", "primary", 10000)
+	created := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	e.Ingest("a", []Item{
+		{ID: "old", Class: ClassReport, Source: SourceWorker, Title: "old", Content: "shared report", Created: created},
+		{ID: "pin-old", Class: ClassReport, Source: SourceVerified, Title: "original", Content: "shared report", Created: created.Add(time.Second), Pinned: true, Verified: true},
+		{ID: "pin-new", Class: ClassReport, Source: SourceVerified, Title: "verified", Content: "shared report", Created: created.Add(2 * time.Second), Pinned: true, Verified: true},
+		{ID: "new", Class: ClassReport, Source: SourceWorker, Title: "new", Content: "different report", Created: created.Add(3 * time.Second)},
+		{ID: "unverified", Class: ClassReport, Source: SourceWorker, Title: "newer-unverified", Content: "verified evidence", Created: created.Add(5 * time.Second)},
+		{ID: "verified", Class: ClassReport, Source: SourceWorker, Title: "verified-old", Content: "verified evidence", Kind: KindArchitecture, Created: created.Add(4 * time.Second), Verified: true},
+		{ID: "unique", Class: ClassFinding, Source: SourceWorker, Title: "unique", Content: "different evidence", Created: created.Add(4 * time.Second)},
+	})
+	g, err := e.Build(BuildRequest{AgentID: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	included := make(map[string]bool, len(g.Items))
+	for _, it := range g.Items {
+		included[it.ID] = true
+	}
+	if included["old"] {
+		t.Fatalf("older unpinned copy survived: %+v", g.Items)
+	}
+	for _, id := range []string{"new", "verified", "pin-old", "pin-new", "unique"} {
+		if !included[id] {
+			t.Errorf("%s was lost: %+v", id, g.Items)
+		}
+	}
+	if len(g.Items) != 5 {
+		t.Fatalf("included %d items, want 5: %+v", len(g.Items), g.Items)
+	}
+}
+
+func TestBuildDeduplicatesIDKeepingNewestContent(t *testing.T) {
+	e := New()
+	e.Bind("a", "t", "worker", 4000)
+	created := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	e.Ingest("a", []Item{
+		{ID: "report", Class: ClassReport, Source: SourceWorker, Title: "old", Content: "stale report", Created: created},
+		{ID: "report", Class: ClassReport, Source: SourceWorker, Title: "new", Content: "current report", Created: created.Add(time.Second)},
+	})
+	g, err := e.Build(BuildRequest{AgentID: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Items) != 1 || g.Items[0].Content != "current report" {
+		t.Fatalf("same-ID update did not keep only the newest item: %+v", g.Items)
+	}
+}
+
+func TestBuildDeduplicationKeepsFullContextAcrossBoundaries(t *testing.T) {
+	items := []Item{
+		{ID: "old", Class: ClassReport, Source: SourceWorker, Title: "old", Content: "shared report"},
+		{ID: "new", Class: ClassReport, Source: SourceWorker, Title: "new", Content: "shared report"},
+		{ID: "pin", Class: ClassTask, Source: SourceUser, Title: "Constraint", Content: "keep this constraint", Pinned: true},
+		{ID: "unique", Class: ClassFinding, Source: SourceWorker, Title: "unique", Content: "different evidence"},
+	}
+	assertFull := func(t *testing.T, g *Generation) {
+		t.Helper()
+		included := make(map[string]bool, len(g.Items))
+		for _, it := range g.Items {
+			included[it.ID] = true
+		}
+		if included["old"] || len(g.Items) != 3 {
+			t.Fatalf("duplicate was not removed: %+v", g.Items)
+		}
+		for _, id := range []string{"new", "pin", "unique"} {
+			if !included[id] {
+				t.Errorf("%s missing from full context: %+v", id, g.Items)
+			}
+		}
+	}
+	e := New()
+	e.Bind("a", "t", "primary", 10000)
+	e.Ingest("a", items)
+	first, _ := e.Build(BuildRequest{AgentID: "a"})
+	assertFull(t, first)
+	continued, _ := e.Build(BuildRequest{AgentID: "a"})
+	assertFull(t, continued)
+	compacted, _ := e.Compress("a")
+	assertFull(t, compacted)
+	refreshed, _ := e.Refresh("a", "test refresh")
+	assertFull(t, refreshed)
+
+	newSession := New()
+	newSession.Bind("new", "t", "primary", 10000)
+	newSession.Ingest("new", items)
+	fresh, _ := newSession.Build(BuildRequest{AgentID: "new"})
+	assertFull(t, fresh)
+}
+
+// A newer out-of-scope copy must not win the duplicate and take the surviving in-scope copy with it.
+func TestBuildDedupeRunsAfterScopeFiltering(t *testing.T) {
+	e := New()
+	e.Bind("a", "t", "worker", 10000)
+	e.Ingest("a", []Item{
+		{ID: "in-scope", Class: ClassFinding, Source: SourceWorker, Title: "evidence", Content: "shared evidence", Created: time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)},
+		{ID: "out-of-scope", Class: ClassReport, Source: SourceWorker, Title: "report", Content: "shared evidence", Created: time.Date(2026, 10, 31, 0, 1, 0, 0, time.UTC)},
+	})
+	g, err := e.Build(BuildRequest{AgentID: "a", Scope: &Scope{Classes: []Class{ClassFinding}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Items) != 1 || g.Items[0].ID != "in-scope" {
+		t.Fatalf("in-scope copy was lost to an out-of-scope duplicate: %+v", g.Items)
+	}
+}
+
+// A newer stale code copy must not win the duplicate and take the fresh copy with it.
+func TestBuildDedupeRunsAfterFreshnessFiltering(t *testing.T) {
+	e := New()
+	e.Bind("a", "t", "worker", 20000)
+	e.BindWorkspace("a", ref("a", 1, "tree1"))
+	body := "package a\n"
+	current := "package a // edited\n"
+	e.Ingest("a", []Item{
+		{ID: "fresh", Class: ClassCode, Source: SourceRepo, Title: "a.go", Content: body, Files: []string{"a.go"},
+			From: derived("a", 1, map[string]string{"a.go": current}), Created: time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)},
+		{ID: "stale", Class: ClassCode, Source: SourceRepo, Title: "a.go", Content: body, Files: []string{"a.go"},
+			From: derived("a", 1, map[string]string{"a.go": body}), Created: time.Date(2026, 10, 31, 0, 1, 0, 0, time.UTC)},
+	})
+	e.Revalidate("a", func(path string) (string, bool, error) {
+		if path != "a.go" {
+			return "", false, nil
+		}
+		return BlobHash([]byte(current)), true, nil
+	})
+	g, err := e.Build(BuildRequest{AgentID: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Items) != 1 || g.Items[0].ID != "fresh" {
+		t.Fatalf("fresh copy was lost to a stale duplicate: %+v", g.Items)
+	}
+}
+
+// An older Verified copy must beat a newer unverified copy of the same content.
+func TestBuildDedupePrefersVerifiedOverNewer(t *testing.T) {
+	e := New()
+	e.Bind("a", "t", "worker", 10000)
+	e.Ingest("a", []Item{
+		{ID: "verified", Class: ClassFinding, Source: SourceVerified, Title: "verified", Content: "same evidence", Verified: true, Created: time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)},
+		{ID: "unverified", Class: ClassFinding, Source: SourceWorker, Title: "unverified", Content: "same evidence", Created: time.Date(2026, 10, 31, 0, 1, 0, 0, time.UTC)},
+	})
+	g, err := e.Build(BuildRequest{AgentID: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Items) != 1 || g.Items[0].ID != "verified" || !g.Items[0].Verified {
+		t.Fatalf("unverified copy displaced the verified one: %+v", g.Items)
+	}
+}
+
 // What was left out is a count. Quoting each item's first line sent a probe 3.7k tokens about memory it was not meant to see.
 func TestExcludedItemsAreCountedNotQuoted(t *testing.T) {
 	var dropped []Dropped

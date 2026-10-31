@@ -959,6 +959,17 @@ func (c *Coord) admitTaskAliases(specs []TurnTask) (kept []TurnTask, existing, i
 		if matched {
 			continue
 		}
+		// A family that spent its failure budget under other ids or wording is blocked, not re-planned.
+		if n, last := familySpend(c.Graph.List(), candidate); n >= familyFailureCap {
+			if !last.BlockedOn.Unresolved() {
+				c.blockFamilyOnBudget(last, n)
+			}
+			note := fmt.Sprintf("Skipped %q because its family already has %d failed or canceled dispatches (task %s, %q); the family is blocked until the user answers. Do not re-plan it under another id or title.", spec.Title, n, last.ID, last.Title)
+			notes[last.ID] = append(notes[last.ID], note)
+			c.chat("system", note, "")
+			refused++
+			continue
+		}
 		kept = append(kept, spec)
 	}
 	if c.Agents != nil && c.Engine != nil && len(notes) > 0 {

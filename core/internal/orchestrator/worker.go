@@ -1386,8 +1386,8 @@ func (c *Coord) runVerify(ctx context.Context, a agent.Agent) (bool, string) {
 	return len(failures) == 0, strings.Join(failures, "\n\n")
 }
 
-// failsOnBase runs a failing command once on a pristine checkout of the base commit (cached per command) to learn
-// whether the failure was already there before the agent touched anything.
+// failsOnBase reports whether a failing command already fails on a pristine checkout of the base commit, so the
+// failure is not the agent's. The baseline run is shared per session: see verification.BaselineCache.
 func (c *Coord) failsOnBase(ctx context.Context, runner verification.Runner, command string) bool {
 	ws := c.workspace()
 	if ws == nil || ws.Direct() {
@@ -1398,27 +1398,13 @@ func (c *Coord) failsOnBase(ctx context.Context, runner verification.Runner, com
 		c.logWarn("baseline checkout", err)
 		return false
 	}
-	key := dir + "\x00" + command
 	c.mu.Lock()
 	if c.baseline == nil {
-		c.baseline = map[string]bool{}
+		c.baseline = verification.NewBaselineCache()
 	}
-	if known, ok := c.baseline[key]; ok {
-		c.mu.Unlock()
-		return known
-	}
+	cache := c.baseline
 	c.mu.Unlock()
-	vctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	res := runner.Run(vctx, command, dir)
-	cancel()
-	if ctx.Err() != nil {
-		return false
-	}
-	failed := res.Status == "failed"
-	c.mu.Lock()
-	c.baseline[key] = failed
-	c.mu.Unlock()
-	return failed
+	return cache.FailsOnBase(ctx, runner, dir, command)
 }
 
 func tailText(s string, max int) string {
@@ -1682,7 +1668,7 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 			if !st.interrupting {
 				st.stalledFor = armed
 			}
-			if !st.interrupting && recoveries < agentRecoveries {
+			if !st.interrupting && len(st.inflight)+len(st.anonymous) == 0 && recoveries < agentRecoveries {
 				// Interrupting the silent model call and telling the agent so keeps everything it has done;
 				// failing the task starts it again from nothing.
 				if c.interruptStalled(ctx, a, rt, sid, st) {
@@ -1895,8 +1881,8 @@ type runState struct {
 	bodyLen  int
 	live     int // rough tokens of the streaming reply already added to the agent's UsedTokens
 
-	inflight  map[string]struct{} // tool calls started and not finished, by call id
-	anonymous int                 // the same for runtimes whose tool events carry no id
+	inflight  map[string]time.Time // tool calls started and not finished, by call id and start time
+	anonymous []time.Time          // the same for runtimes whose tool events carry no id
 
 	last         time.Time     // when the runtime last said anything
 	silent       bool          // the status line is showing how long it has been quiet
@@ -1907,18 +1893,20 @@ type runState struct {
 	watch contextWatch // how full the context is and whether it is being summarized; see compact.go
 }
 
-// An agent is stopped when it goes quiet, never for being busy. It used to be stopped 8 minutes after it began,
-// which killed an architect that was still reading code (17 model calls in, the last one 47 seconds before the
-// cut) and started it again from nothing.
+// An agent is stopped when the model goes quiet, never merely for being busy. It used to be stopped 8 minutes after
+// it began, which killed an architect that was still reading code (17 model calls in, the last one 47 seconds before
+// the cut) and started it again from nothing.
 //
-// A running tool call is not counted at all. OpenCode says nothing while one runs, and a build or a test suite can
-// take as long as it takes (workers ran project suites of four to nine minutes, which looked like a freeze but was
-// not), so the clock stops until the call ends. The tool's own timeout, the status line (which names the command and
-// how long it has been quiet) and the Stop button are what bound it. When the model itself goes quiet, the call is
-// interrupted and the agent is told, which keeps its context and its edits; only if that does not bring it back is
-// it stopped.
+// OpenCode says nothing while a tool runs, so each call also has a wall-clock cap that progress events cannot extend.
+// PAW's measured real p99.9 and maximum tool duration were both 841.202s; the 435,843s and 407,105s records were
+// stale reload artifacts (ses_e96a9a03affe583KbrE3AGg7nn/agent_36e7d08c98ed0e61d877 and
+// ses_e94edbdbbffeK6Yj2JvvcAE9h7/agent_7c73579cdb0ea6fc4121), not live waits. Thirty minutes leaves more than twice
+// the observed headroom without letting a live or stale call disable the watchdog for days.
+const agentToolLimit = 30 * time.Minute
+
 var (
 	agentIdleLimit  = 5 * time.Minute  // the model has said nothing, and no tool call is running
+	agentToolWait   = agentToolLimit   // tests shorten the per-call wall clock; production uses agentToolLimit
 	agentRecoveries = 2                // how many times one turn may be interrupted and resumed before it fails
 	interruptWait   = 15 * time.Second // how long the runtime has to confirm an interrupt
 	silenceShown    = 30 * time.Second // quiet for this long, the status line says so
@@ -1933,38 +1921,63 @@ func (e *stalledError) Error() string { return e.msg }
 // noteTool keeps track of the tool calls that have started and not finished.
 func (st *runState) noteTool(ev runtime.Event) {
 	if st.inflight == nil {
-		st.inflight = map[string]struct{}{}
+		st.inflight = map[string]time.Time{}
 	}
 	if ev.Type == "session.step.started" {
 		// A model call begins only after the previous step's tool calls have all ended. An end event that was lost
 		// (the stream drops oversized events) must not leave the agent looking as if it were still in a tool call,
 		// which would switch its silence clock off for good.
 		clear(st.inflight)
-		st.anonymous = 0
+		st.anonymous = nil
 	}
 	switch {
 	case ev.ToolDone && ev.ToolID != "":
 		delete(st.inflight, ev.ToolID)
 		delete(st.inputs, ev.ToolID)
 	case ev.ToolDone:
-		if st.anonymous > 0 {
-			st.anonymous--
+		if len(st.anonymous) > 0 {
+			// An anonymous completion cannot be paired with a start. Keep the oldest start while any remain,
+			// so later anonymous calls cannot extend the whole group's deadline.
+			st.anonymous = st.anonymous[:len(st.anonymous)-1]
 		}
 	case ev.Tool != "" && ev.ToolID != "":
-		st.inflight[ev.ToolID] = struct{}{}
+		if _, running := st.inflight[ev.ToolID]; !running {
+			st.inflight[ev.ToolID] = time.Now()
+		}
 	case ev.Tool != "":
-		st.anonymous++
+		st.anonymous = append(st.anonymous, time.Now())
 	}
 }
 
-// quietLimit is how long the agent may stay silent from now on; zero means as long as it likes, because a tool
-// call is running.
+// oldestTool returns the call whose wall-clock deadline comes first.
+func (st *runState) oldestTool() (string, time.Time) {
+	id, oldest := "", time.Time{}
+	for callID, started := range st.inflight {
+		if oldest.IsZero() || started.Before(oldest) {
+			id, oldest = callID, started
+		}
+	}
+	for _, started := range st.anonymous {
+		if oldest.IsZero() || started.Before(oldest) {
+			id, oldest = "", started
+		}
+	}
+	return id, oldest
+}
+
+// quietLimit is how long the agent may stay silent from now on. A running tool gets the time left on its own
+// wall clock, rather than resetting the model-idle clock whenever the runtime emits an event.
 func (st *runState) quietLimit() time.Duration {
 	switch {
 	case st.interrupting:
 		return interruptWait
-	case len(st.inflight)+st.anonymous > 0:
-		return 0
+	case len(st.inflight)+len(st.anonymous) > 0:
+		_, started := st.oldestTool()
+		remaining := time.Until(started.Add(agentToolWait))
+		if remaining <= 0 {
+			return time.Nanosecond // rearm treats zero as stopped; an expired call must fire immediately
+		}
+		return remaining
 	}
 	return agentIdleLimit
 }
@@ -1983,13 +1996,21 @@ func rearm(t *time.Timer, limit time.Duration) {
 }
 
 func (st *runState) stalledErr() error {
+	if len(st.inflight)+len(st.anonymous) > 0 {
+		id, _ := st.oldestTool()
+		name := st.tools[id]
+		if name == "" {
+			name = "tool"
+		}
+		return &stalledError{fmt.Sprintf("agent timed out: tool call %q exceeded %s wall-clock limit", name, span(agentToolWait))}
+	}
 	return &stalledError{"agent timed out: no activity for " + span(st.stalledFor)}
 }
 
 // resume clears what the interrupted turn left behind.
 func (st *runState) resume() {
 	st.interrupting = false
-	st.inflight, st.anonymous = map[string]struct{}{}, 0
+	st.inflight, st.anonymous = map[string]time.Time{}, nil
 	st.phase, st.label = "model", "Waiting for model"
 	st.silent, st.last = false, time.Now()
 }

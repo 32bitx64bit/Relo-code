@@ -428,3 +428,97 @@ func TestGuardTurnsPanicIntoError(t *testing.T) {
 		t.Fatalf("guard on success = %v", err)
 	}
 }
+
+// The 'SPT stage 2' loop (session sess_b0abba4abea841d1d19d) re-planned one family 16 times under new ids and
+// reworded titles; each id had its own one-attempt budget, so no cap bit. The family budget counts the failed
+// dispatches across ids and wording, and at familyFailureCap it blocks the family with one question.
+func TestFamilyBudgetBlocksReplansUnderNewIDsAndWording(t *testing.T) {
+	c := New(logging.New(nil, logging.Error))
+	c.CreateSession(t.TempDir(), "", ModeBuild)
+	titles := []string{
+		"SPT stage 2 per spt-impl-plan contract",
+		"SPT stage 2 per its contract in spt-impl-plan",
+		"SPT stage 2 from spt-impl-plan contract",
+		"SPT stage 2 per spt-impl-plan contract",
+	}
+	for i := 0; i < familyFailureCap-1; i++ {
+		c.Graph.Add(taskgraph.Task{ID: fmt.Sprintf("f%d", i), Title: titles[i], Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai", Status: taskgraph.Failed})
+	}
+	spec := func(id, title string) TurnTask {
+		return TurnTask{ID: id, Title: title, Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"}
+	}
+	// Below the cap the re-plan still goes through, so the budget does not cut ordinary retries.
+	if got := c.admitTasks([]TurnTask{spec("below", "SPT stage 2 per its contract in spt-impl-plan")}); len(got) != 1 {
+		t.Fatalf("admitted = %+v below the cap, want the re-plan", got)
+	}
+	c.Graph.Add(taskgraph.Task{ID: "f-last", Title: titles[3], Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai", Status: taskgraph.Failed})
+
+	// At the cap: a new id and a new wording of the same work spawn nothing and the family blocks once.
+	got := c.admitTasks([]TurnTask{spec("n1", "SPT stage 2 from spt-impl-plan contract"), spec("n2", "SPT stage 2 per spt-impl-plan contract v2")})
+	if len(got) != 0 {
+		t.Fatalf("admitted = %+v at the family cap, want none", got)
+	}
+	fams := c.unresolvedFamilies()
+	if len(fams) != 1 {
+		t.Fatalf("blocked families = %v, want exactly one question for the family", fams)
+	}
+	var questions int
+	for _, x := range c.Graph.List() {
+		if x.BlockedOn.Unresolved() {
+			questions++
+			if x.Status != taskgraph.Asking {
+				t.Fatalf("budget-blocked task status = %s, want asking", x.Status)
+			}
+		}
+	}
+	if questions != 1 {
+		t.Fatalf("open questions = %d, want 1", questions)
+	}
+}
+
+// An answer reopens the family: failures before the answer no longer count, and a new re-plan is admitted.
+func TestAnAnswerReopensTheFamilyBudget(t *testing.T) {
+	c := New(logging.New(nil, logging.Error))
+	c.CreateSession(t.TempDir(), "", ModeBuild)
+	for i := 0; i < familyFailureCap; i++ {
+		c.Graph.Add(taskgraph.Task{ID: fmt.Sprintf("g%d", i), Title: "SPT stage 2 per spt-impl-plan contract", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai", Status: taskgraph.Failed})
+	}
+	if got := c.admitTasks([]TurnTask{{ID: "a", Title: "SPT stage 2 per its contract in spt-impl-plan", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"}}); len(got) != 0 {
+		t.Fatalf("admitted = %+v at the cap, want none", got)
+	}
+	open := c.openQuestions()
+	if len(open) != 1 {
+		t.Fatalf("open questions = %d, want 1", len(open))
+	}
+	if err := c.AnswerQuestion(open[0].ID, "Retry with the contract section quoted in the answer."); err != nil {
+		t.Fatal(err)
+	}
+	// Spend before the answer does not count: the answered task was re-queued and the budget starts again.
+	if n, _ := familySpend(c.Graph.List(), taskgraph.Task{Title: "SPT stage 2 per its contract in spt-impl-plan", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"}); n != 0 {
+		t.Fatalf("spend after the answer = %d, want 0", n)
+	}
+	// The answered task is queued, so a re-plan of it is a live duplicate. Once that run fails, the family has one
+	// post-answer failure: the budget is open again and the re-plan is admitted.
+	if q, _ := c.Graph.Get(open[0].ID); q.Status != taskgraph.Queued {
+		t.Fatalf("answered task status = %s, want queued", q.Status)
+	}
+	if _, err := c.Graph.Update(open[0].ID, func(x *taskgraph.Task) {
+		x.Status, x.Finished = taskgraph.Failed, time.Now().UTC().Add(time.Minute)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.admitTasks([]TurnTask{{ID: "b", Title: "SPT stage 2 per its contract in spt-impl-plan", Role: "worker", Paths: []string{"pax_game_ai.c"}, Scope: "ai"}}); len(got) != 1 {
+		t.Fatalf("admitted = %+v after the answer and one new failure, want the re-plan", got)
+	}
+}
+
+// Unrelated failures never spend another family's budget.
+func TestFamilySpendIgnoresUnrelatedWork(t *testing.T) {
+	graph := []taskgraph.Task{
+		{ID: "p", Title: "Fix parser", Role: "worker", Status: taskgraph.Failed},
+		{ID: "d", Title: "SPT stage 2 per spt-impl-plan contract", Role: "worker", Status: taskgraph.Done},
+	}
+	if n, _ := familySpend(graph, taskgraph.Task{Title: "SPT stage 2", Role: "worker"}); n != 0 {
+		t.Fatalf("spend = %d, want 0 for unrelated or done work", n)
+	}
+}

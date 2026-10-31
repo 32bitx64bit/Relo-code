@@ -55,6 +55,13 @@ func setLimits(t *testing.T, idle time.Duration, recoveries int) {
 	t.Cleanup(func() { agentIdleLimit, agentRecoveries, interruptWait = oldIdle, oldRec, oldWait })
 }
 
+func setToolLimit(t *testing.T, limit time.Duration) {
+	t.Helper()
+	old := agentToolWait
+	agentToolWait = limit
+	t.Cleanup(func() { agentToolWait = old })
+}
+
 func runPaced(t *testing.T, idle time.Duration, script []paced) (string, error, time.Duration) {
 	t.Helper()
 	setLimits(t, idle, 0)
@@ -103,8 +110,8 @@ func TestAnAgentThatGoesQuietIsStopped(t *testing.T) {
 	}
 }
 
-// A build or a test suite is silent while it runs. That is the tool working: the clock is off until it ends, and
-// back on after.
+// A build or a test suite is silent while it runs. The model-idle clock is off until it ends and back on after;
+// the separate per-call wall clock still bounds it.
 func TestAnAgentWaitingOnAToolCallIsNotTimedOut(t *testing.T) {
 	script := []paced{{10 * time.Millisecond, toolRuns}, {250 * time.Millisecond, toolEnds}, {10 * time.Millisecond, finished}}
 	if _, err, took := runPaced(t, 80*time.Millisecond, script); err != nil {
@@ -117,9 +124,10 @@ func TestAnAgentWaitingOnAToolCallIsNotTimedOut(t *testing.T) {
 	}
 }
 
-// A shell command that runs for nine minutes, or an hour, is not a reason to stop the agent. Only the user can.
-func TestAToolCallThatNeverReturnsIsNeverTimedOut(t *testing.T) {
+// A build below the per-call wall cap is not interrupted, even when it runs well past the model-idle limit.
+func TestAToolCallBelowItsWallClockLimitIsNotTimedOut(t *testing.T) {
 	setLimits(t, 30*time.Millisecond, 1)
+	setToolLimit(t, 500*time.Millisecond)
 	r := &turnsRuntime{dispatchRuntime: newDispatchRuntime(), confirm: true, turns: [][]paced{{{10 * time.Millisecond, toolRuns}, {10 * time.Millisecond, toolCmd}}}}
 	c := New(logging.New(nil, logging.Error))
 	c.SetRuntime(r)
@@ -150,6 +158,53 @@ func TestAToolCallThatNeverReturnsIsNeverTimedOut(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop did not end the wait for the command")
+	}
+}
+
+// Tool progress is not a new call: repeated events cannot extend the wall clock. A call past the cap is aborted,
+// the turn fails with the command's reason, and the task is never marked as passed.
+func TestAToolCallPastItsWallClockLimitFailsTheTask(t *testing.T) {
+	setLimits(t, time.Hour, 1)
+	setToolLimit(t, 90*time.Millisecond)
+	script := [][]paced{{
+		{10 * time.Millisecond, toolRuns},
+		{20 * time.Millisecond, toolCmd},
+		{20 * time.Millisecond, toolCmd},
+		{20 * time.Millisecond, toolCmd},
+		{20 * time.Millisecond, toolCmd},
+		{20 * time.Millisecond, toolCmd},
+		{20 * time.Millisecond, toolCmd},
+	}}
+	r := &turnsRuntime{dispatchRuntime: newDispatchRuntime(), turns: script}
+	c, task, a := workerInRepo(t, r)
+	task, err := c.Graph.Update(task.ID, func(x *taskgraph.Task) {
+		x.Attempt, x.MaxAttempts = 2, 1 // leave the failed task alone rather than queueing a retry
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.execWorker(context.Background(), task, a)
+	var stalled *stalledError
+	if !errors.As(err, &stalled) {
+		t.Fatalf("err = %v, want a tool-timeout stall", err)
+	}
+	for _, want := range []string{`tool call "shell"`, "exceeded 90ms wall-clock limit"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("%q does not say %q", err, want)
+		}
+	}
+	got, _ := c.Graph.Get(task.ID)
+	if got.Status != taskgraph.Failed {
+		t.Fatalf("task is %s, want failed", got.Status)
+	}
+	rep, ok := c.Agents.Report(a.ID)
+	if !ok || rep.Status != agent.Failed || !strings.Contains(rep.Summary, "wall-clock limit") {
+		t.Fatalf("report = %+v, want the tool-timeout reason", rep)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.cancels != 1 || len(r.tasks) != 1 {
+		t.Fatalf("cancels=%d tasks=%d, want one abort and no model recovery turn", r.cancels, len(r.tasks))
 	}
 }
 
