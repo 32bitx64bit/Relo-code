@@ -1668,6 +1668,7 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 	defer tick.Stop()
 	usageRecorded := false
 	recoveries := 0
+	loopDetection := c.settings().LoopDetection
 	var loops loopDetector
 	for {
 		select {
@@ -1702,25 +1703,27 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 			st.last = time.Now()
 			c.showProgress(a, st)
 			st.noteTool(ev)
-			switch loops.observe(ev) {
-			case 1:
-				if !st.interrupting {
-					interruptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-					err := rt.Cancel(interruptCtx, sid)
-					cancel()
-					if err != nil {
-						c.abortAgentSession(a.ID, rt, sid)
-						c.discardStream(a, st)
-						return body.String(), fmt.Errorf("loop steering interrupt: %w", err)
+			if loopDetection {
+				switch loops.observe(ev) {
+				case 1:
+					if !st.interrupting {
+						interruptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+						err := rt.Cancel(interruptCtx, sid)
+						cancel()
+						if err != nil {
+							c.abortAgentSession(a.ID, rt, sid)
+							c.discardStream(a, st)
+							return body.String(), fmt.Errorf("loop steering interrupt: %w", err)
+						}
 					}
+					st.interrupting, st.nudge = true, loopNudge
+					c.chat("system", "An agent repeated identical tool calls. It was interrupted and told to change approach.", a.ID)
+				case 2:
+					c.abortAgentSession(a.ID, rt, sid)
+					c.discardStream(a, st)
+					c.chat("system", "An agent kept repeating identical tool calls and was stopped.", a.ID)
+					return body.String(), errLoopDetected
 				}
-				st.interrupting, st.nudge = true, loopNudge
-				c.chat("system", "An agent repeated identical tool calls. It was interrupted and told to change approach.", a.ID)
-			case 2:
-				c.abortAgentSession(a.ID, rt, sid)
-				c.discardStream(a, st)
-				c.chat("system", "An agent kept repeating identical tool calls and was stopped.", a.ID)
-				return body.String(), errLoopDetected
 			}
 			if ev.Interrupted && st.interrupting {
 				// The runtime has stopped the stuck call. The session is intact: tell the agent what happened.

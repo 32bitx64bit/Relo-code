@@ -830,6 +830,7 @@ async function settingsPayload(workspace: string): Promise<Record<string, unknow
     compressionStrategy: c.get("context.compressionStrategy"),
     autoVerify: c.get("autoVerify"),
     autoReview: c.get("autoReview"),
+    loopDetection: c.get<boolean>("loopDetection.enabled", false),
     logLevel: c.get("logLevel"),
     byDifficulty: c.get<Record<string, string>>("routing.byDifficulty", {}),
     backupByDifficulty: c.get<Record<string, string>>("routing.backupByDifficulty", {}),

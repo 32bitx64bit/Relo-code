@@ -171,6 +171,7 @@ type Settings struct {
 	Strategy           string            `json:"compressionStrategy"`
 	AutoVerify         bool              `json:"autoVerify"`
 	AutoReview         bool              `json:"autoReview"`
+	LoopDetection      bool              `json:"loopDetection"`
 	Escalate           bool              `json:"escalate"`
 	EscalateSet        bool              `json:"-"`
 	ReportMaxChars     int               `json:"reportMaxChars"`

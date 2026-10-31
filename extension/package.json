@@ -713,6 +713,11 @@
           "default": true,
           "description": "Have a second agent review large or hard changes (a hard or expert task, 6 or more files, or 200 or more changed lines). Small changes are not reviewed, and a reviewer the Primary already planned is not duplicated."
         },
+        "relo.loopDetection.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Stop an agent that repeats the same tool call with the same arguments. Off by default because repeating a command is sometimes legitimate, such as polling a build or re-running a test after a change; turn it on only if you want Relo to interrupt and then block such repeats."
+        },
         "relo.runtime": {
           "type": "string",
           "enum": [

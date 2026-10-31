@@ -30,7 +30,7 @@ export const CORE_SETTING_SECTIONS = [
   "relo.primaryBackupModel", "relo.tier1BackupModel", "relo.tier2BackupModel",
   "relo.context", "relo.efficiency", "relo.permissions", "relo.report", "relo.logLevel",
   "relo.maxConcurrentAgents", "relo.maxTier1Agents", "relo.maxTier2Agents", "relo.maxHierarchyDepth", "relo.maxRetries",
-  "relo.autoVerify", "relo.autoReview",
+  "relo.autoVerify", "relo.autoReview", "relo.loopDetection",
   "relo.changes.autoApply", "relo.changes.lazyConflicts", "relo.changes.dependentSemantics", "relo.changes.ignorePaths",
   "relo.changes.unionPaths", "relo.changes.takeLatestPaths", "relo.scheduler.pathLeases",
   "relo.workspace", "relo.claudeCode", "relo.art", "relo.web", "relo.runtime", "relo.openCode",

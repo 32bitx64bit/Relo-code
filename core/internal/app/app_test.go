@@ -171,6 +171,26 @@ func TestApplySettingsIncludesRoutingAndEfficiency(t *testing.T) {
 	}
 }
 
+func TestApplySettingsLoopDetectionIsOptIn(t *testing.T) {
+	dir := t.TempDir()
+	core, err := New(Config{Workspace: dir, DBPath: filepath.Join(dir, "relo.db"), Runtime: "mock"}, logging.New(&bytes.Buffer{}, logging.Error))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	if core.Coord.SettingsSnapshot().LoopDetection {
+		t.Fatal("loop detection must default to off")
+	}
+	core.applySettings(map[string]any{"loopDetection": true})
+	if !core.Coord.SettingsSnapshot().LoopDetection {
+		t.Fatal("loopDetection true was not applied")
+	}
+	core.applySettings(map[string]any{"loopDetection": false})
+	if core.Coord.SettingsSnapshot().LoopDetection {
+		t.Fatal("loopDetection false was not applied")
+	}
+}
+
 func TestApplySettingsPathLeases(t *testing.T) {
 	dir := t.TempDir()
 	core, err := New(Config{Workspace: dir, DBPath: filepath.Join(dir, "relo.db"), Runtime: "mock"}, logging.New(&bytes.Buffer{}, logging.Error))

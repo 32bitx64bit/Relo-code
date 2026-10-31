@@ -33,6 +33,7 @@ Settings (Ctrl+,, search `relo.`):
 - `relo.primaryModel`, `relo.tier1Model`, `relo.tier2Model` (format `provider/model`). Tier 2 is the cheap one: trivial and easy tasks and probes go there, medium, complex and hard tasks to Tier 1, expert tasks to the Primary model.
 - `relo.routing.byDifficulty` (advanced mode: one model per level `trivial|easy|medium|complex|hard|expert`; `complex` falls back to the `hard` model when unset), `relo.routing.escalate`
 - Token saving: `relo.efficiency.preset` (Saving level: `off|auto|max`), `relo.efficiency.voice` (Reply brevity), `relo.efficiency.craft` (Minimal code)
+- `relo.loopDetection.enabled` (default off): stop an agent that repeats the same tool call with the same arguments. Off because repeating a command is sometimes legitimate, such as polling a build or re-running a test after a change.
 - `relo.runtime` (`opencode` or `mock`), `relo.openCode.path`
 - `relo.claudeCode.enabled`, `relo.claudeCode.path`: run agents on your installed Claude Code CLI (below)
 

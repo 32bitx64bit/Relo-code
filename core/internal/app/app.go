@@ -741,6 +741,9 @@ func (a *App) applySettings(p map[string]any) {
 	if v, ok := p["autoReview"].(bool); ok {
 		s.AutoReview = v
 	}
+	if v, ok := p["loopDetection"].(bool); ok {
+		s.LoopDetection = v
+	}
 	if v, ok := p["escalate"].(bool); ok {
 		s.Escalate, s.EscalateSet = v, true
 	}

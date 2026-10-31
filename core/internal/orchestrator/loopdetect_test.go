@@ -16,6 +16,12 @@ func loopEvent(id, name string, args map[string]any) rt.Event {
 		Raw: map[string]any{"part": map[string]any{"state": map[string]any{"status": "running", "input": args}}}}
 }
 
+func setLoopDetection(enabled bool) func(*Coord) {
+	return func(c *Coord) {
+		c.UpdateSettings(func(s *Settings) { s.LoopDetection = enabled })
+	}
+}
+
 // hasChat reports whether a chat line containing text was shown to the user.
 func hasChat(c *Coord, text string) bool {
 	for _, m := range c.sess.Messages {
@@ -98,7 +104,7 @@ func TestLoopFirstHitSteersOnceAndContinues(t *testing.T) {
 		first = append(first, paced{ev: loopEvent(fmt.Sprint(i), "read", map[string]any{"path": "a"})})
 	}
 	r := &turnsRuntime{dispatchRuntime: newDispatchRuntime(), confirm: true, turns: [][]paced{first, {{ev: finished}}}}
-	c, _, body, err := runTurns(t, r)
+	c, _, body, err := runTurns(t, r, setLoopDetection(true))
 	if err != nil || body != finished.JSON {
 		t.Fatalf("body=%q err=%v", body, err)
 	}
@@ -121,7 +127,7 @@ func TestLoopDetectionInterruptsOnceAndReturnsPartialOutput(t *testing.T) {
 		second = append(second, paced{ev: loopEvent(fmt.Sprintf("b%d", i), "read", map[string]any{"path": "a"})})
 	}
 	r := &turnsRuntime{dispatchRuntime: newDispatchRuntime(), confirm: true, turns: [][]paced{first, second}}
-	c, a, body, err := runTurns(t, r)
+	c, a, body, err := runTurns(t, r, setLoopDetection(true))
 	if err != nil || body != "partial" {
 		t.Fatalf("second loop hit must yield the partial body: body=%q err=%v", body, err)
 	}
@@ -137,6 +143,41 @@ func TestLoopDetectionInterruptsOnceAndReturnsPartialOutput(t *testing.T) {
 	defer r.mu.Unlock()
 	if len(r.tasks) != 2 || r.tasks[1].Prompt != loopNudge {
 		t.Fatalf("tasks = %#v", r.tasks)
+	}
+}
+
+// Repeating a call is legitimate sometimes, so detection is opt-in: the default and an explicit false both leave
+// the run alone, however many identical calls arrive.
+func TestLoopDetectionIsOffUnlessEnabled(t *testing.T) {
+	cases := []struct {
+		name    string
+		options []func(*Coord)
+	}{
+		{name: "default"},
+		{name: "explicitly disabled", options: []func(*Coord){setLoopDetection(false)}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setLimits(t, time.Second, 0)
+			script := []paced{}
+			for i := 0; i < 6; i++ {
+				script = append(script, paced{ev: loopEvent(fmt.Sprintf("a%d", i), "read", map[string]any{"path": "a"})})
+			}
+			script = append(script, paced{ev: finished})
+			r := &turnsRuntime{dispatchRuntime: newDispatchRuntime(), confirm: true, turns: [][]paced{script}}
+			c, _, body, err := runTurns(t, r, tc.options...)
+			if err != nil || body != finished.JSON {
+				t.Fatalf("body=%q err=%v", body, err)
+			}
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if r.cancels != 0 || len(r.tasks) != 1 {
+				t.Fatalf("cancels=%d tasks=%d, want no interrupt and one task", r.cancels, len(r.tasks))
+			}
+			if hasChat(c, "identical tool calls") || hasChat(c, "kept repeating") {
+				t.Fatalf("loop detection warned while disabled: %#v", c.sess.Messages)
+			}
+		})
 	}
 }
 

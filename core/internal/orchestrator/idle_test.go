@@ -216,10 +216,13 @@ func (r *turnsRuntime) Cancel(context.Context, rt.SessionID) error {
 	return nil
 }
 
-func runTurns(t *testing.T, r *turnsRuntime) (*Coord, agent.Agent, string, error) {
+func runTurns(t *testing.T, r *turnsRuntime, options ...func(*Coord)) (*Coord, agent.Agent, string, error) {
 	t.Helper()
 	c := New(logging.New(nil, logging.Error))
 	c.SetRuntime(r)
+	for _, option := range options {
+		option(c)
+	}
 	s := c.CreateSession(t.TempDir(), "q", ModeBuild)
 	c.Agents.Create(agent.Agent{Role: agent.Primary, Workspace: s.Workspace, Model: "mock/p"})
 	task := c.Graph.Add(taskgraph.Task{Title: "Run the suite", Role: string(agent.Worker), Workspace: s.Workspace, Model: "mock/t1", Difficulty: "hard"})
