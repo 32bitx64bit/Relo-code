@@ -578,6 +578,35 @@ test("run panel: only agents of the current run (created after last user message
   assert.deepEqual(ui.runAgents(s).map((a) => a.id), ["w6", "w5", "w4", "w3", "w2", "w1", "w0"]);
 });
 
+test("run panel: sending a message while agents run keeps every running agent; a later spawn adds to them", () => {
+  const t0 = Date.parse("2026-10-14T12:00:00Z");
+  const primary = { id: "p", role: "primary", status: "waiting", activity: "Coordinating sub-agents", startedAt: t0 };
+  const a = { id: "a", role: "worker", title: "A", status: "running", createdAt: t0 + 10_000, startedAt: t0 + 10_000 };
+  const b = { id: "b", role: "worker", title: "B", status: "running", createdAt: t0 + 20_000, startedAt: t0 + 20_000 };
+  const u1 = { id: "u1", role: "user", text: "go", createdAt: new Date(t0 + 5_000).toISOString() };
+  // Before the send: both sub-agents are on the card.
+  const before = { agents: [primary, a, b], messages: [u1] };
+  assert.deepEqual(ui.runAgents(before).map((x) => x.id), ["b", "a"]);
+  // The user sends a message while A and B still run: both must stay, not be treated as a previous run.
+  const u2 = { id: "u2", role: "user", text: "also do this", createdAt: new Date(t0 + 30_000).toISOString() };
+  const sent = { agents: [primary, a, b], messages: [u1, u2] };
+  assert.deepEqual(ui.runAgents(sent).map((x) => x.id), ["b", "a"]);
+  const html = ui.runPanelHtml(sent, NOW_MS, {});
+  assert.ok(html.includes("Sub-agents (2)"));
+  assert.ok(html.includes(">A<") && html.includes(">B<"));
+  // A later spawn shows the earlier still-running agents plus the new one.
+  const c = { id: "c", role: "worker", title: "C", status: "running", createdAt: t0 + 40_000, startedAt: t0 + 40_000 };
+  const spawned = { agents: [primary, a, b, c], messages: [u1, u2] };
+  assert.deepEqual(ui.runAgents(spawned).map((x) => x.id), ["c", "b", "a"]);
+  const html2 = ui.runPanelHtml(spawned, NOW_MS, {});
+  assert.ok(html2.includes("Sub-agents (3)"));
+  assert.ok(html2.includes(">A<") && html2.includes(">B<") && html2.includes(">C<"));
+  // Finished agents of an earlier turn still drop off, and the panel hides only once nothing runs.
+  const done = [{ ...a, status: "completed", endedAt: t0 + 50_000 }, { ...b, status: "completed", endedAt: t0 + 50_000 }];
+  assert.ok(!ui.runPanelHtml({ agents: [primary, c, ...done], messages: [u1, u2] }, NOW_MS, {}).includes(">A<"));
+  assert.equal(ui.runPanelHtml({ agents: [{ ...primary, status: "completed" }, ...done], messages: [u1, u2] }, NOW_MS, {}), "");
+});
+
 test("run panel: finished card shows total duration and tool count; running shows live elapsed", () => {
   const t0 = NOW_MS - 600_000;
   const s = { agents: [

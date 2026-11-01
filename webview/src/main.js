@@ -242,13 +242,16 @@
     return PHASE_LABELS[phase] || "Working";
   }
 
-  // Non-primary agents of the current run: created at or after the last user message, newest first.
+  // Non-primary agents for the panel, newest first. Live statuses come from the live agent list,
+  // not from the current turn: a send while sub-agents run must not drop them, and a later spawn
+  // must add to them. Finished agents belong to no running work, so only the last user message
+  // onward keeps them; older failures would otherwise pile up on every send.
   function runAgents(s) {
-    const msgs = s.messages || [];
     let since = 0;
-    msgs.forEach((m) => { if (m.role === "user") since = Math.max(since, toMs(m.createdAt)); });
+    (s.messages || []).forEach((m) => { if (m.role === "user") since = Math.max(since, toMs(m.createdAt)); });
     return (s.agents || [])
-      .filter((a) => a.role !== "primary" && (a.createdAt == null || !since || toMs(a.createdAt) >= since))
+      .filter((a) => a.role !== "primary")
+      .filter((a) => LIVE_STATUSES.includes(a.status) || a.createdAt == null || !since || toMs(a.createdAt) >= since)
       .sort((a, b) => toMs(b.createdAt) - toMs(a.createdAt));
   }
 
