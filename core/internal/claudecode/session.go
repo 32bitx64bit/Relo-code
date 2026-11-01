@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/relocode/relo/internal/runtime"
+	"github.com/relocode/relo/internal/tempdir"
 )
 
 // A session is one `claude` process in stream mode. It starts with the first task, because the process takes the
@@ -37,7 +38,8 @@ type session struct {
 	perms     map[string]json.RawMessage // open permission requests: request id -> the tool input
 	seq       int
 	tr        translator
-	files     []string
+	files     []string // one-shot files of the last task; removed when the next task starts
+	tmp       *tempdir.Root
 
 	// Events go through an unbounded queue, so a slow reader never stalls the CLI's output.
 	queue  []runtime.Event
@@ -66,6 +68,9 @@ func (p *process) write(v any) error {
 func newSession(rt *Runtime, id runtime.SessionID, cfg runtime.SessionConfig) *session {
 	s := &session{id: id, rt: rt, dir: cfg.Directory, readOnly: cfg.ReadOnly, perms: map[string]json.RawMessage{},
 		signal: make(chan struct{}, 1), out: make(chan runtime.Event, 64), stop: make(chan struct{}), pumped: make(chan struct{})}
+	if root, err := tempdir.New("session", string(id), os.Getpid()); err == nil {
+		s.tmp = root
+	}
 	go s.pump()
 	return s
 }
@@ -202,7 +207,12 @@ func (s *session) flags(task runtime.AgentTask) ([]string, string, error) {
 }
 
 func (s *session) tempFile(pattern string, content []byte) (string, error) {
-	f, err := os.CreateTemp("", "relo-claude-"+pattern)
+	// The system prompt and messaging config live in the session's own temp root, removed when the session ends.
+	dir := ""
+	if s.tmp != nil {
+		dir = s.tmp.Dir()
+	}
+	f, err := os.CreateTemp(dir, "relo-claude-"+pattern)
 	if err != nil {
 		return "", err
 	}
@@ -220,6 +230,14 @@ func (s *session) startLocked(args []string) error {
 	cmd := exec.Command(s.rt.bin, args...)
 	cmd.Dir = s.dir
 	cmd.Env = s.rt.env
+	if s.tmp != nil {
+		// Anything the agent writes through a temp helper stays in the session's root, not in the shared temp dir.
+		// The root goes with the session, so it may already be gone: recreate it before the child is told about it.
+		if err := os.MkdirAll(s.tmp.Dir(), 0o700); err != nil {
+			return err
+		}
+		cmd.Env = tempdir.AppendEnv(cmd.Env, s.tmp.Dir())
+	}
 	cmd.SysProcAttr = childAttr()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -526,6 +544,7 @@ func (s *session) close() error {
 	p := s.proc
 	files := s.files
 	s.files = nil
+	tmp := s.tmp
 	s.mu.Unlock()
 	close(s.stop)
 	<-s.pumped
@@ -539,7 +558,10 @@ func (s *session) close() error {
 		}
 	}
 	for _, f := range files {
-		_ = os.Remove(f)
+		tempdir.RemoveOne(f)
+	}
+	if tmp != nil {
+		_ = tmp.Release(os.Getpid())
 	}
 	close(s.out)
 	return nil

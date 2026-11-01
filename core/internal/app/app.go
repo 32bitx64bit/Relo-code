@@ -591,8 +591,10 @@ func (a *App) initialize(ctx context.Context, p map[string]any) (any, error) {
 	if a.Coord.Current() == nil {
 		a.Coord.CreateSession(a.Cfg.Workspace, "", orchestrator.ModeBuild)
 	}
-	go a.safely("sweep", a.sweepWorktrees) // worktrees left by earlier runs that no change refers to
-	a.Coord.ResumeArt()                    // picture jobs an earlier run left waiting for approval
+	go a.safely("sweep", a.sweepWorktrees)                              // worktrees left by earlier runs that no change refers to
+	go a.safely("temp sweep", a.sweepTemp)                              // temp roots left by earlier runs that only dead processes held
+	go a.safely("state temp sweep", func() { a.sweepStateTemp(false) }) // OpenCode's private temp dir, outside os.TempDir()
+	a.Coord.ResumeArt()                                                 // picture jobs an earlier run left waiting for approval
 	{
 		if models, err := a.models(ctx); err == nil && len(models) > 0 {
 			a.Coord.UpdateSettings(func(s *orchestrator.Settings) {
@@ -872,6 +874,10 @@ func (a *App) startRuntime(ctx context.Context) (runtime.Health, error) {
 	env, err := a.providerEnv()
 	if err != nil {
 		return fallback(err)
+	}
+	if err := opencode.EnsureTmp(a.stateRoot(), os.Getpid()); err != nil {
+		// Without its temp directory a child's go build and mktemp fail; the shared temp dir is the fallback.
+		a.Log.Warn("open code temp dir", map[string]any{"error": err.Error()})
 	}
 	env = append(env, opencode.Isolation(a.stateRoot())...)
 	proc, err := opencode.Start(ctx, bin, a.Cfg.Workspace, env)
@@ -1212,6 +1218,9 @@ func (a *App) Close() {
 				a.Log.Warn("close runtime failed", map[string]any{"error": err.Error()})
 			}
 		}
+		// Temp roots of this run are gone with its sessions; any left behind belong to processes that are dead.
+		a.sweepTemp()
+		a.sweepStateTemp(true)
 		if err := a.Store.Close(); err != nil {
 			a.Log.Error("close store failed", map[string]any{"error": err.Error()})
 		}

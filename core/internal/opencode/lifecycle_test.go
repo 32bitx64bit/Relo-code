@@ -6,11 +6,16 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/relocode/relo/internal/runtime"
+	"github.com/relocode/relo/internal/tempdir"
 )
 
 // lifecycleServer answers interrupt and delete with the given status codes.
@@ -188,7 +193,7 @@ func TestIsolationEnvAndChildEnv(t *testing.T) {
 	}
 	iso := Isolation("/relo")
 	joined := strings.Join(iso, "\n")
-	for _, want := range []string{"XDG_CONFIG_HOME=/relo/config", "XDG_DATA_HOME=/relo/data", "XDG_CACHE_HOME=/relo/cache", "XDG_STATE_HOME=/relo/state", "OPENCODE_DISABLE_PROJECT_CONFIG=1"} {
+	for _, want := range []string{"XDG_CONFIG_HOME=/relo/config", "XDG_DATA_HOME=/relo/data", "XDG_CACHE_HOME=/relo/cache", "XDG_STATE_HOME=/relo/state", "OPENCODE_DISABLE_PROJECT_CONFIG=1", "TMPDIR=/relo/tmp"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("missing %s in %v", want, iso)
 		}
@@ -223,5 +228,88 @@ func TestIsolationEnvAndChildEnv(t *testing.T) {
 	plain := childEnv(inherited, []string{"OPENCODE_CONFIG_CONTENT=x"})
 	if !strings.Contains(strings.Join(plain, "\n"), "OPENCODE_CONFIG=/home/u/mine.json") {
 		t.Fatal("without isolation the inherited OPENCODE_CONFIG must pass through")
+	}
+}
+
+// TestEnsureTmpAndStaleTmpDirs checks Isolation names a temp dir a child can use: EnsureTmp creates it and marks it
+// live, a live-marked directory survives the sweep whatever its age, and only old unmarked entries are removed.
+func TestEnsureTmpAndStaleTmpDirs(t *testing.T) {
+	root := t.TempDir()
+	if err := EnsureTmp(root, os.Getpid()); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(TmpDir(root)); err != nil || !st.IsDir() {
+		t.Fatalf("tmp dir not created: %v", err)
+	}
+	if !tempdir.Live(TmpDir(root)) {
+		t.Fatal("EnsureTmp did not mark the directory live")
+	}
+	old := time.Now().Add(-2 * tmpStaleAge)
+	goBuild := filepath.Join(TmpDir(root), "go-build123")
+	if err := os.MkdirAll(goBuild, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(goBuild, old, old); err != nil {
+		t.Fatal(err)
+	}
+	fresh := filepath.Join(TmpDir(root), "keep.txt")
+	if err := os.WriteFile(fresh, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A core still running marks the directory: nothing in it goes, whatever its age.
+	if names, err := StaleTmpDirs(root); err != nil || len(names) != 0 {
+		t.Fatalf("live-marked dir listed %v (%v), want nothing", names, err)
+	}
+	// Once that core is gone (marker removed), only the old entry is stale.
+	if err := UnmarkTmp(root, os.Getpid()); err != nil {
+		t.Fatal(err)
+	}
+	names, err := StaleTmpDirs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != "go-build123" {
+		t.Fatalf("stale entries = %v, want go-build123 only", names)
+	}
+	// A relative path that would climb out of the root is refused along with the old entry removed.
+	if n := RemoveTmpEntries(root, []string{"go-build123", "../escape"}); n != 1 {
+		t.Fatalf("removed %d entries, want 1", n)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("fresh entry removed: %v", err)
+	}
+	if EnsureTmp("", os.Getpid()) != nil || len(Isolation("")) != 0 {
+		t.Fatal("an empty root must mean no isolation and no temp dir")
+	}
+}
+
+// TestALiveMarkedEntrySurvivesTheSweep is the two-cores case: one core's temp files stay while its marker names a
+// running process, even when they are older than the stale age.
+func TestALiveMarkedEntrySurvivesTheSweep(t *testing.T) {
+	root := t.TempDir()
+	dir := TmpDir(root)
+	if err := os.MkdirAll(filepath.Join(dir, "go-build999"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The other core's marker: the test binary itself stands in for it, because it is a running process.
+	other := os.Getppid()
+	if err := tempdir.Mark(dir, other); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * tmpStaleAge)
+	if err := os.Chtimes(filepath.Join(dir, "go-build999"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if names, err := StaleTmpDirs(root); err != nil || len(names) != 0 {
+		t.Fatalf("stale entries %v (%v), want nothing while a live core marks the dir", names, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "go-build999")); err != nil {
+		t.Fatalf("live core's temp data removed: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, strconv.Itoa(other)+".live")); err != nil {
+		t.Fatal(err)
+	}
+	if names, _ := StaleTmpDirs(root); len(names) != 1 {
+		t.Fatalf("after the other core is gone, stale entries = %v, want the old one", names)
 	}
 }

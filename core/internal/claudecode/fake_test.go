@@ -28,6 +28,7 @@ type fakeLog struct {
 	MCPMode    string   `json:"mcpMode,omitempty"`
 	Input      string   `json:"input,omitempty"`
 	Permission string   `json:"permission,omitempty"`
+	Tmpdir     string   `json:"tmpdir,omitempty"`
 	Bridge     string   `json:"bridge,omitempty"`
 }
 
@@ -55,7 +56,7 @@ func fakeClaude(mode string) int {
 		return 0
 	}
 	dir, _ := os.Getwd()
-	entry := fakeLog{Args: args, Dir: dir}
+	entry := fakeLog{Args: args, Dir: dir, Tmpdir: os.Getenv("TMPDIR")}
 	for i, a := range args {
 		if i+1 >= len(args) {
 			break

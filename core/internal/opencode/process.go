@@ -5,16 +5,24 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/relocode/relo/internal/runtime"
+	"github.com/relocode/relo/internal/tempdir"
 )
+
+// tmpStaleAge is how long an unmarked entry of OpenCode's private temp dir must sit untouched before a sweep takes
+// it: a child writing there keeps its files fresh.
+const tmpStaleAge = time.Hour
 
 type Process struct {
 	Path   string
@@ -71,7 +79,105 @@ func Isolation(root string) []string {
 		"XDG_STATE_HOME=" + filepath.Join(root, "state"),
 		"OPENCODE_DISABLE_PROJECT_CONFIG=1",
 		"OPENCODE_DISABLE_AUTOUPDATE=1",
+		// Temp files OpenCode and the agents it runs write stay in Relo's private root, not the shared temp dir.
+		"TMPDIR=" + TmpDir(root),
+		"TMP=" + TmpDir(root),
+		"GOTMPDIR=" + TmpDir(root),
 	}
+}
+
+// TmpDir is the temp directory inside OpenCode's private root. Go refuses to build with a GOTMPDIR that does not
+// exist, and mktemp refuses a missing TMPDIR, so the caller creates it: Isolation only names it.
+func TmpDir(root string) string {
+	if root == "" {
+		return ""
+	}
+	return filepath.Join(root, "tmp")
+}
+
+// EnsureTmp creates the temp directory inside OpenCode's private root, before a child is started with it, and
+// marks it live for pid. Two cores can share a state root, so the marker is how the other one tells this core's temp
+// files from a dead core's leftover.
+func EnsureTmp(root string, pid int) error {
+	if root == "" {
+		return nil
+	}
+	return tempdir.Mark(TmpDir(root), pid)
+}
+
+// UnmarkTmp drops pid's live marker from OpenCode's private temp directory once this core has no child left.
+func UnmarkTmp(root string, pid int) error {
+	if root == "" {
+		return nil
+	}
+	return tempdir.Unmark(TmpDir(root), pid)
+}
+
+// StaleTmpDirs lists the entries of OpenCode's private temp directory that a sweep may remove: the live markers are
+// never listed, and an entry that another core still marks, or whose content is young, is kept.
+func StaleTmpDirs(root string) ([]string, error) {
+	if root == "" {
+		return nil, nil
+	}
+	dir := TmpDir(root)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if tempdir.Live(dir) {
+		// Another core (or this one) still has a child writing here.
+		return nil, nil
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if isMarker(e.Name()) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(time.Now().Add(-tmpStaleAge)) {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	return names, nil
+}
+
+// RemoveTmpEntries removes the named entries of OpenCode's private temp directory. Only a bare name is accepted, so
+// a caller can never reach outside that directory.
+func RemoveTmpEntries(root string, names []string) int {
+	if root == "" {
+		return 0
+	}
+	dir := TmpDir(root)
+	removed := 0
+	for _, name := range names {
+		if !filepath.IsLocal(name) || isMarker(name) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, name)); err == nil {
+			removed++
+		}
+	}
+	return removed
+}
+
+// isMarker reports whether name is a tempdir pid marker (<pid>.live or <pid>.owner), which the sweep keeps.
+func isMarker(name string) bool {
+	raw, ok := strings.CutSuffix(name, ".live")
+	if !ok {
+		raw, ok = strings.CutSuffix(name, ".owner")
+	}
+	if !ok {
+		return false
+	}
+	pid, err := strconv.Atoi(raw)
+	return err == nil && pid > 0
 }
 
 // childEnv is the inherited environment minus anything extraEnv overrides, plus extraEnv.

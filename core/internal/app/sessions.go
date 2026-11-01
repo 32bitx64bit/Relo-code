@@ -16,7 +16,9 @@ import (
 
 	"github.com/relocode/relo/internal/integration"
 	"github.com/relocode/relo/internal/ipc"
+	"github.com/relocode/relo/internal/opencode"
 	"github.com/relocode/relo/internal/orchestrator"
+	"github.com/relocode/relo/internal/tempdir"
 	"github.com/relocode/relo/internal/workspace"
 )
 
@@ -190,6 +192,52 @@ func (a *App) sweepWorktrees() {
 	}
 	if n := ws.Sweep(keep); n > 0 {
 		a.Log.Info("removed stale agent worktrees", map[string]any{"count": n})
+	}
+}
+
+// tempDirUnused reports whether no core is using OpenCode's private temp directory.
+func tempDirUnused(root string) bool { return !tempdir.Live(opencode.TmpDir(root)) }
+
+// sweepTemp removes Relo temp roots whose owning processes are gone; a live session or agent keeps its own. It runs
+// at startup and on Close beside sweepWorktrees, and it only touches entries Relo named.
+func (a *App) sweepTemp() {
+	a.cleanupMu.Lock()
+	defer a.cleanupMu.Unlock()
+	r := tempdir.Sweep(os.Getpid())
+	if len(r.Removed) > 0 {
+		a.Log.Info("removed stale temp data", map[string]any{"count": len(r.Removed)})
+	}
+	for _, err := range r.Errors {
+		a.Log.Warn("temp sweep", map[string]any{"error": err.Error()})
+	}
+}
+
+// sweepStateTemp empties OpenCode's private temp directory when no core is using it. Two cores can share a state
+// root: a core that is running marks the directory live, so only an unmarked directory, whose entries are also older
+// than an hour, is swept. It lives outside os.TempDir(), so the temp sweep never sees it.
+//
+// At startup this core's own marker is not there yet, or is planted concurrently by startRuntime: the sweep must
+// never clear it, or another core could collect this core's temp files. onClose drops this core's marker first
+// (its runtime has stopped by then) and sweeps after, which still keeps everything while another core is live.
+func (a *App) sweepStateTemp(onClose bool) {
+	root := a.stateRoot()
+	if root == "" {
+		return
+	}
+	pid := os.Getpid()
+	if onClose {
+		if err := opencode.UnmarkTmp(root, pid); err != nil {
+			a.Log.Warn("unmark open code temp dir", map[string]any{"error": err.Error()})
+		}
+	}
+	if !tempDirUnused(root) {
+		return // this core or another one is still writing there
+	}
+	names, err := opencode.StaleTmpDirs(root)
+	if err == nil && len(names) > 0 {
+		if n := opencode.RemoveTmpEntries(root, names); n > 0 {
+			a.Log.Info("removed stale temp data", map[string]any{"count": n, "dir": opencode.TmpDir(root)})
+		}
 	}
 }
 
