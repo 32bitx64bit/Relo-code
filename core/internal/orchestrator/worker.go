@@ -1802,6 +1802,7 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 			promptText += "\n\n" + prompt.CanvasGuidanceForMode(a.Role, sess.Mode == ModeBuild) + canvasScopeText(a.Role, canvasActions) + " Your Canvas key is the same private key: pass it as key to relo_canvas. Never copy it into artifacts or reports."
 		}
 	}
+	promptText += "\n\nPut scratch files, test dirs and DB copies under $TMPDIR (mktemp -d), never hard-coded /tmp paths; Relo deletes $TMPDIR when the agent ends."
 	promptText = strings.TrimPrefix(promptText, "\n\n")
 	if promptText != "" && (dynamic != "" || ask != "") {
 		promptText += "\n\n"

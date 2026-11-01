@@ -55,6 +55,20 @@ func TestWorkerStartsFromItsTaskNotAPointerToIt(t *testing.T) {
 	}
 }
 
+// Every role keeps its scratch work under the temp dir Relo owns and cleans up, never a hard-coded /tmp path.
+func TestEveryRoleKeepsScratchFilesUnderTMPDIR(t *testing.T) {
+	roles := []agent.Role{agent.Primary, agent.Head, agent.Worker, agent.Probe, agent.Reviewer, agent.Architect, agent.Debug, agent.Test, agent.Integration}
+	for _, role := range roles {
+		promptText, _ := canvasExposure(t, role)
+		if !strings.Contains(promptText, "$TMPDIR") {
+			t.Fatalf("%s prompt does not name $TMPDIR:\n%s", role, promptText)
+		}
+		if !strings.Contains(promptText, "never hard-coded /tmp") {
+			t.Fatalf("%s prompt does not ban hard-coded /tmp:\n%s", role, promptText)
+		}
+	}
+}
+
 // What the Primary read out of the request reaches every sub agent that changes or judges something.
 func TestWorkerSeedCarriesConstraintsButProbesDoNotGetThem(t *testing.T) {
 	c, _, s := briefFixture(t)
