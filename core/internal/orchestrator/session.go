@@ -1399,7 +1399,16 @@ func (c *Coord) drive(ctx context.Context) error {
 		}
 		c.refreshSnapshot()
 		c.primaryWaits()
-		if c.dispatch(ctx, sched) == 0 {
+		// One batch: the workers of this round all start here, and the project's full checks run once when they are
+		// done. Running them after each worker cost 600 s a worker, 63 times, in a single session.
+		c.batching.Store(1)
+		started := c.dispatch(ctx, sched)
+		c.batching.Store(0)
+		c.finishBatch(ctx, c.verifier())
+		if ctx.Err() != nil {
+			return nil
+		}
+		if started == 0 {
 			if sched.Paused() {
 				continue
 			}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/relocode/relo/internal/agentmsg"
@@ -229,15 +230,20 @@ type PendingPerm struct {
 }
 
 type Coord struct {
-	Log      *logging.Logger
-	Engine   *ctxeng.Engine
-	Memory   *memory.Store
-	Graph    *taskgraph.Graph
-	Agents   *agent.Registry
-	Sched    *scheduler.Scheduler
-	Route    routing.Config
-	WS       *workspace.Manager
-	Verify   verification.Runner
+	Log    *logging.Logger
+	Engine *ctxeng.Engine
+	Memory *memory.Store
+	Graph  *taskgraph.Graph
+	Agents *agent.Registry
+	Sched  *scheduler.Scheduler
+	Route  routing.Config
+	WS     *workspace.Manager
+	Verify verification.Runner
+	// changeSeenForTest, when set, stands in for git saying an agent changed files: a scripted test worker writes
+	// nothing, so tests that need a change set it. Production leaves it nil and changesFor reads the worktree.
+	// The blank line below keeps gofmt from merging this block into the plain fields above.
+	changeSeenForTest func(agent.Agent) bool
+
 	Perm     *permission.Policy
 	Runtime  runtime.AgentRuntime
 	Cache    *metrics.CacheStats
@@ -291,6 +297,14 @@ type Coord struct {
 	directNotified  string                      // session ID that already received the direct-mode notice; guarded by mu
 	snapshotNoticed map[string]bool             // session ID -> the snapshot notice was already shown; guarded by mu
 	baseline        *verification.BaselineCache // per-session baseline outcomes; guarded by mu, reset on session change
+	// batching is 1 while a dispatcher batch runs: the project's checks then wait and run once at the batch's end.
+	batching atomic.Int32
+	// batchPassed is 1 when a batch's checks all passed, so the base is already known clear.
+	batchPassed atomic.Int32
+	// batchReports holds finished workers whose checks wait for the end of the batch; guarded by mu.
+	batchReports map[string]batchPending
+	// batchRepairs counts the repair turns the end-of-batch checks have sent back.
+	batchRepairs atomic.Int32
 }
 
 func New(log *logging.Logger) *Coord {

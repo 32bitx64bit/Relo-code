@@ -146,3 +146,61 @@ func TestSlowCheckIsReportedAsStoppedForTime(t *testing.T) {
 		t.Fatalf("result = %+v", res)
 	}
 }
+
+// Scoped narrows each stack's check to the packages or files the change touched. A command with no narrower form, and
+// a change outside the stack, keep the command the project defines.
+func TestScopedNarrowsToTheChangedPackagesAndFiles(t *testing.T) {
+	steps := Scoped(t.TempDir(), []Step{{Command: "go test ./..."}, {Command: "pytest -q"}, {Command: "make test"}},
+		[]string{"core/internal/prompt/prompt.go", "core/internal/style/style.go", "tests/test_api.py", "README.md"})
+	if len(steps) != 3 {
+		t.Fatalf("steps = %+v", steps)
+	}
+	if got := steps[0].Command; got != "go test ./core/internal/prompt ./core/internal/style" {
+		t.Errorf("go step = %q; it must name the touched packages, not ./...", got)
+	}
+	if got := steps[1].Command; got != "pytest -q tests/test_api.py" {
+		t.Errorf("pytest step = %q; it must name the touched file", got)
+	}
+	if got := steps[2].Command; got != "make test" {
+		t.Errorf("make step = %q; a Makefile target has no narrower form", got)
+	}
+	for _, steps := range [][]Step{
+		Scoped(t.TempDir(), []Step{{Command: "go test ./..."}}, nil),
+		Scoped(t.TempDir(), []Step{{Command: "go test ./..."}}, []string{"README.md"}),
+		Scoped(t.TempDir(), []Step{{Command: "go test ./..."}}, []string{"../elsewhere/x.go"}),
+	} {
+		if len(steps) != 1 || steps[0].Command != "go test ./..." {
+			t.Fatalf("unscopable change narrowed the check: %+v", steps)
+		}
+	}
+}
+
+// A step Plan skipped for a missing tool must stay skipped after narrowing: the scoped command never becomes runnable.
+func TestScopedKeepsSkippedStepsSkipped(t *testing.T) {
+	steps := Scoped(t.TempDir(), []Step{
+		{Command: "go test ./...", Skip: "go is not installed"},
+		{Command: "pytest -q", Skip: "pytest is not installed"},
+		{Command: "make test", Skip: "make is not installed"},
+	}, []string{"core/internal/prompt/prompt.go", "tests/test_api.py"})
+	if len(steps) != 3 {
+		t.Fatalf("steps = %+v", steps)
+	}
+	if steps[0].Command != "go test ./core/internal/prompt" || steps[0].Skip != "go is not installed" {
+		t.Errorf("skipped go step = %+v; it must narrow but keep its skip", steps[0])
+	}
+	if steps[1].Command != "pytest -q tests/test_api.py" || steps[1].Skip != "pytest is not installed" {
+		t.Errorf("skipped pytest step = %+v; it must narrow but keep its skip", steps[1])
+	}
+	if steps[2].Command != "make test" || steps[2].Skip != "make is not installed" {
+		t.Errorf("skipped make step = %+v; it has no narrower form and must keep its skip", steps[2])
+	}
+}
+
+// A narrowed step whose tool is no longer on PATH must be skipped, not run as if the tool existed.
+func TestScopedSkipsNarrowedStepWhenToolIsMissing(t *testing.T) {
+	t.Setenv("PATH", "")
+	steps := Scoped(t.TempDir(), []Step{{Command: "go test ./..."}}, []string{"core/internal/prompt/prompt.go"})
+	if len(steps) != 1 || steps[0].Command != "go test ./core/internal/prompt" || steps[0].Skip == "" {
+		t.Fatalf("narrowed step without its tool = %+v; it must stay skipped", steps)
+	}
+}

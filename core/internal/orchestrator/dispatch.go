@@ -97,6 +97,8 @@ func (c *Coord) dispatch(ctx context.Context, sched *scheduler.Scheduler) int {
 		}
 	}
 	d.wg.Wait()
+	// The round's checks ran once, for the batch: the next round's workers must not re-check the same tree.
+	c.skipBatchVerify(ctx)
 	if median := sched.LeaseWaitMedian(); median > 0 && c.Log != nil {
 		fields := map[string]any{"medianStartDelayMs": median.Milliseconds()}
 		// The design keeps path leases off when the delay they add exceeds the median agent run time measured in
@@ -125,6 +127,27 @@ func (d *dispatcher) working(taskID string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.running[taskID]
+}
+
+// skipBatchVerify marks a batch whose checks all passed, so the next one knows its base is already clear. It changes
+// what the end-of-batch step re-runs (the base failure is known), never whether a batch's own changes are checked:
+// finishBatch still runs the checks once for every batch that held a change.
+func (c *Coord) skipBatchVerify(ctx context.Context) {
+	c.mu.Lock()
+	sess := c.sess
+	c.mu.Unlock()
+	if sess == nil || sess.Mode != ModeBuild || ctx.Err() != nil {
+		return
+	}
+	passed := 0
+	for _, v := range sess.Verify {
+		if v.Status == "passed" {
+			passed++
+		}
+	}
+	if passed > 0 && passed == len(sess.Verify) {
+		c.batchPassed.Store(1)
+	}
 }
 
 // wakePeers starts bounded reply-only turns for finished workers with unanswered messages.

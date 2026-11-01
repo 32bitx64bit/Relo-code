@@ -442,9 +442,145 @@ func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent)
 			c.failTask(t, a, err)
 			return err
 		}
+	} else if c.batchVerifyPending() && c.verifyAtBatchEnd(a, rep) {
+		// The full checks run once when the batch ends, so this report is kept until then instead of accepting it
+		// with an unchecked "completed". acceptReport does the rest of the bookkeeping when the checks are in.
+		c.rememberForBatch(a, parts, rep)
+		return nil
 	}
 	c.acceptReport(t, a, rep, outcome)
 	return nil
+}
+
+// verifyAtBatchEnd reports whether this report waits for the batch's single run of the project's checks.
+func (c *Coord) verifyAtBatchEnd(a agent.Agent, rep RawReport) bool {
+	sess := c.Current()
+	if sess == nil || sess.Mode != ModeBuild || !c.settings().AutoVerify {
+		return false
+	}
+	if strings.EqualFold(rep.Status, "failed") || strings.EqualFold(rep.Status, "blocked") {
+		return false
+	}
+	if a.Role != agent.Worker && a.Role != agent.Debug {
+		return false
+	}
+	// Every batch with a held change runs the checks once at its end, whether or not an earlier batch passed its
+	// base: that run is what covers these changes.
+	return len(c.changesFor(a, rep)) > 0
+}
+
+// batchPending is one worker whose report waits for the end-of-batch checks.
+type batchPending struct {
+	agent agent.Agent
+	parts prompt.Parts
+	rep   RawReport
+}
+
+// rememberForBatch keeps a finished worker's report for the end of the batch, after the worker's own status says its
+// files are still waiting on the project's checks.
+func (c *Coord) rememberForBatch(a agent.Agent, parts prompt.Parts, rep RawReport) {
+	c.mu.Lock()
+	if c.batchReports == nil {
+		c.batchReports = map[string]batchPending{}
+	}
+	c.batchReports[a.ID] = batchPending{agent: a, parts: parts, rep: rep}
+	c.mu.Unlock()
+	c.Agents.Update(a.ID, func(x *agent.Agent) {
+		x.Status, x.Phase, x.Activity = agent.Running, "verifying", "Waiting for the batch's checks"
+	})
+}
+
+// finishBatch runs the project's checks once for the batch, then accepts every report the batch held back with that
+// outcome, so a failing check still reaches the Primary and its task still fails. One run covers the batch because the
+// workers share a base: a check that fails for the whole project fails in the untouched base too and blames nobody,
+// and a repair goes back to the worker whose changes the failure names.
+func (c *Coord) finishBatch(ctx context.Context, runner verification.Runner) {
+	c.mu.Lock()
+	held := make([]batchPending, 0, len(c.batchReports))
+	for _, p := range c.batchReports {
+		held = append(held, p)
+	}
+	c.batchReports = nil
+	c.mu.Unlock()
+	if len(held) == 0 {
+		return
+	}
+	sort.SliceStable(held, func(i, j int) bool { return held[i].agent.Created.Before(held[j].agent.Created) })
+	c.batchRepairs.Store(0)
+	var failure string
+	var passed bool
+	for {
+		c.Agents.Update(held[0].agent.ID, func(x *agent.Agent) {
+			x.Status, x.Phase, x.Activity = agent.Running, "verifying", "Running the batch's checks"
+		})
+		// Every held worker meets the same failure, so one run decides them all; the first one to place it is asked.
+		passed, failure = c.runVerifyWith(ctx, held[0].agent, runner, batchPaths(held))
+		if passed || ctx.Err() != nil {
+			break
+		}
+		target := culprit(held, held[0].agent, failure)
+		if target == nil {
+			break
+		}
+		c.batchRepairs.Add(1)
+		c.Agents.Update(target.agent.ID, func(x *agent.Agent) {
+			x.Status, x.Phase, x.Activity = agent.Running, "model", fmt.Sprintf("Fixing failed checks (attempt %d)", c.batchRepairs.Load())
+		})
+		body, err := c.runAgent(ctx, target.agent, target.parts, "The project's checks failed on your change:\n\n"+failure+"\n\nFix the cause in your worktree, then return the worker report JSON again.", prompt.ReportSchema)
+		if err != nil {
+			break
+		}
+		if next, perr := ParseJSON[RawReport](body); perr == nil && strings.TrimSpace(next.Summary) != "" {
+			target.rep = mergeReport(target.rep, next)
+		}
+	}
+	outcome := verifyOutcome{ran: true, passed: passed, failure: failure, repairs: int(c.batchRepairs.Load())}
+	for _, p := range held {
+		if t, ok := c.Graph.Get(p.agent.TaskID); ok {
+			c.acceptReport(t, p.agent, p.rep, outcome)
+		} else {
+			c.Agents.Update(p.agent.ID, func(x *agent.Agent) { x.Status, x.Activity = agent.Completed, "Done" })
+		}
+	}
+}
+
+// culprit picks the held worker a failure belongs to: the one whose changed files the output names, then the worker
+// that ran, which is the only one a plain failure can be asked about. A failure no held worker can place is not
+// repaired, so the batch ends with it still failing instead of asking someone to fix another's code.
+func culprit(held []batchPending, watcher agent.Agent, failure string) *batchPending {
+	best, bestHits := -1, 0
+	for i := range held {
+		hits := 0
+		for _, f := range held[i].rep.Files {
+			if f = strings.TrimSpace(f); f != "" && strings.Contains(failure, f) {
+				hits++
+			}
+		}
+		if hits > bestHits {
+			best, bestHits = i, hits
+		}
+	}
+	if best >= 0 {
+		return &held[best]
+	}
+	for i := range held {
+		if held[i].agent.ID == watcher.ID {
+			return &held[i]
+		}
+	}
+	return nil
+}
+
+// mergeReport keeps the earlier report's facts and takes what a repair turn said changed.
+func mergeReport(rep RawReport, next RawReport) RawReport {
+	rep.Summary = next.Summary
+	if len(next.Files) > 0 {
+		rep.Files = next.Files
+	}
+	if next.Status != "" {
+		rep.Status = next.Status
+	}
+	return rep
 }
 
 // materializeDirectory makes the files of an agent that lives in a virtual workspace exist on disk for its tools.
@@ -641,10 +777,17 @@ type verifyOutcome struct {
 
 func (c *Coord) shouldVerify(a agent.Agent, rep RawReport) bool {
 	sess := c.Current()
-	if sess == nil || sess.Mode != ModeBuild || !c.settings().AutoVerify || strings.EqualFold(rep.Status, "failed") || strings.EqualFold(rep.Status, "blocked") {
+	if sess == nil || sess.Mode != ModeBuild || !c.settings().AutoVerify || c.batchVerifyPending() || strings.EqualFold(rep.Status, "failed") || strings.EqualFold(rep.Status, "blocked") {
 		return false
 	}
 	return a.Role == agent.Worker || a.Role == agent.Debug
+}
+
+// batchVerifyPending is true while a batch of workers is still running. The project's checks then wait for the end of
+// the batch and run once there, instead of after every worker that changed a file. Every batch with held changes runs
+// them: a later batch has changes of its own, so an earlier batch passing the base does not cover them.
+func (c *Coord) batchVerifyPending() bool {
+	return c.batching.Load() == 1
 }
 
 // verifyAndRepair runs the checks and, when they fail because of the agent's change, sends the agent back with the
@@ -655,9 +798,16 @@ func (c *Coord) verifyAndRepair(ctx context.Context, a agent.Agent, parts prompt
 	if len(c.changesFor(a, rep)) == 0 {
 		return rep, out, nil // nothing was changed, so there is nothing to check
 	}
+	return c.verifyAndRepairChecks(ctx, a, parts, rep, c.verifier(), c.changedPaths(a))
+}
+
+// verifyAndRepairChecks is verifyAndRepair after the caller has established the agent changed something. The end of a
+// batch uses it on agents whose reports are already in, so the checks are not skipped for a report that names no file.
+func (c *Coord) verifyAndRepairChecks(ctx context.Context, a agent.Agent, parts prompt.Parts, rep RawReport, runner verification.Runner, paths []string) (RawReport, verifyOutcome, error) {
+	var out verifyOutcome
 	for {
 		c.Agents.Update(a.ID, func(x *agent.Agent) { x.Status, x.Phase, x.Activity = agent.Running, "verifying", "Running checks" })
-		passed, failure := c.runVerify(ctx, a)
+		passed, failure := c.runVerifyWith(ctx, a, runner, paths)
 		if ctx.Err() != nil {
 			return rep, out, ctx.Err()
 		}
@@ -683,6 +833,19 @@ func (c *Coord) verifyAndRepair(ctx context.Context, a agent.Agent, parts prompt
 			}
 		}
 	}
+}
+
+// batchPaths is every file the batch changed, so the checks it runs once cover them all.
+func batchPaths(held []batchPending) []string {
+	var paths []string
+	for _, p := range held {
+		for _, f := range p.rep.Files {
+			if f = strings.TrimSpace(f); f != "" {
+				paths = append(paths, f)
+			}
+		}
+	}
+	return paths
 }
 
 // designReportMaxChars is the summary room an architect's report gets. Its design is the spec the dependent workers
@@ -1177,6 +1340,16 @@ func (c *Coord) changesFor(a agent.Agent, rep RawReport) []Change {
 	if !agent.Mutating(a.Role) || c.CurrentMode() != ModeBuild {
 		return nil
 	}
+	c.configMu.RLock()
+	seen := c.changeSeenForTest
+	c.configMu.RUnlock()
+	if seen != nil && seen(a) {
+		path := "file.go"
+		if len(rep.Files) > 0 {
+			path = rep.Files[0]
+		}
+		return []Change{{ID: id.New("chg"), AgentID: a.ID, Path: path, Kind: "modified", Status: "proposed"}}
+	}
 	ws := c.workspace()
 	if ws == nil {
 		return nil
@@ -1342,9 +1515,36 @@ func shortHash(hash string) string {
 
 // runVerify runs the project's checks in the agent's workspace. It reports whether the change is clear of blame: a
 // check that cannot run here, or that fails identically on the untouched base, does not count against the agent.
+// Each command is the fast scoped form for the agent's own changed files where the project has one, so the checks
+// stay close to what the worker already ran.
 func (c *Coord) runVerify(ctx context.Context, a agent.Agent) (bool, string) {
-	runner := c.verifier()
+	return c.runVerifyWith(ctx, a, c.verifier(), c.changedPaths(a))
+}
+
+// changedPaths lists the files an agent changed, read from git, so its checks can name them.
+func (c *Coord) changedPaths(a agent.Agent) []string {
+	ws := c.workspace()
+	if ws == nil {
+		return nil
+	}
+	files, err := ws.ChangedFiles(a.ID)
+	if err != nil {
+		return nil
+	}
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		paths = append(paths, f.Path)
+	}
+	return paths
+}
+
+// runVerifyWith is runVerify with the runner and the changed paths given: the end of a batch passes the union of the
+// batch's files when the full checks run once for it.
+func (c *Coord) runVerifyWith(ctx context.Context, a agent.Agent, runner verification.Runner, paths []string) (bool, string) {
 	steps := verification.Plan(a.Workspace)
+	if len(paths) > 0 {
+		steps = verification.Scoped(a.Workspace, steps, paths)
+	}
 	if len(steps) == 0 {
 		return true, ""
 	}

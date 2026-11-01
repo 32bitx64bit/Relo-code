@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -124,7 +125,19 @@ func IsEnvFailure(code int, output string) bool {
 	return code == 126 || code == 127 || envFailure.MatchString(output)
 }
 
+// RunObserver, when set, sees the result of every check before it is returned. Other packages use it to count runs
+// without replacing the runner; production leaves it nil.
+var RunObserver func(Result)
+
 func (r Runner) Run(ctx context.Context, command, dir string) Result {
+	res := r.run(ctx, command, dir)
+	if RunObserver != nil {
+		RunObserver(res)
+	}
+	return res
+}
+
+func (r Runner) run(ctx context.Context, command, dir string) Result {
 	res := Result{ID: id.New("ver"), Command: command, Dir: dir, Status: "running"}
 	if dir == "" {
 		dir = r.Root
@@ -302,6 +315,86 @@ func unique(in []string) []string {
 		}
 		seen[x] = true
 		out = append(out, x)
+	}
+	return out
+}
+
+// Scoped turns the project's checks into the fast subset for the given changed paths, when the project's stacks have
+// one: the Go packages the files belong to instead of `./...`, pytest selectors instead of the whole tree. A step with
+// no narrower form, such as `make test`, is left whole because it is the project's own full check, and an empty path
+// list scopes nothing. A step Plan already skipped stays skipped: narrowing never makes a missing tool runnable.
+func Scoped(root string, steps []Step, paths []string) []Step {
+	dirs, files := scopePaths(paths)
+	out := make([]Step, 0, len(steps))
+	for _, step := range steps {
+		scoped := ""
+		switch step.Command {
+		case "go test ./...":
+			if len(dirs) > 0 {
+				scoped = "go test " + strings.Join(quoteAll(dirs), " ")
+			}
+		case "pytest -q":
+			if len(files) > 0 {
+				scoped = "pytest -q " + strings.Join(quoteAll(files), " ")
+			}
+		}
+		if scoped == "" {
+			out = append(out, step)
+			continue
+		}
+		st := Step{Command: scoped, Skip: step.Skip}
+		if st.Skip == "" {
+			if tool := toolFor[step.Command]; tool != "" {
+				if _, err := exec.LookPath(tool); err != nil {
+					st.Skip = tool + " is not installed"
+				}
+			}
+		}
+		out = append(out, st)
+	}
+	return out
+}
+
+// scopePaths splits changed paths into the directories the language tools take and the whole files pytest takes. A
+// path outside the root, or one that is not a source file of its stack, scopes nothing.
+func scopePaths(paths []string) (dirs, files []string) {
+	seenDir, seenFile := map[string]bool{}, map[string]bool{}
+	for _, p := range paths {
+		p = filepath.ToSlash(strings.TrimSpace(p))
+		if p == "" || strings.HasPrefix(p, "../") || strings.HasPrefix(p, "/") {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(p, ".go"):
+			dir := filepath.ToSlash(filepath.Dir(p))
+			if dir == "." {
+				dir = "."
+			} else if !strings.HasPrefix(dir, "./") {
+				dir = "./" + dir
+			}
+			if !seenDir[dir] {
+				seenDir[dir] = true
+				dirs = append(dirs, dir)
+			}
+		case strings.HasSuffix(p, ".py"):
+			if !seenFile[p] {
+				seenFile[p] = true
+				files = append(files, p)
+			}
+		}
+	}
+	sort.Strings(dirs)
+	sort.Strings(files)
+	return dirs, files
+}
+
+func quoteAll(items []string) []string {
+	out := make([]string, len(items))
+	for i, item := range items {
+		if strings.ContainsAny(item, " \t") {
+			item = "'" + strings.ReplaceAll(item, "'", `'\''`) + "'"
+		}
+		out[i] = item
 	}
 	return out
 }

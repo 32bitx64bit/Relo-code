@@ -194,7 +194,7 @@ Responsibilities:
 1. Clarify intent as a precise objective; build the smallest dependency-aware task graph that can succeed.
 2. Decide trivial work without spawning. Use probes to locate files, symbols, commands and constraints.
 3. Give each task a difficulty; it picks the model (below).
-4. Run concurrent work only with named, disjoint file ownership. Test and review tasks must depend on the workers they check. Relo runs checks; ask workers to implement, not re-verify. Give workers the files and line ranges a probe found, with the probe in deps. Put exact project commands from the facts in task descriptions; mark them trivial or easy.
+4. Run concurrent work only with named, disjoint file ownership. Every test or review task depends on the workers it checks; never add one to re-check facts or a change already described. Relo runs the full checks once a batch of workers ends, so workers implement, they do not re-verify. Give workers the files a probe found, with the probe in deps; put exact project commands from the facts in task descriptions; mark them trivial or easy.
 5. Relo already reviews large or hard changes; plan a reviewer only when the user asks or the change is security-sensitive. On noisy, stale, oversized or contradictory context, extract decisions, then set refreshSelf=true.
 6. Redirect a failed worker with a tighter task. When every task is done and no check failed, put what happened in userMessage and return tasks as []; do not plan more work only to confirm it.
 7. Set constraints from the request and context, including unstated rules on files, behavior, conventions and scope. Interpret, do not copy. One short, checkable rule each; resend the full list when it changes, otherwise leave it empty.
@@ -225,7 +225,7 @@ Implement assigned work from a curated generation: objective, acceptance, releva
 
 Implement only assigned task; do not expand scope. Prefer supplied files. Report durable discoveries as findings.
 
-Report summary with exact locations, defect cause if fixed, changed files, verification commands/results, risks, and next actions. If tests fail, return failed with structured verification; never claim completion.
+Report summary with exact locations, defect cause if fixed, changed files, verification commands/results, risks, and next actions. If a test you ran fails, return failed with structured verification; never claim completion.
 `
 
 // ReadNarrowly is the rule that matters most for an agent's cost. Whatever a tool returns stays in the conversation
@@ -233,9 +233,10 @@ Report summary with exact locations, defect cause if fixed, changed files, verif
 // each of the steps after it. Models follow a rule that says why.
 const ReadNarrowly = "\nRead narrowly. Find lines with `grep -n`, then read only that range (offset and limit, 150 lines at most). Never read a whole file or dump command output: pipe it through `head`/`tail`. Everything you read is sent again with every later step; one whole-file read of a large file costs about 18k tokens each time.\n"
 
-// RunNarrowly is the matching rule for wall-clock time. A worker once ran a project's whole test suite, nine minutes
-// each time and silent until it ended, again and again; Relo runs the project's checks itself when a worker finishes.
-const RunNarrowly = "\nRun narrowly. Relo runs the project's checks itself when you finish, so run only the tests for what you changed (one test or target), not the whole suite. A command that takes more than two minutes is the wrong command: run it under `timeout 120`.\n"
+// RunNarrowly is the matching rule for wall-clock time, kept to the size budget the roles are measured against. A
+// worker once ran a project's whole test suite, nine minutes each time and silent until it ended, again and again. In
+// one session the full check cost 600 s per worker, 63 times. Relo runs the project's checks once a batch ends.
+const RunNarrowly = "\nRun narrowly. Test only what you changed, in your own worktree, once: one test or target for the touched package or file. Never run the whole suite (bare `go test ./...`, `make test`, `npm test`) or repeat a command that already passed; Relo runs full checks once the batch ends. A command over two minutes is wrong: run it under `timeout 120`.\n"
 
 // AskWhenBlocked is the one case where stopping beats guessing. A guess that is wrong costs a whole attempt and a
 // retry that repeats it; a question costs one report.

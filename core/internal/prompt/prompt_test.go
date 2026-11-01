@@ -134,7 +134,7 @@ func TestSchemaCapsAndRolePromptSizes(t *testing.T) {
 		}
 	}
 	roles := []agent.Role{agent.Primary, agent.Head, agent.Probe, agent.Architect, agent.Debug, agent.Worker, agent.Test, agent.Reviewer, agent.Integration}
-	before := map[agent.Role]int{agent.Primary: 6067, agent.Head: 1504, agent.Probe: 1862, agent.Architect: 2264, agent.Debug: 2540, agent.Worker: 2764, agent.Test: 1543, agent.Reviewer: 1835, agent.Integration: 2279}
+	before := map[agent.Role]int{agent.Primary: 6067, agent.Head: 1504, agent.Probe: 1862, agent.Architect: 2264, agent.Debug: 2604, agent.Worker: 2838, agent.Test: 1543, agent.Reviewer: 1835, agent.Integration: 2279}
 	for _, role := range roles {
 		prompt := For(role)
 		t.Logf("role=%s bytes before=%d after=%d", role, before[role], len(prompt))
@@ -227,14 +227,24 @@ func longestCommonPrefix(a, b string) int {
 
 func TestWorkersAreToldToRunOnlyTheTestsTheyChanged(t *testing.T) {
 	for _, role := range []agent.Role{agent.Worker, agent.Debug} {
-		p := For(role)
-		if !strings.Contains(p, "not the whole suite") || !strings.Contains(p, "timeout 120") {
-			t.Errorf("%s is not told to keep its test runs short", role)
+		p := strings.ToLower(For(role))
+		for _, rule := range []string{"in your own worktree", "one test or target for the touched package or file", "never run the whole suite", "timeout 120"} {
+			if !strings.Contains(p, rule) {
+				t.Errorf("%s is not told to run fast scoped tests only: missing %q", role, rule)
+			}
 		}
 	}
 	for _, role := range []agent.Role{agent.Primary, agent.Probe, agent.Reviewer} {
-		if strings.Contains(For(role), "not the whole suite") {
+		if strings.Contains(For(role), "Never run the whole suite") {
 			t.Errorf("%s was given a rule about running tests that is not its job", role)
+		}
+	}
+}
+
+func TestPrimaryPlansNoExtraCheckTasks(t *testing.T) {
+	for _, rule := range []string{"never add one to re-check facts or a change already described", "Relo runs the full checks once a batch of workers ends", "they do not re-verify", "Every test or review task depends on the workers it checks"} {
+		if !strings.Contains(Primary, rule) {
+			t.Errorf("Primary prompt missing batching rule %q", rule)
 		}
 	}
 }
