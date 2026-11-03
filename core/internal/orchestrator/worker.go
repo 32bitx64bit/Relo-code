@@ -55,6 +55,8 @@ type runtimeSession struct {
 	generation  int
 	model       string
 	lastDynamic string
+	// convo is the Primary's live conversation, which continues across turns; see convo.go. Nil for every other agent.
+	convo *primaryConvo
 }
 
 var schemaContracts sync.Map
@@ -109,6 +111,7 @@ func (c *Coord) spawnSoft(t taskgraph.Task, role agent.Role, soft []scheduler.So
 	if model == "" {
 		model = c.modelForTask(role, t.Difficulty, t.Vision)
 	}
+	model = c.avoidStalled(role, t.Difficulty, model)
 	a := c.Agents.Create(agent.Agent{
 		ParentID: parent.ID, Role: role, Title: t.Title, TaskID: t.ID,
 		Status: agent.Queued, Model: model, Scope: t.Description, Attempt: t.Attempt + 1,
@@ -638,6 +641,16 @@ func taskBrief(t taskgraph.Task) string {
 	}
 	if len(t.Paths) > 0 {
 		b.WriteString("\nFiles in scope: " + strings.Join(t.Paths, ", ") + "\n")
+	}
+	if t.CommandMinutes > 0 {
+		b.WriteString(fmt.Sprintf("\nCommand time limit: %d min for any one command, set for this task. Use it as the `timeout`. Start anything that may pass 2 min detached (`nohup cmd > $TMPDIR/run.log 2>&1 &`) and `tail` the log between steps; do not shorten, skip or give up on a run the task needs because it is long.\n", t.CommandMinutes))
+	}
+	if len(t.Assumes) > 0 {
+		b.WriteString("\nCheck before you build: the plan relies on these facts about the existing code. They were relayed to the planner, not read by it. Verify each against the files first (a read or grep is enough) and never build on one that is wrong:\n")
+		for i, line := range t.Assumes {
+			b.WriteString(fmt.Sprintf("%d. %s\n", i+1, line))
+		}
+		b.WriteString("List any that are wrong in deviations: what is true instead, with file:line. If the correction changes what you were asked to build, stop with status blocked and ask. Say nothing about the ones that hold.\n")
 	}
 	if t.BlockedOn != nil && !t.BlockedOn.Unresolved() {
 		b.WriteString("\nAnswered question: " + t.BlockedOn.Question + "\nAnswer (" + string(t.BlockedOn.AnsweredBy) + "): " + t.BlockedOn.Resolution + "\n")
@@ -1216,6 +1229,11 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		short, _ = clipText(text, c.summaryLimit(""))
 	}
 	checksFailed := outcome.ran && !outcome.passed
+	devs := cleanDeviations(rep.Deviations)
+	for i := len(devs) - 1; i >= 0; i-- {
+		// A wrong plan fact is a risk the Primary must see, so the report is not collapsed to a status line.
+		rep.Risks = append([]string{"Wrong plan fact: " + devs[i]}, rep.Risks...)
+	}
 	// A valid structured failed report from a read-only reviewer or probe is its verdict, delivered to the Primary
 	// and not retried. Invalid or prose replies still go through the retry path.
 	negativeVerdict := st == agent.Failed && !blocked && !rep.unstructured && rep.ValidationError == "" &&
@@ -1230,7 +1248,7 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 	if unchanged {
 		rep.Risks = append([]string{"Changed no files."}, rep.Risks...)
 	}
-	report := agent.Report{Status: st, Summary: rep.Summary, Findings: rep.Findings, Files: rep.Files, Risks: rep.Risks, Next: rep.Next, Cause: rep.Cause, Handoff: rep.Handoff, Question: rep.Question, Raw: rep.Summary}
+	report := agent.Report{Status: st, Summary: rep.Summary, Findings: rep.Findings, Files: rep.Files, Risks: rep.Risks, Next: rep.Next, Cause: rep.Cause, Handoff: rep.Handoff, Question: rep.Question, Deviations: devs, Raw: rep.Summary}
 	for _, v := range rep.Verify {
 		report.Verify = append(report.Verify, agent.Verify{Command: v.Command, Status: v.Status, Output: v.Output})
 	}
@@ -1278,7 +1296,14 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		c.proposeMemory(a, firstLine(short), ctxeng.CompressReport(short, files, verifyLines(rep), rep.Risks, rep.Cause), files)
 	}
 	if parent, ok := c.Agents.Primary(); ok {
-		sum := ctxeng.CompressReport(short, files, verifyLines(rep), rep.Risks, rep.Cause)
+		// A clean finish costs the Primary a status line: it decides nothing from the prose, and a dependent task
+		// gets the whole handoff from depReports. Anything it must weigh (a failure, a risk, a wrong plan fact, a
+		// question, no change) keeps the full summary.
+		brief := short
+		if cleanFinish(a.Role, st, checksFailed || blocked, len(changes), rep.Risks) {
+			brief, _ = clipText(short, cleanReportRunes)
+		}
+		sum := ctxeng.CompressReport(brief, files, verifyLines(rep), rep.Risks, rep.Cause)
 		c.Engine.Ingest(parent.ID, []ctxeng.Item{{
 			Class: ctxeng.ClassReport, Source: ctxeng.SourceParent, Title: a.Title, Content: sum,
 			Files: files, Durability: 0.95, Verified: st == agent.Completed && !checksFailed, AgentID: a.ID, TaskID: t.ID,
@@ -1288,6 +1313,7 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		c.logWarn("promote worker report", fmt.Errorf("primary agent missing"))
 	}
 	c.recordChanges(t, a, changes)
+	c.raiseDeviations(t, a, devs)
 	gst := taskgraph.Done
 	if st == agent.Failed || checksFailed {
 		gst = taskgraph.Failed
@@ -1659,10 +1685,16 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 	}
 	var stalled *stalledError
 	class := runtime.Classify(err)
-	if errors.As(err, &stalled) || class == runtime.ClassUnknown {
+	stall := errors.As(err, &stalled)
+	// A tool that outran its wall clock would outrun it on any model. A model that went silent is its route failing:
+	// that is what a backup is for.
+	if stall && !stalled.model || !stall && class == runtime.ClassUnknown {
 		return body, err
 	}
-	backup := c.routing().BackupFor(a.Difficulty, a.Model, a.Model)
+	backup := c.backupModel(a)
+	if stall {
+		backup = c.stallFailover(a)
+	}
 	provider, model := routing.Split(backup)
 	if provider == "" || model == "" || backup == a.Model {
 		return body, err
@@ -1675,13 +1707,18 @@ func (c *Coord) runAgent(ctx context.Context, a agent.Agent, parts prompt.Parts,
 	// The failed runtime session may still be live if SendTask failed before streaming.
 	c.closeAgentSession(a.ID)
 	from := a.Model
+	fallbackClass := string(class)
+	if stall {
+		fallbackClass = "stalled"
+		c.chat("system", fmt.Sprintf("%q: %s stopped responding, so the task moved to %s.", a.Title, from, backup), a.ID)
+	}
 	c.Agents.Update(a.ID, func(x *agent.Agent) {
-		x.FallbackFrom, x.FallbackClass, x.Model = from, string(class), backup
+		x.FallbackFrom, x.FallbackClass, x.Model = from, fallbackClass, backup
 		x.RuntimeID = ""
 		x.Window = c.settings().Window(backup)
 	})
 	a = c.freshAgent(a)
-	c.emit("agent.fallback", map[string]any{"agentId": a.ID, "from": from, "model": backup, "class": class})
+	c.emit("agent.fallback", map[string]any{"agentId": a.ID, "from": from, "model": backup, "class": fallbackClass})
 	// Context-limit handling may have rebuilt the pack while the failing turn ended.
 	if current := c.Engine.CurrentNumber(a.ID); current != generation {
 		if gen := c.Engine.Generation(a.ID, current); gen != nil {
@@ -1726,14 +1763,33 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 	prov, model := routing.Split(a.Model)
 	gen := c.Engine.CurrentNumber(a.ID)
 	key := a.ID
+	// The Primary's conversation continues across turns and sends only what changed; every other agent's session
+	// lasts one context generation.
+	primary := a.Role == agent.Primary && !peerWake
+	contract := schemaContract(schema)
+	ctxBody, ctxExtra := parts.Body, parts.Extra
+	if ctxBody == "" && ctxExtra == "" {
+		ctxBody = parts.Dynamic // parts not made by ComposeParts have no split
+	}
+	// The process keeps the system prompt it started with, so a changed one (role prompt or output contract) needs a new one.
+	systemKey := hashString(parts.SystemStatic(contract))
+	fullTokens := estimateTokens(parts.SystemStatic(contract) + parts.Stable + parts.Dynamic)
 	c.runtimeMu.Lock()
 	session := c.runtimeSessions[key]
-	if session != nil && (session.generation != gen || session.model != a.Model) {
-		delete(c.runtimeSessions, key)
-		c.runtimeMu.Unlock()
-		c.closeRuntimeSession(rt, session)
-		c.runtimeMu.Lock()
-		session = nil
+	if session != nil {
+		stale := session.model != a.Model
+		if primary {
+			stale = stale || session.convo.shouldStartOver(systemKey, fullTokens, time.Now())
+		} else {
+			stale = stale || session.generation != gen
+		}
+		if stale {
+			delete(c.runtimeSessions, key)
+			c.runtimeMu.Unlock()
+			c.closeRuntimeSession(rt, session)
+			c.runtimeMu.Lock()
+			session = nil
+		}
 	}
 	if session == nil {
 		sid, err := rt.StartSession(ctx, runtime.SessionConfig{Title: a.Title, Directory: a.Workspace, ReadOnly: peerWake || !agent.Mutating(a.Role) || sess.Mode != ModeBuild, Provider: prov})
@@ -1741,14 +1797,29 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 			c.runtimeMu.Unlock()
 			return "", err
 		}
-		evs, err := rt.Events(ctx, sid)
+		// The Primary's conversation outlives the run that started it, so its event stream must too: the session's
+		// close, not this run's end, is what stops it.
+		eventsCtx := ctx
+		if primary {
+			eventsCtx = context.WithoutCancel(ctx)
+		}
+		evs, err := rt.Events(eventsCtx, sid)
 		if err != nil {
 			c.runtimeMu.Unlock()
 			_ = rt.CloseSession(context.Background(), sid)
 			return "", err
 		}
 		session = &runtimeSession{id: sid, events: evs, generation: gen, model: a.Model}
+		if primary {
+			session.convo = &primaryConvo{static: systemKey}
+		}
 		c.runtimeSessions[key] = session
+	}
+	resumed := primary && session.convo != nil && session.convo.turns > 0
+	var sentBlocks []block
+	var sentBefore map[string]block
+	if resumed {
+		sentBefore = session.convo.blocks
 	}
 	sid, evs := session.id, session.events
 	previousDynamic := session.lastDynamic
@@ -1762,9 +1833,24 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 			x.Generation = gen
 		})
 	}
-	system := parts.System(schemaContract(schema))
+	system := parts.System(contract)
 	dynamic := parts.Dynamic
-	if previousDynamic != "" {
+	switch {
+	case primary:
+		// The system prompt of a conversation that continues cannot hold context that changes. The first message
+		// carries all of it; each later one only what changed since.
+		system = parts.SystemStatic(contract)
+		sentBlocks = contextBlocks(parts.Stable, ctxBody)
+		if resumed {
+			changed, gone := diffBlocks(sentBefore, sentBlocks)
+			dynamic = contextDelta(changed, gone)
+			if strings.TrimSpace(ctxExtra) != "" {
+				dynamic += "\n" + ctxExtra
+			}
+		} else if parts.Stable != "" {
+			dynamic = parts.Stable + "\n\n" + parts.Dynamic
+		}
+	case previousDynamic != "":
 		if strings.HasPrefix(dynamic, previousDynamic) {
 			dynamic = dynamic[len(previousDynamic):]
 		} else {
@@ -1788,7 +1874,11 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 		if err != nil {
 			return "", err
 		}
-		promptText += "\n\nRelo agent messaging is available through relo_agents. Your private key is " + key + ". Use action list for live peer IDs, send with to/text, and inbox to acknowledge received messages. Never copy your key into messages or reports."
+		keyNote := "Your private key is " + key
+		if resumed {
+			keyNote = "Your private key for this turn is " + key + " (earlier keys no longer work)"
+		}
+		promptText += "\n\nRelo agent messaging is available through relo_agents. " + keyNote + ". Use action list for live peer IDs, send with to/text, and inbox to acknowledge received messages. Never copy your key into messages or reports."
 		if a.Role != agent.Primary {
 			// relo_image is offered unless the model is known to be text only; that model is told it cannot see
 			// instead, so it reports a visual check as unavailable rather than claiming one.
@@ -1848,7 +1938,21 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 		})
 	}
 	if err := send(promptText); err != nil {
+		if primary {
+			// A conversation that cannot be sent to is not kept, or every later turn would meet the same dead session.
+			c.closeAgentSession(a.ID)
+			if resumed {
+				// The idle process may have ended, or the runtime lost the session. A fresh conversation has the
+				// whole context, so nothing is lost by starting it over.
+				c.logWarn("primary conversation could not continue; starting it over", err)
+				return c.runAgentWith(ctx, a, parts, ask, schema, peerWake)
+			}
+		}
 		return "", err
+	}
+	if primary {
+		c.convoSent(key, session, sentBlocks, estimateTokens(system+promptText))
+		defer c.convoEnded(key, session)
 	}
 	for _, messageID := range peerIDs {
 		c.peerState(sess.ID, messageID, "delivered", "included in recipient prompt; model acknowledgement not yet received")
@@ -1860,6 +1964,9 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 	c.runtimeMu.Unlock()
 	var body strings.Builder
 	st := &runState{tools: map[string]string{}, inputs: map[string]string{}, phase: "model", label: "Waiting for model", last: time.Now()}
+	if task, ok := c.Graph.Get(a.TaskID); ok && task.CommandMinutes > 0 {
+		st.toolWait = time.Duration(task.CommandMinutes)*time.Minute + 5*time.Minute
+	}
 	armed := st.quietLimit()
 	quiet := time.NewTimer(time.Hour)
 	defer quiet.Stop()
@@ -1882,7 +1989,7 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 			if !st.interrupting {
 				st.stalledFor = armed
 			}
-			if !st.interrupting && len(st.inflight)+len(st.anonymous) == 0 && recoveries < agentRecoveries {
+			if !st.interrupting && len(st.inflight)+len(st.anonymous) == 0 && recoveries < c.stallRecoveries(a) {
 				// Interrupting the silent model call and telling the agent so keeps everything it has done;
 				// failing the task starts it again from nothing.
 				if c.interruptStalled(ctx, a, rt, sid, st) {
@@ -1894,7 +2001,11 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 			}
 			c.abortAgentSession(a.ID, rt, sid)
 			c.discardStream(a, st)
-			return "", st.stalledErr()
+			err := st.stalledErr()
+			if se, ok := err.(*stalledError); ok && se.model {
+				c.noteStall(a.Model)
+			}
+			return "", err
 		case ev, ok := <-evs:
 			if !ok {
 				return body.String(), nil
@@ -1961,6 +2072,9 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 					}
 					c.recordUsage(a, gen, usage, st.live)
 					usageRecorded = true
+					if primary {
+						c.convoSized(key, session, usage.Context)
+					}
 				}
 				if ev.JSON != "" {
 					return ev.JSON, nil
@@ -1983,6 +2097,64 @@ func (c *Coord) runAgentWith(ctx context.Context, a agent.Agent, parts prompt.Pa
 			}
 		}
 	}
+}
+
+// convoSent records what the Primary's conversation was just sent. estimate is Relo's count of the first message,
+// which tells the runtime's own overhead apart from it once the provider reports the real size.
+func (c *Coord) convoSent(key string, session *runtimeSession, blocks []block, estimate int) {
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
+	if c.runtimeSessions[key] != session || session.convo == nil {
+		return
+	}
+	cv := session.convo
+	if cv.turns == 0 {
+		cv.firstEst = estimate
+	}
+	cv.blocks, cv.busy, cv.sentAt = blockMap(blocks), true, time.Now()
+	cv.turns++
+}
+
+// convoSized records the conversation's size as the provider counted it for the turn's latest request.
+func (c *Coord) convoSized(key string, session *runtimeSession, tokens int) {
+	if tokens <= 0 {
+		return
+	}
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
+	if c.runtimeSessions[key] != session || session.convo == nil {
+		return
+	}
+	session.convo.tokens = tokens
+	if session.convo.first == 0 {
+		session.convo.first = tokens
+	}
+}
+
+// primaryIdleCloseAfter is primaryIdleClose as a variable, so tests can shorten it.
+var primaryIdleCloseAfter = primaryIdleClose
+
+// convoEnded marks the Primary's turn finished and closes the conversation's process if nobody uses it for a while.
+// A conversation left open costs a process, and its cache is gone after five minutes anyway.
+func (c *Coord) convoEnded(key string, session *runtimeSession) {
+	c.runtimeMu.Lock()
+	if c.runtimeSessions[key] != session || session.convo == nil {
+		c.runtimeMu.Unlock()
+		return
+	}
+	session.convo.busy, session.convo.sentAt = false, time.Now()
+	c.runtimeMu.Unlock()
+	time.AfterFunc(primaryIdleCloseAfter, func() {
+		c.runtimeMu.Lock()
+		idle := c.runtimeSessions[key] == session && session.convo != nil && !session.convo.busy && time.Since(session.convo.sentAt) >= primaryIdleCloseAfter
+		if idle {
+			delete(c.runtimeSessions, key)
+		}
+		c.runtimeMu.Unlock()
+		if idle {
+			c.closeRuntimeSession(c.RuntimeSnapshot(), session)
+		}
+	})
 }
 
 // closeAgentSession detaches and closes the agent's runtime session. Idempotent:
@@ -2052,6 +2224,11 @@ func (c *Coord) recordUsage(a agent.Agent, generation int, usage runtime.Usage, 
 	}
 	profileID := c.styleFor(a).Profile.ID()
 	cache.AddLabeled(a.ID, generation, a.Model, string(a.Role), profileID, u)
+	if a.Role == agent.Primary {
+		// The Primary is the one agent whose cost is worth reading turn by turn: in a Pixels at War run cache writes
+		// were 77% of it, because nearly every turn wrote its whole context again.
+		c.emit("primary.cost", map[string]any{"agentId": a.ID, "generation": generation, "input": u.Input, "output": u.Output, "cacheRead": u.CacheRead, "cacheWrite": u.CacheWrite, "units": costUnits(u)})
+	}
 	if c.Log != nil {
 		c.Log.Debug("prompt usage", map[string]any{"agent": a.ID, "role": string(a.Role), "generation": generation, "input": u.Input, "cacheRead": u.CacheRead, "output": u.Output})
 	}
@@ -2083,6 +2260,12 @@ func (c *Coord) recordUsage(a agent.Agent, generation int, usage runtime.Usage, 
 	c.emit("cache.updated", cache.Snapshot().Payload())
 }
 
+// costUnits weighs a turn's tokens by what a provider charges for them, in input-token equivalents: a cache write
+// costs 1.25 times an input token, a cache read a tenth, an output token five times.
+func costUnits(u metrics.Usage) int {
+	return u.Input + u.CacheWrite*5/4 + u.CacheRead/10 + u.Output*5
+}
+
 // runState is what handleEvent remembers about one model turn.
 type runState struct {
 	tools    map[string]string // tool call id to tool name; only the start event carries the name
@@ -2105,6 +2288,107 @@ type runState struct {
 	stalledFor   time.Duration // how long the agent had been quiet when it was interrupted
 
 	watch contextWatch // how full the context is and whether it is being summarized; see compact.go
+
+	toolWait time.Duration // wall clock for one tool call in this run; zero means agentToolWait
+}
+
+// toolLimit is how long one tool call may run before the agent counts as stalled. A task whose Primary set a command
+// time limit gets that long plus five minutes, so the watchdog never cuts a run the plan asked for.
+func (st *runState) toolLimit() time.Duration {
+	if st.toolWait > agentToolWait {
+		return st.toolWait
+	}
+	return agentToolWait
+}
+
+// cleanReportRunes is how much of a clean worker report the Primary's context keeps. Thirty-three reports at up to
+// 1200 characters were half of its last context in a Pixels at War run (13.5k of 26k tokens).
+const cleanReportRunes = 320
+
+// cleanFinish is a builder's finish with nothing for the Primary to weigh: it changed files, its checks held, and it
+// reported no risk. A probe's or reviewer's summary is what it was sent to find, so those are never collapsed.
+func cleanFinish(role agent.Role, st agent.Status, problem bool, changed int, risks []string) bool {
+	return deliversChanges(role) && st == agent.Completed && !problem && changed > 0 && len(risks) == 0
+}
+
+// cleanDeviations bounds the wrong plan facts a worker reports.
+func cleanDeviations(in []string) []string {
+	var out []string
+	for _, line := range in {
+		if line = strings.TrimSpace(line); line != "" {
+			clipped, _ := clipText(line, 300)
+			out = append(out, clipped)
+		}
+		if len(out) == 4 {
+			break
+		}
+	}
+	return out
+}
+
+// raiseDeviations tells the Primary a task found facts the plan relied on to be wrong. The report already carries
+// them, but a finished task does not wake the Primary, and a wrong fact is the one thing it must hear about now:
+// other tasks may be building on it. A worker that already sent the message itself is not echoed.
+func (c *Coord) raiseDeviations(t taskgraph.Task, a agent.Agent, devs []string) {
+	primary, ok := c.Agents.Primary()
+	if !ok || len(devs) == 0 {
+		return
+	}
+	c.mu.Lock()
+	if c.sess == nil {
+		c.mu.Unlock()
+		return
+	}
+	for _, m := range c.sess.PeerMessages {
+		if m.From == a.ID && m.To == primary.ID && m.Kind == "deviation" {
+			c.mu.Unlock()
+			return
+		}
+	}
+	if len(c.sess.PeerMessages) >= maxPeerMessages {
+		for i, old := range c.sess.PeerMessages {
+			if peerSettled(old) {
+				c.sess.PeerMessages = append(c.sess.PeerMessages[:i], c.sess.PeerMessages[i+1:]...)
+				break
+			}
+		}
+	}
+	text := fmt.Sprintf("Task %q found facts the plan relied on to be wrong:\n- %s", t.Title, strings.Join(devs, "\n- "))
+	c.sess.PeerMessages = append(c.sess.PeerMessages, PeerMessage{ID: id.New("peer"), From: a.ID, To: primary.ID, Text: text, Kind: "deviation", State: "queued", Created: time.Now().UTC()})
+	sid := c.sess.ID
+	c.mu.Unlock()
+	c.syncPeerContext(sid, primary.ID)
+	c.wakeHead()
+}
+
+// Assumptions a task may carry, and how long each may be. They are facts to check, not a place to put a design.
+const (
+	maxAssumes     = 6
+	maxAssumeRunes = 240
+)
+
+// cleanAssumes trims, drops blanks and repeats, and bounds the Primary's list of facts a task relies on.
+func cleanAssumes(in []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, line := range in {
+		line = strings.TrimSpace(line)
+		if line == "" || seen[line] {
+			continue
+		}
+		seen[line] = true
+		clipped, _ := clipText(line, maxAssumeRunes)
+		out = append(out, clipped)
+		if len(out) == maxAssumes {
+			break
+		}
+	}
+	return out
+}
+
+// clampCommandMinutes keeps a Primary-set command limit to something a day can hold.
+func clampCommandMinutes(n int) int {
+	return max(0, min(n, 24*60))
 }
 
 // An agent is stopped when the model goes quiet, never merely for being busy. It used to be stopped 8 minutes after
@@ -2128,9 +2412,21 @@ var (
 )
 
 // stalledError is an agent that stopped responding and could not be brought back.
-type stalledError struct{ msg string }
+type stalledError struct {
+	msg string
+	// model is true when the model itself went quiet, false when a tool call outran its wall clock. Only the first
+	// says the model or its route is failing, so only the first is worth a different model: another model would
+	// meet the same slow tool.
+	model bool
+}
 
 func (e *stalledError) Error() string { return e.msg }
+
+// earlySteps is how many model requests an agent has made before it counts as having work worth keeping. An
+// agent that goes silent earlier than this has nothing a nudge would save: it moves to another model at once
+// instead of waiting out the nudges on a route that is not answering. In one session five agents in a row made three
+// requests in fifteen minutes each on a dead route and never changed model.
+const earlySteps = 6
 
 // noteTool keeps track of the tool calls that have started and not finished.
 func (st *runState) noteTool(ev runtime.Event) {
@@ -2187,7 +2483,7 @@ func (st *runState) quietLimit() time.Duration {
 		return interruptWait
 	case len(st.inflight)+len(st.anonymous) > 0:
 		_, started := st.oldestTool()
-		remaining := time.Until(started.Add(agentToolWait))
+		remaining := time.Until(started.Add(st.toolLimit()))
 		if remaining <= 0 {
 			return time.Nanosecond // rearm treats zero as stopped; an expired call must fire immediately
 		}
@@ -2216,9 +2512,9 @@ func (st *runState) stalledErr() error {
 		if name == "" {
 			name = "tool"
 		}
-		return &stalledError{fmt.Sprintf("agent timed out: tool call %q exceeded %s wall-clock limit", name, span(agentToolWait))}
+		return &stalledError{msg: fmt.Sprintf("agent timed out: tool call %q exceeded %s wall-clock limit", name, span(st.toolLimit()))}
 	}
-	return &stalledError{"agent timed out: no activity for " + span(st.stalledFor)}
+	return &stalledError{msg: "agent timed out: no activity for " + span(st.stalledFor), model: true}
 }
 
 // resume clears what the interrupted turn left behind.

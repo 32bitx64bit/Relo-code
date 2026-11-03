@@ -86,19 +86,25 @@ type TurnTask struct {
 	Difficulty  string   `json:"difficulty"`
 	Vision      bool     `json:"vision"`
 	Art         bool     `json:"art"`
+	// CommandMinutes is the longest single command the task needs; see taskgraph.Task.
+	CommandMinutes int `json:"commandMinutes"`
+	// Assumes: see taskgraph.Task.
+	Assumes []string `json:"assumes"`
 }
 
 type RawReport struct {
-	Status          string             `json:"status"`
-	Summary         string             `json:"summary"`
-	Findings        []string           `json:"findings"`
-	Files           []string           `json:"filesChanged"`
-	Verify          []RawVerify        `json:"verification"`
-	Risks           []string           `json:"remainingRisks"`
-	Next            []string           `json:"recommendedNextActions"`
-	Cause           string             `json:"rootCause"`
-	Handoff         string             `json:"handoff"`
-	Question        string             `json:"question"`
+	Status   string      `json:"status"`
+	Summary  string      `json:"summary"`
+	Findings []string    `json:"findings"`
+	Files    []string    `json:"filesChanged"`
+	Verify   []RawVerify `json:"verification"`
+	Risks    []string    `json:"remainingRisks"`
+	Next     []string    `json:"recommendedNextActions"`
+	Cause    string      `json:"rootCause"`
+	Handoff  string      `json:"handoff"`
+	Question string      `json:"question"`
+	// Deviations are facts the task relied on that proved wrong, with what is true instead.
+	Deviations      []string           `json:"deviations"`
 	Options         []taskgraph.Option `json:"options,omitempty"`
 	Structured      []RawFinding       `json:"structuredFindings"`
 	ValidationError string             `json:"-"`
@@ -393,6 +399,7 @@ func ParseReport(body string) (agent.Report, error) {
 	return agent.Report{
 		Status: status, Summary: report.Summary, Findings: report.Findings, Files: report.Files, Verify: verify,
 		Risks: report.Risks, Next: report.Next, Cause: report.Cause, Handoff: report.Handoff, Question: report.Question, Raw: report.Summary,
+		Deviations: report.Deviations,
 	}, nil
 }
 

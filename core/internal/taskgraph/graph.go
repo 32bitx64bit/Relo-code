@@ -70,21 +70,28 @@ func (b *BlockedOn) Unresolved() bool {
 }
 
 type Task struct {
-	ID          string     `json:"id"`
-	Title       string     `json:"title"`
-	Description string     `json:"description"`
-	Acceptance  []string   `json:"acceptance"`
-	Creator     string     `json:"creator"`
-	AgentID     string     `json:"agentId,omitempty"`
-	Status      Status     `json:"status"`
-	Priority    int        `json:"priority"`
-	Depends     []string   `json:"dependencies"`
-	Paths       []string   `json:"paths,omitempty"` // files this task will edit; used by advisory path leases
-	Children    []string   `json:"children"`
-	Workspace   string     `json:"workspace"`
-	Difficulty  string     `json:"difficulty"`
-	Vision      bool       `json:"vision,omitempty"` // the agent must look at images; routing prefers a model that sees
-	Art         bool       `json:"art,omitempty"`    // the agent makes image assets and is offered the sprite tools; implies Vision
+	ID          string   `json:"id"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	Acceptance  []string `json:"acceptance"`
+	Creator     string   `json:"creator"`
+	AgentID     string   `json:"agentId,omitempty"`
+	Status      Status   `json:"status"`
+	Priority    int      `json:"priority"`
+	Depends     []string `json:"dependencies"`
+	Paths       []string `json:"paths,omitempty"` // files this task will edit; used by advisory path leases
+	Children    []string `json:"children"`
+	Workspace   string   `json:"workspace"`
+	Difficulty  string   `json:"difficulty"`
+	Vision      bool     `json:"vision,omitempty"` // the agent must look at images; routing prefers a model that sees
+	Art         bool     `json:"art,omitempty"`    // the agent makes image assets and is offered the sprite tools; implies Vision
+	// CommandMinutes is the longest a single command in this task may need, as the Primary judged it. Zero means the
+	// agent sizes its own limits. It is the Primary's call because only the plan knows which test or measurement is long.
+	CommandMinutes int `json:"commandMinutes,omitempty"`
+	// Assumes are facts about the existing code the plan relies on, each naming a file or symbol. They come from
+	// what the Primary was told (a reader's answer, a worker's report), not from reading code itself, so the worker
+	// checks them before it builds on them; see taskBrief.
+	Assumes     []string   `json:"assumes,omitempty"`
 	Model       string     `json:"model"`
 	Role        string     `json:"role"`
 	Attempt     int        `json:"attempt"` // the one attempt counter: incremented once per dispatch

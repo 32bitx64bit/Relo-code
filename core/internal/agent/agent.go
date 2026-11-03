@@ -99,7 +99,9 @@ type Report struct {
 	Handoff string `json:"handoff,omitempty"`
 	// Question is the decision a blocked agent needs.
 	Question string `json:"question,omitempty"`
-	Raw      string `json:"raw,omitempty"`
+	// Deviations are plan facts the agent found wrong while checking its task, with what is true instead.
+	Deviations []string `json:"deviations,omitempty"`
+	Raw        string   `json:"raw,omitempty"`
 }
 
 type Verify struct {
