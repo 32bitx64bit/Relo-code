@@ -108,7 +108,7 @@ func TestRetryBackoffAndDispatchWait(t *testing.T) {
 		attempt     int
 		base, upper time.Duration
 	}{
-		{1, 5 * time.Second, 6 * time.Second}, {2, 20 * time.Second, 24 * time.Second}, {3, 54 * time.Second, 60 * time.Second}, {9, 54 * time.Second, 60 * time.Second},
+		{1, 2 * time.Second, 2400 * time.Millisecond}, {2, 6 * time.Second, 7200 * time.Millisecond}, {3, 15 * time.Second, 18 * time.Second}, {9, 15 * time.Second, 18 * time.Second},
 	} {
 		if retryDelay(tc.attempt, 0) != tc.base || retryDelay(tc.attempt, 1) != tc.upper {
 			t.Fatalf("attempt %d: %v %v", tc.attempt, retryDelay(tc.attempt, 0), retryDelay(tc.attempt, 1))
@@ -123,7 +123,7 @@ func TestRetryBackoffAndDispatchWait(t *testing.T) {
 		before := time.Now()
 		c.retryTaskAfter(task, agent.Agent{}, errors.New(msg))
 		got, _ := c.Graph.Get(task.ID)
-		if got.NotBefore.Before(before.Add(5*time.Second)) || got.NotBefore.After(time.Now().Add(6*time.Second)) {
+		if got.NotBefore.Before(before.Add(2*time.Second)) || got.NotBefore.After(time.Now().Add(2400*time.Millisecond)) {
 			t.Fatalf("notBefore = %v", got.NotBefore)
 		}
 	}

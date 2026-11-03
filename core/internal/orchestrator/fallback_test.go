@@ -201,7 +201,7 @@ func TestWorkerFallbackMissingUsesFailTaskAndStallDoesNotSwitch(t *testing.T) {
 		c := New(logging.New(nil, logging.Error))
 		r := &fallbackRuntime{dispatchRuntime: newDispatchRuntime(), id: "main", failures: 1}
 		if stall {
-			r.err = &stalledError{"quota exhausted"}
+			r.err = &stalledError{msg: "quota exhausted"}
 			c.Route = routing.Config{Tier1BackupModel: "backup/model"}
 		}
 		c.SetRuntime(r)

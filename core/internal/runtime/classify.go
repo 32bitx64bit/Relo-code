@@ -86,7 +86,7 @@ var (
 	// auth400Re matches OAuth-style auth errors that providers return with 400.
 	auth400Re = regexp.MustCompile(`invalid_grant|invalid_client|invalid_token|unauthorized_client|token (is )?(expired|revoked)`)
 	rateRe    = regexp.MustCompile(`rate[ _-]?limit|too many requests|\b429\b`)
-	serverRe  = regexp.MustCompile(`internal server error|overloaded|bad gateway|service unavailable|gateway timeout|server error|api_error`)
+	serverRe  = regexp.MustCompile(`internal server error|overloaded|bad gateway|service unavailable|gateway timeout|server error|api_error|connection (refused|reset)|econn(refused|reset)|no such host|i/o timeout|tls handshake|unexpected eof|network is unreachable|socket hang up|fetch failed|upstream (connect|request) (error|timeout)|empty response`)
 	crashRe   = regexp.MustCompile(`crash|panic|segmentation fault|signal: |killed|exited|exit status|broken pipe|unexpectedly`)
 	statusRe  = regexp.MustCompile(`(?:status|http|code)\D{0,12}(\d{3})\b`)
 )
