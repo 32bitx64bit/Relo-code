@@ -636,6 +636,7 @@ func (c *Coord) seedPrimary(text string, refs []string) {
 		c.applyDecisions(p.ID, s.Decisions)
 	}
 	c.syncPrimaryConversation(p.ID, text, s.Messages)
+	c.setRepoMap(p.ID)
 	var items []ctxeng.Item
 	for _, ref := range refs {
 		items = append(items, ctxeng.Item{Class: ctxeng.ClassCode, Source: ctxeng.SourceRepo, Content: ref, Durability: 0.6})
@@ -766,7 +767,6 @@ func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text strin
 	}
 	parts := prompt.ComposePartsWith(primary.Role, *gen, extra, resolvedPrimary.Profile.Fragment(primary.Role))
 	turn, err := c.primaryTurn(ctx, primary, parts, "Plan the request and return the structured turn.")
-	c.closeAgentSession(primary.ID)
 	if err != nil {
 		return err
 	}
@@ -798,6 +798,9 @@ func (c *Coord) honorRefreshSelf(agentID string, turn Turn) {
 		return
 	}
 	c.relistMemory(agentID)
+	// A clean slate is asked for in the model's conversation as much as in the engine's context: the next turn
+	// starts a new conversation and sends the whole rebuilt context.
+	c.closeAgentSession(agentID)
 	if _, err := c.Engine.Refresh(agentID, "primary requested refresh"); err != nil {
 		c.logWarn("refresh primary context", err)
 		return
@@ -841,7 +844,7 @@ func (c *Coord) applyTurn(primary agent.Agent, turn Turn, userText ...string) {
 	}
 	for _, spec := range turn.Tasks {
 		role := parseRole(spec.Role)
-		t := c.Graph.Add(taskgraph.Task{Title: spec.Title, Description: spec.Description, Acceptance: spec.Acceptance, Creator: primary.ID, Priority: spec.Priority, Role: string(role), Workspace: s.Workspace, Difficulty: spec.Difficulty, Vision: spec.Vision || spec.Art, Art: spec.Art && c.artOn(), MaxAttempts: settings.MaxRetries, Model: c.modelForTask(role, spec.Difficulty, spec.Vision || spec.Art), Paths: spec.Paths, Scope: spec.Scope})
+		t := c.Graph.Add(taskgraph.Task{Title: spec.Title, Description: spec.Description, Acceptance: spec.Acceptance, Creator: primary.ID, Priority: spec.Priority, Role: string(role), Workspace: s.Workspace, Difficulty: spec.Difficulty, Vision: spec.Vision || spec.Art, Art: spec.Art && c.artOn(), MaxAttempts: settings.MaxRetries, Model: c.modelForTask(role, spec.Difficulty, spec.Vision || spec.Art), Paths: spec.Paths, Scope: spec.Scope, CommandMinutes: clampCommandMinutes(spec.CommandMinutes), Assumes: cleanAssumes(spec.Assumes)})
 		idmap[spec.ID] = t.ID
 		c.emit("task.created", t)
 	}
@@ -1401,6 +1404,7 @@ func (c *Coord) primaryTurn(ctx context.Context, primary agent.Agent, parts prom
 			c.dropPresentedMemory()
 		}
 	}()
+	c.newAskTurn()
 	body, err := c.runAgent(ctx, primary, parts, ask, prompt.PrimarySchemaFor(c.artOn()))
 	if err != nil {
 		return Turn{}, err
@@ -1563,6 +1567,7 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 		c.Engine.SetTaskState(p.ID, "Latest user message", nil)
 	}
 	c.pinBlocks(p.ID)
+	c.setRepoMap(p.ID)
 	c.relistMemory(p.ID)
 	// Recall is recomputed for this integration turn: worker output changes what is relevant, and a flag turned off since
 	// the last turn must not leave recalled memory in the prompt.
@@ -1584,7 +1589,6 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 	}
 	parts := prompt.ComposePartsWith(p.Role, *gen, extra, resolvedPrimary.Profile.Fragment(p.Role))
 	turn, err := c.primaryTurn(ctx, p, parts, "Integrate worker reports and return the structured turn.")
-	c.closeAgentSession(p.ID)
 	if err != nil {
 		c.logWarn("reprompt primary", err)
 		c.reportFailure(p, "Primary could not integrate the results", err)
@@ -1666,13 +1670,14 @@ func (c *Coord) retryTask(t taskgraph.Task, a agent.Agent) {
 	c.retryTaskAfter(t, a, nil)
 }
 
-// retryDelay uses the dispatched attempt count, adding jitter without exceeding one minute.
+// retryDelay uses the dispatched attempt count, adding jitter. It is short on purpose: a route that is failing is
+// left for its backup after the first retry, so a long wait only holds the work back.
 func retryDelay(attempt int, jitter float64) time.Duration {
-	base := 5 * time.Second
+	base := 2 * time.Second
 	if attempt == 2 {
-		base = 20 * time.Second
+		base = 6 * time.Second
 	} else if attempt >= 3 {
-		return 54*time.Second + time.Duration(float64(6*time.Second)*jitter)
+		return 15*time.Second + time.Duration(float64(3*time.Second)*jitter)
 	}
 	delay := base + time.Duration(float64(base)*0.2*jitter)
 	return delay
@@ -1680,6 +1685,20 @@ func retryDelay(attempt int, jitter float64) time.Duration {
 
 func (c *Coord) retryTaskAfter(t taskgraph.Task, a agent.Agent, cause error) {
 	model, retry := c.nextAttempt(t, a)
+	// The same model would go quiet again, and each wait is five minutes or more. Move now, not at attempt two.
+	var stalled *stalledError
+	if retry && errors.As(cause, &stalled) && stalled.model {
+		if next := c.stallFailover(a); next != "" {
+			model = next
+		}
+	}
+	// A route that failed again after its first retry is not worth a third try: the backup takes the task. The first
+	// retry stays on the model, since one failure in a row is often a blip.
+	if retry && t.Attempt >= 2 && cause != nil && runtime.Classify(cause) != runtime.ClassUnknown {
+		if next := c.backupModel(a); next != "" {
+			model = next
+		}
+	}
 	if !retry {
 		c.chat("system", fmt.Sprintf("%q failed after %s and was not retried again. Ask Relo to try a different approach.%s", t.Title, plural(t.Attempt, "attempt"), c.keptNote(t, a)), "")
 		return
