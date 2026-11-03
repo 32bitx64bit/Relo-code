@@ -136,7 +136,12 @@ func TestSchemaCapsAndRolePromptSizes(t *testing.T) {
 	roles := []agent.Role{agent.Primary, agent.Head, agent.Probe, agent.Architect, agent.Debug, agent.Worker, agent.Test, agent.Reviewer, agent.Integration}
 	// Primary rose from 6067 to 6157 when memoryActions was added (590-byte item 9). Autonomy rules (assume-and-proceed,
 	// head answers blocks first, fix obvious in-scope limitations) raised every role; the caps below hold them.
-	before := map[agent.Role]int{agent.Primary: 6242, agent.Head: 1627, agent.Probe: 1829, agent.Architect: 2430, agent.Debug: 2803, agent.Worker: 3172, agent.Test: 1510, agent.Reviewer: 1802, agent.Integration: 2445}
+	// 2026-11-02: Primary +225 (item 10: do not push commits and repairs onto the user, believe a missing-file report),
+	// Worker +295 and Debug +126 (long measurements run detached instead of under a 120 s cap that made them impossible;
+	// a one-line wiring change outside paths is part of the task).
+	// 2026-11-03: Primary +480 (it never reads code: the repository map and workspace facts come each turn, relo_agents
+	// ask returns a checked answer from a reader, and what a task builds on goes to its assumes for the worker to check).
+	before := map[agent.Role]int{agent.Primary: 6950, agent.Head: 1627, agent.Probe: 1829, agent.Architect: 2430, agent.Debug: 2929, agent.Worker: 3467, agent.Test: 1510, agent.Reviewer: 1802, agent.Integration: 2445}
 	for _, role := range roles {
 		prompt := For(role)
 		t.Logf("role=%s bytes before=%d after=%d", role, before[role], len(prompt))
@@ -144,7 +149,7 @@ func TestSchemaCapsAndRolePromptSizes(t *testing.T) {
 			t.Errorf("%s prompt grew: %d > %d bytes", role, len(prompt), before[role])
 		}
 		// For already includes Shared; count what is actually sent rather than charging Shared twice.
-		if total := len(prompt); total > 6300 {
+		if total := len(prompt); total > 7000 {
 			t.Errorf("%s prompt too large: %d chars", role, total)
 		}
 	}
@@ -230,10 +235,21 @@ func longestCommonPrefix(a, b string) int {
 func TestWorkersAreToldToRunOnlyTheTestsTheyChanged(t *testing.T) {
 	for _, role := range []agent.Role{agent.Worker, agent.Debug} {
 		p := strings.ToLower(For(role))
-		for _, rule := range []string{"in your own worktree", "one test or target for the touched package or file", "never run the whole suite", "timeout 120"} {
+		for _, rule := range []string{"in your own worktree", "one test or target for the touched package or file", "never run the whole suite", "put `timeout` on every command", "command time limit"} {
 			if !strings.Contains(p, rule) {
 				t.Errorf("%s is not told to run fast scoped tests only: missing %q", role, rule)
 			}
+		}
+		// A blanket two-minute cap made every measurement impossible: ten-year simulations ran past it, agents gave up
+		// after 300 steps and failed twice. A measurement runs detached and is read from its log.
+		// The command time limit is the Primary's to set per task (commandMinutes), not a fixed number in the prompt.
+		for _, rule := range []string{"never skip or shorten a needed run", "detached", "nohup", "tail"} {
+			if !strings.Contains(p, rule) {
+				t.Errorf("%s is not told how to run a long measurement: missing %q", role, rule)
+			}
+		}
+		if strings.Contains(p, "over two minutes is wrong") || strings.Contains(p, "timeout 120") {
+			t.Errorf("%s is again given a fixed two-minute command cap", role)
 		}
 	}
 	for _, role := range []agent.Role{agent.Primary, agent.Probe, agent.Reviewer} {
@@ -321,5 +337,26 @@ func TestPrimarySchemaOffersTheArtFlagOnlyWhenArtIsOn(t *testing.T) {
 		if (PrimarySchema[k] == nil) != (on[k] == nil) {
 			t.Fatalf("the art schema dropped %q", k)
 		}
+	}
+}
+
+// The Primary does not read code. It is told where facts come from, and that what a task builds on and it did not
+// measure goes to assumes, which the task's worker checks.
+func TestPrimaryIsToldItNeverReadsCodeAndHowToGetFacts(t *testing.T) {
+	p := For(agent.Primary)
+	for _, want := range []string{"never read code", "Repository map", "action ask", "assumes"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("Primary prompt lacks %q", want)
+		}
+	}
+	task := taskSchema["properties"].(map[string]any)["assumes"].(map[string]any)
+	if task["maxItems"] == nil {
+		t.Error("assumes has no cap")
+	}
+	if _, ok := ReportSchema["properties"].(map[string]any)["deviations"]; !ok {
+		t.Error("the worker report has no deviations field")
+	}
+	if !strings.Contains(Reader, "Cite every claim") || !strings.Contains(Reader, "Never guess") {
+		t.Error("the reader prompt does not demand citations")
 	}
 }
