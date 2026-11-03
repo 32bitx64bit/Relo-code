@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	ctxeng "github.com/relocode/relo/internal/context"
 )
@@ -30,7 +31,7 @@ func TestPeerOnlyStepDoesNotReuseAnsweredLatestUserMessage(t *testing.T) {
 	c.mu.Lock()
 	c.addChatLocked(Chat{Role: "user", Text: "answer the original question"})
 	c.addChatLocked(Chat{Role: "assistant", Text: "Original answer."})
-	c.sess.PeerMessages = []PeerMessage{{ID: "peer-1", From: "worker-1", To: p.ID, State: "queued", Text: "Worker update."}}
+	c.sess.PeerMessages = []PeerMessage{{ID: "peer-1", From: "worker-1", To: p.ID, State: "queued", Kind: "ask", Text: "Worker update."}}
 	c.mu.Unlock()
 	c.seedPrimary("answer the original question", nil)
 	if _, err := c.Engine.Build(ctxeng.BuildRequest{AgentID: p.ID}); err != nil {
@@ -107,5 +108,52 @@ func TestDeliveredQueuedMessageDoesNotStartAnotherHeadTurn(t *testing.T) {
 	defer r.hmu.Unlock()
 	if len(r.headSeen) != 2 {
 		t.Fatalf("head calls = %d, want one initial turn and one queued-message turn", len(r.headSeen))
+	}
+}
+
+// Worker reports that arrive while the head is still answering the last one share the next turn. The first message
+// is answered at once, a second one inside the gap waits for a single deferred wake instead of costing its own turn.
+func TestPeerMessagesInsideTheGapShareOneHeadTurn(t *testing.T) {
+	old := peerStepGap
+	peerStepGap = 150 * time.Millisecond
+	t.Cleanup(func() { peerStepGap = old })
+
+	c, r, _ := newGuidanceCoord(t, headWrap, headWrap)
+	p := c.ensurePrimary()
+	c.mu.Lock()
+	c.addChatLocked(Chat{Role: "user", Text: "answer the original question"})
+	c.addChatLocked(Chat{Role: "assistant", Text: "Original answer."})
+	c.sess.PeerMessages = []PeerMessage{{ID: "peer-1", From: "worker-1", To: p.ID, State: "queued", Kind: "ask", Text: "First update."}}
+	c.mu.Unlock()
+	c.seedPrimary("answer the original question", nil)
+	if _, err := c.Engine.Build(ctxeng.BuildRequest{AgentID: p.ID}); err != nil {
+		t.Fatal(err)
+	}
+	calls := func() int {
+		r.hmu.Lock()
+		defer r.hmu.Unlock()
+		return len(r.headSeen)
+	}
+
+	c.stepQueued(context.Background())
+	if calls() != 1 {
+		t.Fatalf("head calls after the first message = %d, want 1 at once", calls())
+	}
+
+	c.mu.Lock()
+	c.sess.PeerMessages = append(c.sess.PeerMessages, PeerMessage{ID: "peer-2", From: "worker-2", To: p.ID, State: "queued", Kind: "ask", Text: "Second update."})
+	c.mu.Unlock()
+	c.stepQueued(context.Background())
+	if calls() != 1 {
+		t.Fatalf("head calls = %d, a message inside the gap must wait", calls())
+	}
+	select {
+	case <-c.wake:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the waiting message was never woken")
+	}
+	c.stepQueued(context.Background())
+	if calls() != 2 {
+		t.Fatalf("head calls = %d, want the waiting message answered once the gap passed", calls())
 	}
 }

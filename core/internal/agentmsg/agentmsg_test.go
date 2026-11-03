@@ -124,8 +124,16 @@ func TestPingAndToolsList(t *testing.T) {
 		t.Fatalf("required = %v", req)
 	}
 	action := schema["properties"].(map[string]any)["action"].(map[string]any)["enum"].([]any)
-	if len(action) != 3 {
+	// import is in the enum: a model only calls what the schema lists, and a worker once reported that the tool
+	// "exposes only list/send/inbox, not import".
+	want := map[string]bool{"list": true, "send": true, "inbox": true, "import": true, "ask": true}
+	if len(action) != len(want) {
 		t.Fatalf("action enum = %v", action)
+	}
+	for _, a := range action {
+		if !want[a.(string)] {
+			t.Fatalf("action enum = %v", action)
+		}
 	}
 }
 
@@ -454,5 +462,52 @@ func TestPathsAreBoundedAndImportNeedsAMessage(t *testing.T) {
 	}
 	if called {
 		t.Fatal("the handler ran for an invalid call")
+	}
+}
+
+func TestSendCarriesItsKindAndRefusesAnUnknownOne(t *testing.T) {
+	var got Request
+	called := 0
+	s := startTest(t, func(_ context.Context, r Request) (any, error) { got = r; called++; return "ok", nil })
+	rpc(t, s, "tools/call", map[string]any{
+		"name":      "agents",
+		"arguments": map[string]any{"key": "k1", "action": "send", "to": "bob", "text": "the flag moved", "kind": "deviation"},
+	})
+	if want := (Request{Key: "k1", Action: "send", To: "bob", Text: "the flag moved", Kind: "deviation"}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v want %+v", got, want)
+	}
+	rpc(t, s, "tools/call", map[string]any{
+		"name":      "agents",
+		"arguments": map[string]any{"key": "k1", "action": "send", "to": "bob", "text": "x", "kind": "urgent"},
+	})
+	if called != 1 {
+		t.Fatalf("handler ran %d times, want 1: an unknown kind must be refused before the handler", called)
+	}
+}
+
+func TestAskNeedsAQuestionAndWaitsLongerThanOtherActions(t *testing.T) {
+	var got Request
+	var deadline time.Duration
+	s := startTest(t, func(ctx context.Context, r Request) (any, error) {
+		got = r
+		if d, ok := ctx.Deadline(); ok {
+			deadline = time.Until(d)
+		}
+		return "ok", nil
+	})
+	rpc(t, s, "tools/call", map[string]any{"name": "agents", "arguments": map[string]any{"key": "k1", "action": "ask"}})
+	if got.Action != "" {
+		t.Fatalf("an ask with no question reached the handler: %+v", got)
+	}
+	rpc(t, s, "tools/call", map[string]any{"name": "agents", "arguments": map[string]any{"key": "k1", "action": "ask", "text": "What type are the flags?"}})
+	if got.Action != "ask" || got.Text != "What type are the flags?" {
+		t.Fatalf("got %+v", got)
+	}
+	if deadline < 40*time.Second || deadline > 56*time.Second {
+		t.Fatalf("ask deadline = %v, want about %v", deadline, askTimeout)
+	}
+	rpc(t, s, "tools/call", map[string]any{"name": "agents", "arguments": map[string]any{"key": "k1", "action": "inbox"}})
+	if deadline > handlerTimeout {
+		t.Fatalf("inbox deadline = %v, want at most %v", deadline, handlerTimeout)
 	}
 }

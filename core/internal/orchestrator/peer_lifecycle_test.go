@@ -75,7 +75,7 @@ func TestPrimaryWaitingReceivesQueuedWorkerMessageAndStepsWithIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	const note = "The export API lives in api.go:42; keep Export(ctx)."
-	m, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: p.ID, Text: note})
+	m, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: p.ID, Text: note, Kind: "ask"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestSendToTerminalTargetWakesOrSettles(t *testing.T) {
 			c, _, sender, _, key := newPeerCoord(t)
 			c.SetRuntime(&wakeRuntime{Mock: rt.NewMock()})
 			dead := c.Agents.Create(agent.Agent{ID: "dead-target", Role: agent.Worker, Status: status})
-			v, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: dead.ID, Text: "hello"})
+			v, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: dead.ID, Text: "hello", Kind: "ask"})
 			if err != nil {
 				t.Fatal(err)
 			}

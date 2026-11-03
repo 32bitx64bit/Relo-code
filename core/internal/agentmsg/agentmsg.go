@@ -55,6 +55,7 @@ const (
 	maxBodyBytes           = 32 << 10
 	maxHeaderBytes         = 8 << 10
 	handlerTimeout         = 15 * time.Second
+	askTimeout             = 55 * time.Second // an ask waits for a reader; the HTTP write timeout is 65s
 	shutdownTimeout        = 5 * time.Second
 	defaultProtocolVersion = "2024-11-05"
 	serverName             = "relo-agentmsg"
@@ -82,6 +83,9 @@ type Request struct {
 	Action string `json:"action"`
 	To     string `json:"to,omitempty"`
 	Text   string `json:"text,omitempty"`
+	// Kind says what a send needs from its recipient: ask (an answer), blocked or deviation (the recipient must act),
+	// or fyi (nothing; it rides along with the recipient's next turn). Empty means the text decides.
+	Kind string `json:"kind,omitempty"`
 	// Paths names files in the sender's workspace (send) or the files to take from a message's change (import).
 	Paths []string `json:"paths,omitempty"`
 	// Message is the id of the message whose change to import (import only).
@@ -426,7 +430,7 @@ func initialize(params json.RawMessage) (any, *rpcError) {
 func toolDescriptor() map[string]any {
 	return map[string]any{
 		"name":        toolName,
-		"description": "Relo agent messaging. Use your own capability key. action: list (agents), send (to, text; optionally paths: files you changed that the recipient may choose to import), inbox (your messages), import (message id, optionally paths: copy files from a message's change into your own workspace).",
+		"description": "Relo agent messaging. Use your own capability key. action: list (agents), send (to, text, kind; optionally paths: files you changed that the recipient may choose to import), inbox (your messages), import (message id, optionally paths: copy files from a message's change into your own workspace), ask (Primary only; text: one question about the code; a reader answers with citations Relo checked). kind: ask = you need an answer, blocked = you cannot go on, deviation = a fact in your task is wrong, fyi = nothing is needed from the recipient.",
 		"inputSchema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -437,7 +441,12 @@ func toolDescriptor() map[string]any {
 				},
 				"action": map[string]any{
 					"type": "string",
-					"enum": []string{"list", "send", "inbox"},
+					"enum": []string{"list", "send", "inbox", "import", "ask"},
+				},
+				"kind": map[string]any{
+					"type":        "string",
+					"enum":        []string{"ask", "blocked", "deviation", "fyi"},
+					"description": "What a send needs from the recipient. Default: ask if the text is a question, else fyi",
 				},
 				"to": map[string]any{
 					"type":        "string",
@@ -475,6 +484,7 @@ type toolArguments struct {
 	Action  string   `json:"action"`
 	To      string   `json:"to"`
 	Text    string   `json:"text"`
+	Kind    string   `json:"kind"`
 	Paths   []string `json:"paths"`
 	Message string   `json:"message"`
 }
@@ -522,16 +532,25 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	}
 	switch args.Action {
 	case "list", "inbox":
+	case "ask":
+		if strings.TrimSpace(args.Text) == "" {
+			return nil, invalidParams("text is required for ask")
+		}
 	case "send":
 		if args.To == "" {
 			return nil, invalidParams("to is required for send")
+		}
+		switch args.Kind {
+		case "", "ask", "blocked", "deviation", "fyi":
+		default:
+			return nil, invalidParams("kind must be ask, blocked, deviation, or fyi")
 		}
 	case "import":
 		if args.Message == "" {
 			return nil, invalidParams("message is required for import")
 		}
 	default:
-		return nil, invalidParams("action must be list, send, inbox, or import")
+		return nil, invalidParams("action must be list, send, inbox, import, or ask")
 	}
 
 	out, err := s.invoke(ctx, Request{
@@ -539,6 +558,7 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 		Action:  args.Action,
 		To:      args.To,
 		Text:    args.Text,
+		Kind:    args.Kind,
 		Paths:   args.Paths,
 		Message: args.Message,
 	})
@@ -555,7 +575,11 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 // invoke runs the handler with a bounded deadline and converts panics into
 // tool errors so a faulty handler cannot crash the server.
 func (s *Server) invoke(ctx context.Context, req Request) (out any, err error) {
-	ctx, cancel := context.WithTimeout(ctx, handlerTimeout)
+	timeout := handlerTimeout
+	if req.Action == "ask" {
+		timeout = askTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	defer func() {
 		if recover() != nil {

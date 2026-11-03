@@ -101,7 +101,7 @@ func TestPeerWakeFailureAndCapsSettle(t *testing.T) {
 			c.mu.Lock()
 			c.sess.PeerWakes = tc.counts
 			c.mu.Unlock()
-			if _, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: target.ID, Text: "question"}); err != nil {
+			if _, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: target.ID, Text: "question", Kind: "ask"}); err != nil {
 				t.Fatal(err)
 			}
 			d := wakeDispatcher(c)
@@ -119,7 +119,7 @@ func TestPeerDiscardAndCancelledSettle(t *testing.T) {
 	for _, discard := range []bool{false, true} {
 		c, _, _, target, key := newPeerCoord(t)
 		c.Agents.Update(target.ID, func(a *agent.Agent) { a.Status = agent.Queued })
-		if _, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: target.ID, Text: "question"}); err != nil {
+		if _, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: target.ID, Text: "question", Kind: "ask"}); err != nil {
 			t.Fatal(err)
 		}
 		if discard {
@@ -155,8 +155,8 @@ func TestPeerWakeDeliveredAndPrimaryExcluded(t *testing.T) {
 	p := c.Agents.Create(agent.Agent{ID: "primary-done", Role: agent.Primary, Status: agent.Completed})
 	c.mu.Lock()
 	c.sess.PeerMessages = append(c.sess.PeerMessages,
-		PeerMessage{ID: "missed", From: sender.ID, To: target.ID, State: "delivered", Text: "question"},
-		PeerMessage{ID: "primary-message", From: sender.ID, To: p.ID, State: "delivered", Text: "question"})
+		PeerMessage{ID: "missed", From: sender.ID, To: target.ID, State: "delivered", Kind: "ask", Text: "question"},
+		PeerMessage{ID: "primary-message", From: sender.ID, To: p.ID, State: "delivered", Kind: "ask", Text: "question"})
 	c.mu.Unlock()
 	d := wakeDispatcher(c)
 	d.wakePeers()
@@ -170,7 +170,7 @@ func TestPeerWakeDeliveredAndPrimaryExcluded(t *testing.T) {
 func TestPeerSendToCancelledSettlesImmediately(t *testing.T) {
 	c, _, _, target, key := newPeerCoord(t)
 	c.Agents.Update(target.ID, func(a *agent.Agent) { a.Status = agent.Cancelled })
-	got, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: target.ID, Text: "question"})
+	got, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: target.ID, Text: "question", Kind: "ask"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestFinishedPairGetsOneWakeRound(t *testing.T) {
 	c.Agents.Update(sender.ID, func(a *agent.Agent) { a.Status = agent.Completed })
 	c.Agents.Update(target.ID, func(a *agent.Agent) { a.Status = agent.Completed })
 	c.mu.Lock()
-	c.sess.PeerMessages = append(c.sess.PeerMessages, PeerMessage{ID: "ask", From: sender.ID, To: target.ID, State: "delivered", Text: "question"})
+	c.sess.PeerMessages = append(c.sess.PeerMessages, PeerMessage{ID: "ask", From: sender.ID, To: target.ID, State: "delivered", Kind: "ask", Text: "question"})
 	c.mu.Unlock()
 	for pass := 0; pass < 3; pass++ {
 		d := wakeDispatcher(c)
@@ -241,7 +241,7 @@ func TestFinishedPairGetsOneWakeRound(t *testing.T) {
 func TestSettledMessagesNeverFillQueue(t *testing.T) {
 	c, _, _, target, key := newPeerCoord(t)
 	send := func() error {
-		_, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: target.ID, Text: "question"})
+		_, err := c.peerRequest(context.Background(), agentmsg.Request{Key: key, Action: "send", To: target.ID, Text: "question", Kind: "ask"})
 		return err
 	}
 	c.mu.Lock()

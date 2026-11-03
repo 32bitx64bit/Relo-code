@@ -182,6 +182,20 @@ func (d *dispatcher) wakePeers() {
 				messages = append(messages, m)
 			}
 		}
+		// A finished agent is woken only to answer. Messages that ask nothing are marked read and cost no model turn.
+		asked := messages[:0:0]
+		for _, m := range messages {
+			if needsReply(m.Kind, m.Text) {
+				asked = append(asked, m)
+				continue
+			}
+			for i := range c.sess.PeerMessages {
+				if c.sess.PeerMessages[i].ID == m.ID {
+					c.sess.PeerMessages[i].State, c.sess.PeerMessages[i].Reason = "read", "asked nothing, so the finished agent was not woken"
+				}
+			}
+		}
+		messages = asked
 		if len(messages) == 0 {
 			c.mu.Unlock()
 			continue

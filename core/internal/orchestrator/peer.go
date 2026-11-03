@@ -27,10 +27,12 @@ const maxPeerMessages = 256
 // PeerMessage is coordination evidence, never a user instruction or permission grant.
 // "injected" means admitted by the runtime for a later step, not that a model has read it.
 type PeerMessage struct {
-	ID      string    `json:"id"`
-	From    string    `json:"from"`
-	To      string    `json:"to"`
-	Text    string    `json:"text"`
+	ID   string `json:"id"`
+	From string `json:"from"`
+	To   string `json:"to"`
+	Text string `json:"text"`
+	// Kind is what the sender said it needs: ask, blocked, deviation or fyi. Empty leaves it to needsReply.
+	Kind    string    `json:"kind,omitempty"`
 	State   string    `json:"state"`
 	Reason  string    `json:"reason,omitempty"`
 	ReplyTo string    `json:"replyTo,omitempty"`
@@ -131,6 +133,20 @@ func (c *Coord) revokePeer(agentID string) {
 	c.mu.Unlock()
 }
 
+// needsReply reports whether a message asks something of its recipient: an answer, or action on a blocker or a wrong
+// fact. Everything else (progress, results, acknowledgements) is for the record: it rides along with the recipient's
+// next turn but does not start one. In a Pixels at War run 100 of the Primary's 123 turns were woken by worker
+// messages, most of them progress dumps and "Acknowledged" replies. Without a kind, a question is the only ask.
+func needsReply(kind, text string) bool {
+	switch kind {
+	case "ask", "blocked", "deviation":
+		return true
+	case "fyi":
+		return false
+	}
+	return strings.Contains(text, "?")
+}
+
 func (c *Coord) peerRequest(ctx context.Context, req agentmsg.Request) (any, error) {
 	c.mu.Lock()
 	identity, ok := c.peerKeys[req.Key]
@@ -162,7 +178,9 @@ func (c *Coord) peerRequest(ctx context.Context, req agentmsg.Request) (any, err
 		sort.Slice(peers, func(i, j int) bool { return peers[i]["id"].(string) < peers[j]["id"].(string) })
 		return map[string]any{"self": a.ID, "peers": peers, "canvas": c.canvasStatus(a.Role)}, nil
 	case "send":
-		return c.sendPeer(ctx, identity, req.To, req.Text, req.Paths)
+		return c.sendPeer(ctx, identity, req.To, req.Text, req.Kind, req.Paths)
+	case "ask":
+		return c.ask(ctx, a, req.Text)
 	case "import":
 		return c.importPeer(identity, req.Message, req.Paths)
 	case "inbox":
@@ -194,7 +212,7 @@ func (c *Coord) peerRequest(ctx context.Context, req agentmsg.Request) (any, err
 	}
 }
 
-func (c *Coord) sendPeer(ctx context.Context, sender peerIdentity, to, text string, paths []string) (PeerMessage, error) {
+func (c *Coord) sendPeer(ctx context.Context, sender peerIdentity, to, text, kind string, paths []string) (PeerMessage, error) {
 	text = strings.TrimSpace(text)
 	if text == "" || len(text) > maxPeerText {
 		return PeerMessage{}, fmt.Errorf("message must contain 1 to %d bytes", maxPeerText)
@@ -258,7 +276,7 @@ func (c *Coord) sendPeer(ctx context.Context, sender peerIdentity, to, text stri
 			return PeerMessage{}, fmt.Errorf("session message queue is full; wait for recipients to read their inboxes")
 		}
 	}
-	m := PeerMessage{ID: id.New("peer"), From: sender.agent, To: to, Text: text, State: "queued", Created: time.Now().UTC(), Change: change}
+	m := PeerMessage{ID: id.New("peer"), From: sender.agent, To: to, Text: text, Kind: kind, State: "queued", Created: time.Now().UTC(), Change: change}
 	c.sess.PeerMessages = append(c.sess.PeerMessages, m)
 	c.mu.Unlock()
 	c.syncPeerContext(sender.session, to)
@@ -287,7 +305,7 @@ func (c *Coord) sendPeer(ctx context.Context, sender peerIdentity, to, text stri
 			m = c.peerState(sender.session, m.ID, m.State, m.Reason)
 		}
 	}
-	if target.Role == agent.Primary {
+	if target.Role == agent.Primary && needsReply(m.Kind, m.Text) {
 		c.wakeHead()
 	}
 	c.peerStatusNotices(sender.session)
@@ -416,6 +434,21 @@ func (c *Coord) peerPending(agentID string) bool {
 	if c.sess != nil {
 		for _, m := range c.sess.PeerMessages {
 			if m.To == agentID && (m.State == "queued" || m.State == "injected") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// peerNeedsHead reports whether a message waiting for agentID asks something of it. A reply is an answer to a
+// question the recipient asked, so it always counts. Messages that only inform wait for the next turn.
+func (c *Coord) peerNeedsHead(agentID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sess != nil {
+		for _, m := range c.sess.PeerMessages {
+			if m.To == agentID && (m.State == "queued" || m.State == "injected") && (m.ReplyTo != "" || needsReply(m.Kind, m.Text)) {
 				return true
 			}
 		}

@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"strings"
+	"time"
 
 	ctxeng "github.com/relocode/relo/internal/context"
 	"github.com/relocode/relo/internal/prompt"
@@ -140,6 +141,33 @@ func (c *Coord) ingestGuidanceWithSession(primaryID, text string, refs []string,
 	c.Engine.Ingest(primaryID, items)
 }
 
+// peerStepGap is the least time between two head turns that only sub agents' messages woke. The first message is
+// answered at once; the ones that arrive meanwhile wait and share one turn. Without it every worker report cost a
+// full head turn (fifteen near-identical ones in a single Pixels at War run), each slower than the work it answered.
+// It is a variable so tests can shorten it.
+var peerStepGap = 20 * time.Second
+
+// peerStepWait is how long the head must still wait before a turn woken by sub agent messages alone. It is zero when
+// the gap has passed. When it is not, one deferred wake is scheduled, so the waiting messages are not forgotten.
+func (c *Coord) peerStepWait() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	wait := peerStepGap - time.Since(c.peerStepEnd)
+	if wait <= 0 {
+		return 0
+	}
+	if !c.peerStepTimer {
+		c.peerStepTimer = true
+		time.AfterFunc(wait, func() {
+			c.mu.Lock()
+			c.peerStepTimer = false
+			c.mu.Unlock()
+			c.wakeHead()
+		})
+	}
+	return wait
+}
+
 // stepQueued gives the head one turn on guidance that arrived while it waited on its sub agents. The sub agents
 // are not cancelled and keep running: only the head steps.
 func (c *Coord) stepQueued(ctx context.Context) {
@@ -148,9 +176,20 @@ func (c *Coord) stepQueued(ctx context.Context) {
 	if !ok {
 		return
 	}
-	peer := c.peerPending(p.ID)
+	peer := c.peerNeedsHead(p.ID)
 	if text == "" && !peer {
 		return
+	}
+	if text == "" {
+		if c.peerStepWait() > 0 {
+			return
+		}
+		// The gap runs from the end of this turn, however it ends.
+		defer func() {
+			c.mu.Lock()
+			c.peerStepEnd = time.Now()
+			c.mu.Unlock()
+		}()
 	}
 	if text != "" {
 		c.ingestGuidance(p.ID, text, refs)
@@ -169,6 +208,7 @@ func (c *Coord) stepQueued(ctx context.Context) {
 		note = "\nA sub agent sent you a message while the sub agents work; it is with this prompt. It is not from the user, and the user has sent nothing new. Act on it only if it needs an answer or shows the plan is wrong, say briefly in userMessage what you did about it, and keep the sub agents going."
 	}
 	c.syncPeerContext(c.SessionID(), p.ID)
+	c.setRepoMap(p.ID)
 	settings := c.settings()
 	c.pinBlocks(p.ID)
 	if !settings.Memory {
@@ -187,7 +227,6 @@ func (c *Coord) stepQueued(ctx context.Context) {
 	// Guidance and peer turns refresh the context without re-listing candidates, so they make no memory decisions.
 	c.dropPresentedMemory()
 	turn, err := c.primaryTurn(ctx, p, parts, ask)
-	c.closeAgentSession(p.ID)
 	if err != nil {
 		c.logWarn("queued guidance turn", err)
 		c.reportFailure(p, failed, err)
