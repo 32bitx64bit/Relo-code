@@ -100,6 +100,38 @@ export function checkSessionId(id: unknown): string | undefined {
   return typeof id === "string" && SESSION_ID_RE.test(id) ? id : undefined;
 }
 
+// Caps mirror core memory.MaxTitle and memory.MaxBody (runes).
+export const MAX_MEMORY_TITLE = 120;
+export const MAX_MEMORY_BODY = 600;
+const MEMORY_ID_RE = /^[A-Za-z0-9_.-]{1,200}$/;
+
+export type MemoryAction = "update" | "promote" | "retire" | "delete";
+export type MemoryCheck = { action: MemoryAction; method: string; params: Record<string, unknown> };
+
+// A user memory write from the webview. Only the expected revision and the allowlisted fields are forwarded:
+// source, state and actor are never taken from the webview, core fills them. Promote is an update with an empty patch.
+export function checkMemoryMessage(msg: { type?: unknown; id?: unknown; revision?: unknown; title?: unknown; body?: unknown }): MemoryCheck | undefined {
+  if (typeof msg.id !== "string" || !MEMORY_ID_RE.test(msg.id)) return undefined;
+  if (typeof msg.revision !== "number" || !Number.isSafeInteger(msg.revision) || msg.revision < 1) return undefined;
+  const base = { id: msg.id, revision: msg.revision };
+  switch (msg.type) {
+    case "memory.update": {
+      if (typeof msg.title !== "string" || typeof msg.body !== "string") return undefined;
+      const title = msg.title.trim();
+      if (!title || [...title].length > MAX_MEMORY_TITLE || [...msg.body].length > MAX_MEMORY_BODY || !msg.body.trim()) return undefined;
+      return { action: "update", method: "memory.update", params: { ...base, patch: { title, body: msg.body } } };
+    }
+    case "memory.promote":
+      return { action: "promote", method: "memory.update", params: { ...base, patch: {} } };
+    case "memory.retire":
+      return { action: "retire", method: "memory.retire", params: base };
+    case "memory.delete":
+      return { action: "delete", method: "memory.delete", params: base };
+    default:
+      return undefined;
+  }
+}
+
 export function isAllowedCommand(id: unknown): id is string {
   return typeof id === "string" && COMMAND_ALLOWLIST.has(id);
 }

@@ -42,9 +42,9 @@ func TestRoleMatrix(t *testing.T) {
 		{agent.Primary, LevelOff, LevelOff, 24000, false, true},
 		{agent.Head, LevelLite, LevelOff, 12000, false, true},
 		{agent.Probe, LevelUltra, LevelOff, 6000, true, false},
-		{agent.Worker, LevelFull, LevelLite, 16000, false, false},
-		{agent.Debug, LevelFull, LevelLite, 16000, false, false},
-		{agent.Integration, LevelFull, LevelLite, 16000, false, false},
+		{agent.Worker, LevelFull, LevelLite, 16000, false, true},
+		{agent.Debug, LevelFull, LevelLite, 16000, false, true},
+		{agent.Integration, LevelFull, LevelLite, 16000, false, true},
 		{agent.Architect, LevelFull, LevelLite, 16000, false, true},
 		{agent.Test, LevelUltra, LevelOff, 8000, false, true},
 		{agent.Reviewer, LevelFull, LevelOff, 12000, false, false},
@@ -58,7 +58,7 @@ func TestRoleMatrix(t *testing.T) {
 		}
 	}
 	worker := Resolve(Prefs{Preset: "auto"}, agent.Worker, routing.Medium, 1, 0).Scope
-	if worker.MaxItemTokens != 2000 || !worker.DependencyReportsOnly || len(worker.Classes) != 4 {
+	if worker.MaxItemTokens != 2000 || !worker.DependencyReportsOnly || !worker.Memory || len(worker.Classes) != 5 {
 		t.Errorf("worker scope = %+v", worker)
 	}
 	hasFinding := false
@@ -73,6 +73,19 @@ func TestRoleMatrix(t *testing.T) {
 	probe := Resolve(Prefs{Preset: "auto"}, agent.Probe, routing.Medium, 1, 0).Scope
 	if !probe.ReadOnly || probe.Memory || !probe.DependencyReportsOnly {
 		t.Errorf("probe scope = %+v", probe)
+	}
+}
+
+func TestMemoryGatingIsTheSameInEveryPreset(t *testing.T) {
+	roles := []agent.Role{agent.Primary, agent.Head, agent.Probe, agent.Worker, agent.Architect, agent.Debug, agent.Test, agent.Integration, agent.Reviewer}
+	for _, preset := range []string{"", "off", "auto", "max"} {
+		for _, role := range roles {
+			got := Resolve(Prefs{Preset: preset}, role, routing.Medium, 1, 0).Scope.Memory
+			want := role != agent.Probe && role != agent.Reviewer
+			if got != want {
+				t.Errorf("preset %q role %q: Memory = %t, want %t", preset, role, got, want)
+			}
+		}
 	}
 }
 
@@ -113,8 +126,10 @@ func TestModifiers(t *testing.T) {
 
 func TestPresetsOverridesAndUnknownValues(t *testing.T) {
 	for _, preset := range []string{"", "off"} {
+		// No efficiency features, but memory still follows the role matrix: nothing is recalled without an opt-in,
+		// and a probe or reviewer never receives recalled memory.
 		r := Resolve(Prefs{Preset: preset}, agent.Worker, routing.Medium, 1, 777)
-		if r.Profile.ID() != "" || r.Profile.Fragment(agent.Worker) != "" || r.Scope.Budget != 777 || r.Scope.Memory || len(r.Scope.Classes) != 0 {
+		if r.Profile.ID() != "" || r.Profile.Fragment(agent.Worker) != "" || r.Scope.Budget != 777 || !r.Scope.Memory || len(r.Scope.Classes) != 0 {
 			t.Errorf("preset %q did not disable efficiency: %+v %+v", preset, r.Profile, r.Scope)
 		}
 	}

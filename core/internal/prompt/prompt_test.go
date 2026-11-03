@@ -134,7 +134,9 @@ func TestSchemaCapsAndRolePromptSizes(t *testing.T) {
 		}
 	}
 	roles := []agent.Role{agent.Primary, agent.Head, agent.Probe, agent.Architect, agent.Debug, agent.Worker, agent.Test, agent.Reviewer, agent.Integration}
-	before := map[agent.Role]int{agent.Primary: 6067, agent.Head: 1504, agent.Probe: 1862, agent.Architect: 2264, agent.Debug: 2604, agent.Worker: 2838, agent.Test: 1543, agent.Reviewer: 1835, agent.Integration: 2279}
+	// Primary rose from 6067 to 6157 when memoryActions was added (590-byte item 9). Autonomy rules (assume-and-proceed,
+	// head answers blocks first, fix obvious in-scope limitations) raised every role; the caps below hold them.
+	before := map[agent.Role]int{agent.Primary: 6242, agent.Head: 1627, agent.Probe: 1829, agent.Architect: 2430, agent.Debug: 2803, agent.Worker: 3172, agent.Test: 1510, agent.Reviewer: 1802, agent.Integration: 2445}
 	for _, role := range roles {
 		prompt := For(role)
 		t.Logf("role=%s bytes before=%d after=%d", role, before[role], len(prompt))
@@ -142,7 +144,7 @@ func TestSchemaCapsAndRolePromptSizes(t *testing.T) {
 			t.Errorf("%s prompt grew: %d > %d bytes", role, len(prompt), before[role])
 		}
 		// For already includes Shared; count what is actually sent rather than charging Shared twice.
-		if total := len(prompt); total > 6200 {
+		if total := len(prompt); total > 6300 {
 			t.Errorf("%s prompt too large: %d chars", role, total)
 		}
 	}
@@ -238,6 +240,23 @@ func TestWorkersAreToldToRunOnlyTheTestsTheyChanged(t *testing.T) {
 		if strings.Contains(For(role), "Never run the whole suite") {
 			t.Errorf("%s was given a rule about running tests that is not its job", role)
 		}
+	}
+}
+
+func TestAgentsAssumeAndProceedAndFixObviousLimits(t *testing.T) {
+	for _, role := range []agent.Role{agent.Worker, agent.Architect, agent.Debug, agent.Integration} {
+		p := For(role)
+		for _, rule := range []string{"Assume and proceed", "record it as an assumption", "destructive or irreversible actions", "credentials or secrets", "provider/quota/billing"} {
+			if !strings.Contains(p, rule) {
+				t.Errorf("%s is not told to assume and proceed: missing %q", role, rule)
+			}
+		}
+	}
+	if !strings.Contains(For(agent.Worker), "Fix obvious limitations, edge cases and TODOs inside your assigned files and scope") {
+		t.Error("worker is not told to fix obvious in-scope limitations")
+	}
+	if !strings.Contains(Primary, "Answer it yourself first via resolvedBlocks") {
+		t.Error("Primary is not told to answer worker blocks itself before the user")
 	}
 }
 

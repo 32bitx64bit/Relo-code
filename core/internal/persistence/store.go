@@ -46,7 +46,7 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}
-	db, err := openDB(filepath.Join(root, "catalog.db"))
+	db, err := openCatalogDB(filepath.Join(root, "catalog.db"))
 	if err != nil {
 		if temporary {
 			os.RemoveAll(root)
@@ -58,12 +58,22 @@ func Open(path string) (*Store, error) {
 		s.Close()
 		return nil, err
 	}
+	// The guard is installed before the legacy import can run, so the import rewrites every memory row through the
+	// shared intake; older binaries cannot write a legacy payload into the table. The memory store installs the same
+	// triggers after its migration, so a catalog without memory.Open is still guarded.
+	if _, err := db.Exec(MemoryGuardSQL); err != nil {
+		s.Close()
+		return nil, err
+	}
 	if err := s.initLegacy(); err != nil {
 		s.Close()
 		return nil, err
 	}
 	return s, nil
 }
+
+// DB returns the catalog handle. Memory opens its workspace partition on it through memory.Open.
+func (s *Store) DB() *sql.DB { return s.db }
 
 func (s *Store) Close() error {
 	s.mu.Lock()
@@ -203,19 +213,17 @@ func (s *Store) migrateV2() error {
 func (s *Store) PutJSON(table, id, session string, extra string, v any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if table != "sessions" && table != "agents" && table != "tasks" && table != "findings" && table != "memory" && table != "changes" && table != "verification" && table != "reports" {
+	if table != "sessions" && table != "agents" && table != "tasks" && table != "findings" && table != "changes" && table != "verification" && table != "reports" {
 		return fmt.Errorf("unknown table %s", table)
 	}
 	if table == "sessions" {
 		session = id
 	}
 	db := s.db
-	if table != "memory" {
-		var err error
-		db, err = s.sessionDB(session)
-		if err != nil {
-			return err
-		}
+	var err error
+	db, err = s.sessionDB(session)
+	if err != nil {
+		return err
 	}
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -244,9 +252,6 @@ func (s *Store) PutJSON(table, id, session string, extra string, v any) error {
 	case "findings":
 		_, err = db.Exec(`INSERT INTO findings(id, session_id, payload, updated_at) VALUES(?,?,?,?)
 			ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`, id, session, string(b), now)
-	case "memory":
-		_, err = db.Exec(`INSERT INTO memory(id, workspace, payload, updated_at) VALUES(?,?,?,?)
-			ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`, id, extra, string(b), now)
 	case "changes":
 		_, err = db.Exec(`INSERT INTO changes(id, session_id, payload, updated_at) VALUES(?,?,?,?)
 			ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`, id, session, string(b), now)
@@ -259,7 +264,7 @@ func (s *Store) PutJSON(table, id, session string, extra string, v any) error {
 	default:
 		return fmt.Errorf("unknown table %s", table)
 	}
-	if err != nil || table == "memory" {
+	if err != nil {
 		return err
 	}
 	if table == "sessions" {
@@ -342,16 +347,13 @@ func (s *Store) Get(table, id string, dest any) error {
 	if !validTable(table) {
 		return fmt.Errorf("unknown table %s", table)
 	}
-	db := s.db
-	if table != "memory" {
-		session, err := s.resolveID(table, id)
-		if err != nil {
-			return err
-		}
-		db, err = s.sessionDB(session)
-		if err != nil {
-			return err
-		}
+	session, err := s.resolveID(table, id)
+	if err != nil {
+		return err
+	}
+	db, err := s.sessionDB(session)
+	if err != nil {
+		return err
 	}
 	q := "SELECT payload FROM " + table + " WHERE id=?"
 	var payload string
@@ -371,17 +373,11 @@ func (s *Store) List(table, session string) ([]json.RawMessage, error) {
 		return nil, fmt.Errorf("unknown table %s", table)
 	}
 	var rows *sql.Rows
-	var err error
-	db := s.db
-	if table != "memory" {
-		db, err = s.sessionDB(session)
-		if err != nil {
-			return nil, err
-		}
+	db, err := s.sessionDB(session)
+	if err != nil {
+		return nil, err
 	}
 	switch table {
-	case "memory":
-		rows, err = db.Query(`SELECT payload FROM memory WHERE workspace=? ORDER BY updated_at DESC`, session)
 	case "generations":
 		rows, err = db.Query(`SELECT payload FROM generations WHERE session_id=? ORDER BY agent_id, number`, session)
 	case "usage":
@@ -486,7 +482,9 @@ func (s *Store) DeleteSession(id string) error {
 
 func validTable(table string) bool {
 	switch table {
-	case "sessions", "agents", "tasks", "generations", "findings", "memory", "reports", "usage", "changes", "verification", "events":
+	// memory is deliberately absent: rows are written and read only through memory.Store, which enforces schema v2
+	// payloads, provenance and the revision CAS. The database guard below refuses any other writer.
+	case "sessions", "agents", "tasks", "generations", "findings", "reports", "usage", "changes", "verification", "events":
 		return true
 	default:
 		return false

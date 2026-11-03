@@ -3,7 +3,7 @@ import { createServer } from "node:net";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { decodeFrame, encodeFrame } from "./client";
-import { Events, emptyState, reduce, routingFrom, type CacheInfo } from "./protocol";
+import { Events, emptyState, reduce, routingFrom, upsertMemory, type CacheInfo } from "./protocol";
 
 test("encode/decode ipc frames", () => {
   const line = encodeFrame("session.create", { mode: "build" }, "1");
@@ -238,4 +238,19 @@ test("change records carry kind and line counts through the reducer", () => {
   const s = reduce(emptyState(), "changes.updated", [{ id: "c1", agentId: "a", taskId: "t", path: "a.ts", status: "proposed", kind: "added", added: 3, deleted: 0 }]);
   assert.equal(s.changes[0].kind, "added");
   assert.equal(s.changes[0].added, 3);
+});
+
+test("memory.updated upserts the fetched entry by id, drops deleted ids, and ignores older revisions", () => {
+  let s = emptyState();
+  const entry = (revision: number, title: string) => ({ id: "mem_1", revision, state: "verified", source: "user", title, body: "b" });
+  s = reduce(s, "memory.updated", { id: "mem_1", change: "updated", entry: entry(1, "first") });
+  s = reduce(s, "memory.updated", { id: "mem_1", change: "updated", entry: entry(3, "third") });
+  s = reduce(s, "memory.updated", { id: "mem_1", change: "updated", entry: entry(2, "late") });
+  assert.equal(s.memory.length, 1);
+  assert.equal((s.memory[0] as { title: string }).title, "third");
+  s = reduce(s, "memory.updated", { id: "mem_2", change: "candidate" });
+  assert.equal(s.memory.length, 1, "a notification without an entry changes nothing");
+  s = reduce(s, "memory.updated", { id: "mem_1", change: "deleted", revision: 4 });
+  assert.equal(s.memory.length, 0);
+  assert.deepEqual(upsertMemory([], { id: "", revision: 1 }), []);
 });

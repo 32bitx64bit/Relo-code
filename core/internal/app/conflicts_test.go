@@ -118,8 +118,15 @@ func TestResolveConflictsHandlesMissingTrees(t *testing.T) {
 				}
 				wantReason = "worktree is unavailable"
 			case "restart":
+				// The old manager is closed first, as a real restart does: its observers read Coord.WS.
+				if err := core.Coord.WS.Close(); err != nil {
+					t.Fatal(err)
+				}
 				core.Coord.WS = workspace.New(dir)
 			case "open failure":
+				if err := core.Coord.WS.Close(); err != nil {
+					t.Fatal(err)
+				}
 				core.Coord.WS = workspace.New(dir)
 				first.AgentID = "invalid/agent"
 				wantReason = "invalid agent id"

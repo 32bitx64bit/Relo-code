@@ -14,6 +14,7 @@ import (
 	"github.com/relocode/relo/internal/agent"
 	ctxeng "github.com/relocode/relo/internal/context"
 	"github.com/relocode/relo/internal/id"
+	"github.com/relocode/relo/internal/memory"
 	"github.com/relocode/relo/internal/metrics"
 	"github.com/relocode/relo/internal/prompt"
 	"github.com/relocode/relo/internal/routing"
@@ -639,10 +640,11 @@ func (c *Coord) seedPrimary(text string, refs []string) {
 	for _, ref := range refs {
 		items = append(items, ctxeng.Item{Class: ctxeng.ClassCode, Source: ctxeng.SourceRepo, Content: ref, Durability: 0.6})
 	}
+	// Recall replaces the previous turn's group, and is cleared when Settings.Memory is off, so nothing accumulates or
+	// survives a disabled flag.
+	c.refreshRecall(p.ID, s.Workspace, memory.RecallQuery{Text: text})
 	if settings.Memory {
-		for _, e := range c.Memory.Recall(text) {
-			items = append(items, ctxeng.Item{Class: ctxeng.ClassMemory, Source: ctxeng.SourceVerified, Title: staleMemory + e.Title, Content: e.Body, Files: e.Files, Verified: e.Verified, Durability: 0.8})
-		}
+		items = append(items, c.pendingMemoryItems()...)
 	}
 	c.Engine.Ingest(p.ID, items)
 }
@@ -666,6 +668,26 @@ func (c *Coord) syncPrimaryConversation(primaryID, text string, messages []Chat)
 		last = []ctxeng.Item{{Source: ctxeng.SourceSummary, Content: reply, Durability: 0.9}}
 	}
 	c.Engine.SetTaskState(primaryID, "Previous assistant reply", last)
+}
+
+// publishPrimaryReply keeps the next worker-only turn's conversation state current. Without new user input, an exact
+// repeat of any earlier assistant reply is stale output, so its streamed bubble is discarded instead of posted again.
+func (c *Coord) publishPrimaryReply(primaryID, text string, hasUserInput bool) {
+	if text == "" {
+		return
+	}
+	if !hasUserInput {
+		if s := c.Current(); s != nil {
+			for _, m := range s.Messages {
+				if m.Role == "assistant" && m.Text == text {
+					c.emit("chat.discard", map[string]any{"agentId": primaryID})
+					return
+				}
+			}
+		}
+	}
+	c.chat("assistant", text, primaryID)
+	c.Engine.SetTaskState(primaryID, "Previous assistant reply", []ctxeng.Item{{Source: ctxeng.SourceSummary, Content: text, Durability: 0.9}})
 }
 
 // primaryHistory reads the transcript for the Primary's canonical user-side context. first is the earliest delivered
@@ -722,6 +744,10 @@ func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text strin
 			text = queued
 		}
 	}
+	if text == "" {
+		// Worker and peer wakes are not user input; the last answered request must not remain the latest user message.
+		c.Engine.SetTaskState(primary.ID, "Latest user message", nil)
+	}
 	resolvedPrimary := style.Resolve(settings.Efficiency, primary.Role, primary.Difficulty, primary.Attempt, settings.Budget)
 	primaryBudget := settings.Budget
 	if resolvedPrimary.Scope.Budget != 0 {
@@ -744,9 +770,7 @@ func (c *Coord) loopPrimary(ctx context.Context, primary agent.Agent, text strin
 	if err != nil {
 		return err
 	}
-	if turn.UserMessage != "" {
-		c.chat("assistant", turn.UserMessage, primary.ID)
-	}
+	c.publishPrimaryReply(primary.ID, turn.UserMessage, text != "")
 	c.applyTurn(primary, turn, text)
 	if len(turn.Tasks) > 0 {
 		c.primaryWaits()
@@ -773,6 +797,7 @@ func (c *Coord) honorRefreshSelf(agentID string, turn Turn) {
 	if !turn.RefreshSelf {
 		return
 	}
+	c.relistMemory(agentID)
 	if _, err := c.Engine.Refresh(agentID, "primary requested refresh"); err != nil {
 		c.logWarn("refresh primary context", err)
 		return
@@ -802,6 +827,9 @@ func (c *Coord) applyTurn(primary agent.Agent, turn Turn, userText ...string) {
 	}
 	// Answers come before admission, so a family whose question is answered here can be planned in this same turn.
 	c.applyResolvedBlocks(turn.ResolvedBlocks, userText...)
+	if err := c.applyMemoryActions(primary.ID, turn.MemoryActions); err != nil {
+		c.logWarn("memory actions", err)
+	}
 	c.pinBlocks(primary.ID)
 	c.setConstraints(turn.Constraints)
 	idmap := map[string]string{}
@@ -1128,6 +1156,62 @@ func (c *Coord) unresolvedFamilies() map[string]bool {
 	return families
 }
 
+// errNotPrimary refuses a memory decision from any agent but the Primary: workers propose, only the head decides.
+var errNotPrimary = errors.New("only the primary may decide memory candidates")
+
+// applyMemoryActions applies the head's decisions on pending agent candidates through the head gate. Only the Primary
+// may decide; any other agent is refused with errNotPrimary and nothing changes. Nothing applies while Settings.Memory
+// is off. A refused decision (stale revision, quota, unsafe or missing evidence) is logged and skipped, not fatal.
+func (c *Coord) applyMemoryActions(agentID string, actions []MemoryAction) error {
+	if p, ok := c.Agents.Primary(); !ok || p.ID != agentID {
+		return errNotPrimary
+	}
+	// The listing this turn was built from is spent here, so a replayed decision finds nothing presented.
+	presented := c.takePresentedMemory()
+	if len(actions) == 0 {
+		return nil
+	}
+	if !c.settings().Memory {
+		return nil
+	}
+	turnID := id.New("turn")
+	for _, m := range actions {
+		e, err := c.decideMemory(m, presented, turnID)
+		if err != nil {
+			c.logWarn("memory "+m.Op, err)
+			continue
+		}
+		c.emit("memory.updated", map[string]any{"id": e.ID, "revision": e.Revision, "change": m.Op})
+	}
+	return nil
+}
+
+// proposeMemory records a worker completion as a candidate. The candidate is never verified here: core stamps agent
+// source and candidate state, and the only evidence is the check run that core itself observed (ran, passed).
+func (c *Coord) proposeMemory(a agent.Agent, title, body string, files []string) {
+	s := c.Current()
+	if s == nil {
+		return
+	}
+	var evidence []memory.Evidence
+	// The candidate cites the agent's own latest check record by its result ID. A record whose command memory cannot
+	// hold is not cited, so the candidate stays unpromotable instead of being refused whole.
+	if v, ok := c.latestCheck(a.ID, s); ok && memory.ValidEvidenceCommand(v.Command) {
+		res := memory.ResultFailed
+		if v.Status == "passed" {
+			res = memory.ResultPassed
+		}
+		evidence = append(evidence, memory.Evidence{Type: memory.EvidenceCommandResult, SessionID: s.ID, AgentID: a.ID,
+			Ref: v.ID, Command: v.Command, ObservedAt: time.Now().UTC(), Result: res})
+	}
+	e, err := c.Memory.ProposeCandidate(memory.Entry{Kind: "fact", Title: title, Body: body, Files: files, Evidence: evidence})
+	if err != nil {
+		c.logWarn("propose memory candidate", err)
+		return
+	}
+	c.emit("memory.updated", map[string]any{"agentId": a.ID, "id": e.ID, "revision": e.Revision, "change": "candidate"})
+}
+
 // applyResolvedBlocks records the user's answers on the tasks waiting for them. Unknown ids, empty answers and tasks
 // already answered are ignored.
 func (c *Coord) applyResolvedBlocks(answers []ResolvedBlock, userText ...string) {
@@ -1264,7 +1348,7 @@ func (c *Coord) pinBlocks(primaryID string) {
 		if len(t.Paths) > 0 {
 			where = " Its paths: " + strings.Join(t.Paths, ", ") + "."
 		}
-		items = append(items, ctxeng.Item{Source: ctxeng.SourceSystem, Kind: ctxeng.KindConstraint, Content: fmt.Sprintf("WAIT FOR USER: task %s (%q) is blocked, unanswered: %s.%s Do not replan, cancel, replace or work around it, and do not plan tasks that share its family or paths or depend on it: core refuses them. Work that is disjoint from it may continue. Return resolvedBlocks [{taskId,answer,answeredBy,cite}] only with authorized evidence; provider and quota questions require the user.", t.ID, t.Title, t.BlockedOn.Question, where), Durability: 1, Relevance: 1, Pinned: true})
+		items = append(items, ctxeng.Item{Source: ctxeng.SourceSystem, Kind: ctxeng.KindConstraint, Content: fmt.Sprintf("WAIT FOR USER: task %s (%q) is blocked, unanswered: %s.%s Do not replan, cancel, replace or work around it, and do not plan tasks that share its family or paths or depend on it: core refuses them. Work that is disjoint from it may continue. Answer it yourself first via resolvedBlocks [{taskId,answer,answeredBy,cite}] when cited evidence decides it; provider, quota and credential questions and destructive actions require the user.", t.ID, t.Title, t.BlockedOn.Question, where), Durability: 1, Relevance: 1, Pinned: true})
 	}
 	c.Engine.SetTaskState(primaryID, "Unresolved questions", items)
 }
@@ -1310,7 +1394,13 @@ func (c *Coord) surfaceBlocks() {
 	}
 }
 
-func (c *Coord) primaryTurn(ctx context.Context, primary agent.Agent, parts prompt.Parts, ask string) (Turn, error) {
+func (c *Coord) primaryTurn(ctx context.Context, primary agent.Agent, parts prompt.Parts, ask string) (_ Turn, err error) {
+	// A failed turn applies no decisions, so the listing it was built on is dropped rather than spent by a later turn.
+	defer func() {
+		if err != nil {
+			c.dropPresentedMemory()
+		}
+	}()
 	body, err := c.runAgent(ctx, primary, parts, ask, prompt.PrimarySchemaFor(c.artOn()))
 	if err != nil {
 		return Turn{}, err
@@ -1330,6 +1420,8 @@ func (c *Coord) primaryTurn(ctx context.Context, primary agent.Agent, parts prom
 	if strayCall {
 		repair = "Your last reply was tool-call markup, not an executed tool. You have no repository tools; use relo_agents or relo_canvas only if offered. Reply with the JSON turn: what was done in userMessage, and tasks [] when nothing is left to do."
 	}
+	// A repaired turn is a new reply to a listing it did not read in full: its decisions are not applied.
+	c.dropPresentedMemory()
 	body, err = c.runAgent(ctx, primary, parts, repair, prompt.PrimarySchemaFor(c.artOn()))
 	if err != nil {
 		return Turn{}, err
@@ -1467,8 +1559,18 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 	queued, refs, hasQueued := c.takeQueued(c.SessionID())
 	if hasQueued {
 		c.ingestGuidance(p.ID, queued, refs)
+	} else {
+		c.Engine.SetTaskState(p.ID, "Latest user message", nil)
 	}
 	c.pinBlocks(p.ID)
+	c.relistMemory(p.ID)
+	// Recall is recomputed for this integration turn: worker output changes what is relevant, and a flag turned off since
+	// the last turn must not leave recalled memory in the prompt.
+	if s := c.Current(); s != nil {
+		c.refreshRecall(p.ID, s.Workspace, c.integrationRecallQuery(s))
+	} else {
+		c.Engine.SetRecall(p.ID, nil)
+	}
 	gen, err := c.Engine.Refresh(p.ID, "collapse completed worker reports")
 	if err != nil {
 		c.logWarn("refresh primary after workers", err)
@@ -1488,9 +1590,7 @@ func (c *Coord) repromptPrimary(ctx context.Context) {
 		c.reportFailure(p, "Primary could not integrate the results", err)
 		return
 	}
-	if turn.UserMessage != "" {
-		c.chat("assistant", turn.UserMessage, p.ID)
-	}
+	c.publishPrimaryReply(p.ID, turn.UserMessage, hasQueued)
 	c.applyTurn(p, turn, queued)
 	c.honorRefreshSelf(p.ID, turn)
 }

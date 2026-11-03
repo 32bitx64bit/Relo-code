@@ -68,6 +68,9 @@ type Manager struct {
 	vwsAbsent    bool // Git holds no virtual workspaces, so a worktree-mode run never opens the engine
 	notify       func(kind, message string)
 	observer     func(vws.Event)
+	closeMu      sync.Mutex     // guards closed; a leaf lock, so it may be taken while vmu is held
+	closed       bool           // set by Close; the engine never reopens after it
+	observers    sync.WaitGroup // observer calls in flight; Close waits for them
 	recovered    vws.RecoverReport
 	fallbackSeen map[string]bool
 }

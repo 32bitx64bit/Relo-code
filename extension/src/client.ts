@@ -3,6 +3,11 @@ import { EventEmitter } from "node:events";
 import * as readline from "node:readline";
 import { PROTOCOL_VERSION, type Frame } from "./protocol";
 
+// The core's error code (conflict, not_found, ...) stays on the Error so callers can branch on it.
+export function rpcError(error: { code?: string; message?: string } | undefined): Error & { code?: string } {
+  return Object.assign(new Error(error?.message ?? "error"), { code: error?.code });
+}
+
 export class CoreClient extends EventEmitter {
   private child?: ChildProcessWithoutNullStreams;
   private seq = 0;
@@ -66,7 +71,7 @@ export class CoreClient extends EventEmitter {
       const p = this.pending.get(f.id);
       if (!p) return;
       this.pending.delete(f.id);
-      if (f.kind === "err") p.reject(new Error(f.error?.message ?? "error"));
+      if (f.kind === "err") p.reject(rpcError(f.error));
       else p.resolve(f.result);
     }
   }

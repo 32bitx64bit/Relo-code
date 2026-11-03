@@ -97,20 +97,22 @@ func TmpDir(root string) string {
 
 // EnsureTmp creates the temp directory inside OpenCode's private root, before a child is started with it, and
 // marks it live for pid. Two cores can share a state root, so the marker is how the other one tells this core's temp
-// files from a dead core's leftover.
-func EnsureTmp(root string, pid int) error {
+// files from a dead core's leftover. It returns the marker to hand to UnmarkTmp.
+func EnsureTmp(root string, pid int) (int, error) {
 	if root == "" {
-		return nil
+		return pid, nil
 	}
-	return tempdir.Mark(TmpDir(root), pid)
+	return tempdir.MarkUnique(TmpDir(root), pid)
 }
 
-// UnmarkTmp drops pid's live marker from OpenCode's private temp directory once this core has no child left.
-func UnmarkTmp(root string, pid int) error {
+// UnmarkTmp drops the marker EnsureTmp returned for pid from OpenCode's private temp directory once this core has no
+// child left. The marker is the one returned, not pid itself: several cores in one process share the directory and
+// each drops only its own.
+func UnmarkTmp(root string, marker int) error {
 	if root == "" {
 		return nil
 	}
-	return tempdir.Unmark(TmpDir(root), pid)
+	return tempdir.UnmarkUnique(TmpDir(root), marker)
 }
 
 // StaleTmpDirs lists the entries of OpenCode's private temp directory that a sweep may remove: the live markers are

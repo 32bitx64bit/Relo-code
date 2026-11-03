@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
-import { CORE_SETTING_SECTIONS, checkCommand, checkQuestionMessage, checkSessionId, checkSetting, isAllowedCommand, modelsSignature, settingsReply, type SettingsSchema } from "./settingsBridge";
+import { CORE_SETTING_SECTIONS, checkCommand, checkMemoryMessage, checkQuestionMessage, checkSessionId, checkSetting, isAllowedCommand, modelsSignature, settingsReply, type SettingsSchema } from "./settingsBridge";
 import { emptyState, reduce } from "./protocol";
 
 const schema: SettingsSchema = {
@@ -254,4 +254,30 @@ test("art limit settings accept 0 as unlimited and survive the bridge", () => {
   assert.equal(checkSetting("relo.art.sessionJobLimit", 100001, actual).ok, false);
   assert.ok(source.includes('sessionJobLimit: c.get<number>("art.sessionJobLimit", 25)'));
   assert.ok(CORE_SETTING_SECTIONS.includes("relo.art.sessionJobLimit") || CORE_SETTING_SECTIONS.includes("relo.art"));
+});
+
+// Webview input is untrusted and may carry extra fields, so the test widens the validator input on purpose.
+const wire = (o: Record<string, unknown>) => checkMemoryMessage(o as Parameters<typeof checkMemoryMessage>[0]);
+
+test("memory messages: only the expected revision and allowlisted fields reach core", () => {
+  const id = "mem_abc123";
+  assert.deepEqual(wire({ type: "memory.update", id, revision: 3, title: " Title ", body: "<b>body</b>", source: "agent", state: "verified" }), {
+    action: "update", method: "memory.update", params: { id, revision: 3, patch: { title: "Title", body: "<b>body</b>" } },
+  });
+  assert.deepEqual(wire({ type: "memory.promote", id, revision: 2, source: "agent" }), { action: "promote", method: "memory.update", params: { id, revision: 2, patch: {} } });
+  assert.deepEqual(wire({ type: "memory.retire", id, revision: 2, actor: "agent" }), { action: "retire", method: "memory.retire", params: { id, revision: 2 } });
+  assert.deepEqual(wire({ type: "memory.delete", id, revision: 9 }), { action: "delete", method: "memory.delete", params: { id, revision: 9 } });
+});
+
+test("memory messages: bad ids, revisions, sizes and types are dropped", () => {
+  const id = "mem_abc123";
+  assert.equal(wire({ type: "memory.retire", id: "../x", revision: 1 }), undefined);
+  assert.equal(wire({ type: "memory.retire", id, revision: 0 }), undefined);
+  assert.equal(wire({ type: "memory.retire", id, revision: "2" }), undefined);
+  assert.equal(wire({ type: "memory.retire", id, revision: 1.5 }), undefined);
+  assert.equal(wire({ type: "memory.update", id, revision: 1, title: "   ", body: "b" }), undefined);
+  assert.equal(wire({ type: "memory.update", id, revision: 1, title: "t".repeat(121), body: "b" }), undefined);
+  assert.equal(wire({ type: "memory.update", id, revision: 1, title: "t", body: "x".repeat(601) }), undefined);
+  assert.equal(wire({ type: "memory.update", id, revision: 1, title: "t", body: "  " }), undefined);
+  assert.equal(wire({ type: "memory.create", id, revision: 1 }), undefined);
 });

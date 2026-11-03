@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,7 +20,6 @@ import (
 	"github.com/relocode/relo/internal/art"
 	"github.com/relocode/relo/internal/claudecode"
 	ctxeng "github.com/relocode/relo/internal/context"
-	"github.com/relocode/relo/internal/id"
 	"github.com/relocode/relo/internal/integration"
 	"github.com/relocode/relo/internal/ipc"
 	"github.com/relocode/relo/internal/logging"
@@ -83,6 +83,10 @@ type App struct {
 	decisionMu sync.Mutex // serialises change decisions for the current session
 	vwMu       sync.Mutex // serialises mirroring of virtual workspaces into the store
 	cleanupMu  sync.Mutex // serialises worktree discard and release outside decisionMu
+	// tmpMu guards tmpMarker: the live marker this core holds in OpenCode's private temp dir, so its Close drops only
+	// its own and leaves the marker of another core in the same process.
+	tmpMu     sync.Mutex
+	tmpMarker int
 	// cleanupHoldMu guards cleanupHolds. A rejected agent is held here from the decision until its blob is
 	// retained, so a concurrent accept cannot release the worktree in between.
 	cleanupHoldMu sync.Mutex
@@ -214,6 +218,13 @@ func New(cfg Config, log *logging.Logger) (*App, error) {
 		return nil, err
 	}
 	a := &App{Cfg: cfg, Log: log, Store: store, Coord: orchestrator.New(log)}
+	mem, rep, memErr := memory.Open(store.DB(), cfg.Workspace)
+	a.Coord.Memory = mem
+	if memErr != nil {
+		log.Error("project memory unavailable; reads are empty and writes fail until fixed", map[string]any{"error": memErr.Error()})
+	} else if rep.Migrated+rep.Scrubbed > 0 {
+		log.Info("project memory migrated to v2", map[string]any{"candidates": rep.Migrated, "scrubbed": rep.Scrubbed})
+	}
 	a.Coord.ResolveChanges = a.resolveHeadChanges
 	// Canvas calls are audited in the event log with metadata only: the raw payloads stay out of the log.
 	a.Coord.SetCanvasAudit(a.logCanvasAudit)
@@ -397,22 +408,76 @@ func (a *App) Handle(method string, params json.RawMessage) (any, error) {
 		agentID := str(p, "agentId", "")
 		for _, it := range a.Coord.Engine.SnapshotPool(agentID) {
 			if it.ID == item {
-				a.Coord.Memory.Upsert(memFrom(it))
+				e, err := a.Coord.Memory.UserPromote(memFrom(it))
+				if err != nil {
+					return nil, memFail(err)
+				}
 				a.Coord.Notify("context.item.promoted", it)
-				a.Coord.Notify("memory.updated", it)
-				return it, nil
+				a.Coord.Notify("memory.updated", memChange(e, "created"))
+				return e, nil
 			}
 		}
 		return nil, ipc.Fail{C: "not_found", M: "item not found"}
 	case "findings.list":
 		return a.Coord.Engine.Findings(), nil
 	case "memory.list":
-		return a.Coord.Memory.List(), nil
+		items, err := a.Coord.Memory.Load()
+		if err != nil {
+			return nil, memFail(err)
+		}
+		return items, nil
+	case "memory.get":
+		e, ok := a.Coord.Memory.Get(str(p, "id", ""))
+		if !ok {
+			return nil, ipc.Fail{C: "not_found", M: "memory entry not found"}
+		}
+		return e, nil
 	case "memory.update":
-		e := a.Coord.Memory.Upsert(memFromParams(p))
+		rev, ok := memRevision(p)
+		if !ok {
+			return nil, ipc.Fail{C: "invalid_params", M: "revision is required"}
+		}
+		id := str(p, "id", "")
+		pt, ok := memPatch(p)
+		if !ok {
+			return nil, ipc.Fail{C: "invalid_params", M: "patch must set title or body"}
+		}
+		cur, found := a.Coord.Memory.Get(id)
+		if !found {
+			return nil, ipc.Fail{C: "not_found", M: "memory entry not found"}
+		}
+		if memNoop(cur, pt) {
+			return nil, ipc.Fail{C: "invalid_params", M: "patch does not change the entry"}
+		}
+		e, err := a.Coord.Memory.UserUpdate(id, rev, pt)
+		if err != nil {
+			return nil, memFail(err)
+		}
+		a.Coord.Notify("memory.updated", memChange(e, "updated"))
+		return e, nil
+	case "memory.retire":
+		rev, ok := memRevision(p)
+		if !ok {
+			return nil, ipc.Fail{C: "invalid_params", M: "revision is required"}
+		}
+		e, err := a.Coord.Memory.UserRetire(str(p, "id", ""), rev)
+		if err != nil {
+			return nil, memFail(err)
+		}
+		a.Coord.Notify("memory.updated", memChange(e, "retired"))
 		return e, nil
 	case "memory.delete":
-		return map[string]any{"ok": a.Coord.Memory.Delete(str(p, "id", ""))}, nil
+		rev, ok := memRevision(p)
+		if !ok {
+			return nil, ipc.Fail{C: "invalid_params", M: "revision is required"}
+		}
+		id := str(p, "id", "")
+		stored, err := a.Coord.Memory.UserDeleteRevision(id, rev)
+		if err != nil {
+			return nil, memFail(err)
+		}
+		a.Coord.Notify("memory.updated", map[string]any{"id": id, "revision": stored, "change": "deleted"})
+		return map[string]any{"ok": true}, nil
 	case "changes.list":
 		a.projectPaths(a.proposedPaths())
 		if s := a.Coord.Current(); s != nil {
@@ -875,10 +940,7 @@ func (a *App) startRuntime(ctx context.Context) (runtime.Health, error) {
 	if err != nil {
 		return fallback(err)
 	}
-	if err := opencode.EnsureTmp(a.stateRoot(), os.Getpid()); err != nil {
-		// Without its temp directory a child's go build and mktemp fail; the shared temp dir is the fallback.
-		a.Log.Warn("open code temp dir", map[string]any{"error": err.Error()})
-	}
+	a.holdStateTmpMarker(a.stateRoot())
 	env = append(env, opencode.Isolation(a.stateRoot())...)
 	proc, err := opencode.Start(ctx, bin, a.Cfg.Workspace, env)
 	if err != nil {
@@ -992,9 +1054,6 @@ func (a *App) persistLocked() {
 	for _, f := range a.Coord.Engine.Findings() {
 		a.putJSON("findings", f.ID, s.ID, "", f)
 	}
-	for _, e := range a.Coord.Memory.List() {
-		a.putJSON("memory", e.ID, "", s.Workspace, e)
-	}
 	for _, ch := range s.Changes {
 		a.putJSON("changes", ch.ID, s.ID, "", ch)
 	}
@@ -1088,16 +1147,6 @@ func (a *App) restoreSession(sessionID string) {
 	}
 	if s.Usage == nil { // omitempty drops an empty map on save; a stored usage record would panic on write
 		s.Usage = map[string]any{}
-	}
-	if raws, err := a.Store.List("memory", s.Workspace); err == nil {
-		for _, raw := range raws {
-			var e memory.Entry
-			if json.Unmarshal(raw, &e) == nil {
-				a.Coord.Memory.Upsert(e)
-			}
-		}
-	} else {
-		a.Log.Error("restore memory failed", map[string]any{"workspace": s.Workspace, "error": err.Error()})
 	}
 	if raws, err := a.Store.List("changes", sessionID); err == nil {
 		for _, raw := range raws {
@@ -1375,14 +1424,102 @@ func num(m map[string]any, k string, def float64) float64 {
 }
 
 func memFrom(it ctxeng.Item) memory.Entry {
-	return memory.Entry{ID: id.New("mem"), Kind: it.Kind, Title: it.Title, Body: it.Content, Files: it.Files, Verified: it.Verified, Score: it.Durability, Source: string(it.Source)}
+	return memory.Entry{Kind: memory.NormalizeKind(it.Kind), Title: it.Title, Body: it.Content, Files: it.Files}
 }
 
-func memFromParams(p map[string]any) memory.Entry {
-	files, _ := p["files"].([]any)
-	var fs []string
-	for _, f := range files {
-		fs = append(fs, fmt.Sprint(f))
+// memPatch takes only the fields the caller sent; absent fields keep their stored value.
+// memRevision reads the revision a memory write must carry. It has to be a positive integer JSON number; a missing,
+// fractional or non-numeric value is refused rather than read as zero.
+func memRevision(p map[string]any) (int64, bool) {
+	f, ok := p["revision"].(float64)
+	if !ok || f < 1 || f != math.Trunc(f) {
+		return 0, false
 	}
-	return memory.Entry{ID: str(p, "id", ""), Kind: str(p, "kind", "note"), Title: str(p, "title", ""), Body: str(p, "body", ""), Files: fs, Verified: false}
+	return int64(f), true
+}
+
+// memPatch reads the edit a memory.update caller sent. The protocol sends it nested under "patch" with title and body;
+// other patch fields are ignored. Top-level title/body/kind/files remain accepted for older callers. A nil field keeps
+// the stored value. The bool is false when the caller sent no editable field at all.
+func memPatch(p map[string]any) (memory.Patch, bool) {
+	var pt memory.Patch
+	src, nested := p["patch"].(map[string]any)
+	if !nested {
+		src = p
+	}
+	if v, ok := src["title"].(string); ok {
+		pt.Title = &v
+	}
+	if v, ok := src["body"].(string); ok {
+		pt.Body = &v
+	}
+	if !nested {
+		if v, ok := src["kind"].(string); ok {
+			pt.Kind = &v
+		}
+		if files, ok := src["files"].([]any); ok {
+			fs := []string{}
+			for _, f := range files {
+				fs = append(fs, fmt.Sprint(f))
+			}
+			pt.Files = &fs
+		}
+	}
+	return pt, pt.Kind != nil || pt.Title != nil || pt.Body != nil || pt.Files != nil
+}
+
+// memNoop reports whether the patch would leave the stored entry unchanged, so an empty edit is refused instead of
+// bumping the revision and telling the UI it saved something.
+func memNoop(cur memory.Entry, pt memory.Patch) bool {
+	if pt.Kind != nil && *pt.Kind != cur.Kind {
+		return false
+	}
+	if pt.Title != nil && *pt.Title != cur.Title {
+		return false
+	}
+	if pt.Body != nil && *pt.Body != cur.Body {
+		return false
+	}
+	if pt.Files != nil && !sameStrings(*pt.Files, cur.Files) {
+		return false
+	}
+	if pt.Symbols != nil && !sameStrings(*pt.Symbols, cur.Symbols) {
+		return false
+	}
+	return true
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// memChange is the memory.updated payload: identity and change only, never content.
+func memChange(e memory.Entry, change string) map[string]any {
+	return map[string]any{"id": e.ID, "revision": e.Revision, "change": change}
+}
+
+// memFail maps a memory error to the protocol error code. The message never carries entry content.
+func memFail(err error) error {
+	var conflict *memory.ConflictError
+	switch {
+	case errors.As(err, &conflict):
+		return ipc.Fail{C: "conflict", M: fmt.Sprintf("memory entry changed; current revision is %d", conflict.Current.Revision)}
+	case errors.Is(err, memory.ErrNotFound):
+		return ipc.Fail{C: "not_found", M: "memory entry not found"}
+	case errors.Is(err, memory.ErrInvalid):
+		return ipc.Fail{C: "invalid_params", M: "memory entry fails validation"}
+	case errors.Is(err, memory.ErrUnsafe):
+		return ipc.Fail{C: "unsafe_content", M: "memory entry rejected: contains content that must not be stored"}
+	case errors.Is(err, memory.ErrQuota):
+		return ipc.Fail{C: "storage_unavailable", M: "verified memory quota reached"}
+	}
+	return ipc.Fail{C: "storage_unavailable", M: "project memory is unavailable"}
 }

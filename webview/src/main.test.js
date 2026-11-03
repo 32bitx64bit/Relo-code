@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { md, submit, handleKeyDown, handleKeydown, isRunning } = require("./main.js");
+const { loadBrowser } = require("./browserHarness.js");
 
 test("question cards show options, custom answer, provenance and delegation", () => {
   const { questionCards, questionAnswerMessage } = require("./main.js");
@@ -965,4 +966,287 @@ test("settings page shows a Web group with every relo.web setting from package.j
   const defaults = Object.fromEntries(webKeys.map((k) => [k, props[k].default]));
   const html = settingsPageHtml({ schema, values: defaults, defaults, models: [] });
   for (const k of webKeys) assert.ok(html.includes(`data-key="${k}"`), `missing row for ${k}`);
+});
+
+const memUi0 = { editId: "", editRev: 0, title: "", body: "", stale: false, confirmId: "", confirmRev: 0, busy: "", focus: "", notice: null };
+const memEntries = [
+  { id: "mem_c", revision: 1, kind: "fact", state: "candidate", source: "agent", title: "Candidate", body: "c body" },
+  { id: "mem_v", revision: 4, kind: "command", state: "verified", source: "user", title: "Verified", body: "v body", verified: new Date().toISOString() },
+  { id: "mem_s", revision: 2, kind: "fact", state: "stale", source: "agent", title: "Stale", body: "s body", staleReason: "file changed" },
+  { id: "mem_r", revision: 3, kind: "fact", state: "retired", source: "legacy", title: "Retired", body: "r body" },
+];
+
+test("memory section groups entries by state with source, revision and freshness", () => {
+  const html = mainApi.drawerHtml("context", { memory: memEntries });
+  for (const heading of ["Awaiting head review (1)", "Verified (1)", "Stale (1)", "Retired (1)"]) assert.ok(html.includes(heading), heading);
+  assert.match(html, /your edit · r4 · Verified just now/);
+  assert.match(html, /Stale: file changed/);
+  assert.match(html, /earlier version · r3 · Retired/);
+  assert.match(html, /Waiting for head review/);
+  assert.match(html, /role="list" aria-labelledby="mem-group-verified"/);
+  assert.match(html, /aria-label="Edit memory: Verified"/);
+  assert.match(html, /aria-label="Promote memory: Candidate"/);
+  assert.match(html, /aria-label="Retire memory: Verified"/);
+  assert.doesNotMatch(html, /Promote memory: Verified/);
+  assert.doesNotMatch(html, /Promote memory: Stale/);
+  assert.doesNotMatch(html, /Retire memory: Retired/);
+  assert.match(html, /aria-label="Delete memory: Retired"/);
+});
+
+test("memory text is escaped: markup in title or body renders as literal text", () => {
+  const html = mainApi.drawerHtml("context", { memory: [{ id: "mem_x", revision: 1, kind: "fact", state: "verified", source: "user", title: '<img src=x onerror="alert(1)">', body: '<script>alert(1)</script> & "q"', verified: "" }] });
+  assert.ok(html.includes("&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;q&quot;"));
+  assert.ok(html.includes("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;"));
+  assert.doesNotMatch(html, /<script|<img src=x/);
+  const editing = mainApi.memorySection({ memory: [{ id: "mem_x", revision: 1, state: "verified", source: "user", title: "T", body: "<b>x</b>" }] }, { ...memUi0, editId: "mem_x", title: '"><svg onload=1>', body: "<i>draft</i>" });
+  assert.doesNotMatch(editing, /<svg|<b>x|<i>draft/);
+  assert.ok(editing.includes("&lt;i&gt;draft&lt;/i&gt;"));
+});
+
+test("memory paused copy shows only when relo.context.projectMemory is off, and actions stay available", () => {
+  const s = { memory: memEntries };
+  const off = mainApi.drawerHtml("context", s, { values: { "relo.context.projectMemory": false } });
+  assert.match(off, /Project memory is paused: relo.context.projectMemory is off/);
+  assert.match(off, /aria-label="Delete memory: Verified"/);
+  assert.doesNotMatch(mainApi.drawerHtml("context", s, { values: { "relo.context.projectMemory": true } }), /paused/);
+  assert.doesNotMatch(mainApi.drawerHtml("context", s, {}), /paused/);
+});
+
+test("memory edit: save sends the opened revision; a conflict keeps the draft and asks for a reload", () => {
+  const entry = { id: "mem_v", revision: 4, title: "Old", body: "old body", state: "verified", source: "user" };
+  const opened = mainApi.memoryStep(memUi0, "edit", "mem_v", entry);
+  assert.equal(opened.ui.editRev, 4);
+  assert.equal(opened.focus, "mem-title");
+  const saving = mainApi.memoryStep({ ...opened.ui, title: "New <b>", body: "<i>text</i>" }, "save", "mem_v", entry);
+  assert.deepEqual(saving.message, { type: "memory.update", id: "mem_v", revision: 4, title: "New <b>", body: "<i>text</i>" });
+  const failed = mainApi.memoryResult(saving.ui, { type: "memory.result", id: "mem_v", action: "update", ok: false, code: "conflict", message: "memory entry changed; current revision is 5" });
+  assert.equal(failed.ui.stale, true);
+  assert.equal(failed.ui.editId, "mem_v");
+  assert.equal(failed.ui.title, "New <b>");
+  assert.equal(failed.ui.notice.kind, "alert");
+  assert.match(failed.ui.notice.text, /nothing was saved/);
+  assert.equal(failed.focus, "mem-reload");
+  assert.equal(mainApi.memoryStep(failed.ui, "save", "mem_v", entry).message, undefined);
+  const html = mainApi.memorySection({ memory: [{ ...entry, revision: 5 }] }, failed.ui);
+  assert.match(html, /role="alert"/);
+  assert.match(html, /aria-label="Reload latest memory: Old"/);
+  const reloaded = mainApi.memoryStep(failed.ui, "reload", "mem_v", { ...entry, revision: 5, title: "Changed" });
+  assert.equal(reloaded.ui.editRev, 5);
+  assert.equal(reloaded.ui.stale, false);
+  assert.equal(reloaded.ui.title, "Changed");
+  const done = mainApi.memoryResult(reloaded.ui, { type: "memory.result", id: "mem_v", action: "update", ok: true });
+  assert.equal(done.ui.editId, "");
+  assert.equal(done.ui.notice.kind, "status");
+  assert.equal(done.focus, "mem-edit-mem_v");
+});
+
+test("memory edit: empty title is refused locally and a non-conflict failure keeps the editor open", () => {
+  const entry = { id: "mem_v", revision: 4, title: "Old", body: "b", state: "verified", source: "user" };
+  const opened = mainApi.memoryStep(memUi0, "edit", "mem_v", entry);
+  const blank = mainApi.memoryStep({ ...opened.ui, title: "   " }, "save", "mem_v", entry);
+  assert.equal(blank.message, undefined);
+  assert.match(blank.ui.notice.text, /Title is required/);
+  const bad = mainApi.memoryResult(opened.ui, { type: "memory.result", id: "mem_v", action: "update", ok: false, code: "unsafe_content", message: "memory entry rejected" });
+  assert.equal(bad.ui.editId, "mem_v");
+  assert.equal(bad.ui.stale, false);
+  assert.match(bad.ui.notice.text, /Could not save this memory: memory entry rejected/);
+});
+
+test("memory promote, retire and delete send the displayed revision and delete needs a confirmation", () => {
+  const cand = { id: "mem_c", revision: 1, state: "candidate", source: "agent" };
+  // Promote and retire ask first, like delete: the buttons name the entry and the confirmed write carries its revision.
+  const promoteAsked = mainApi.memoryStep(memUi0, "promote", "mem_c", cand);
+  assert.equal(promoteAsked.message, undefined);
+  assert.deepEqual(promoteAsked.ui.confirm, { id: "mem_c", rev: 1, action: "promote" });
+  assert.equal(promoteAsked.focus, "mem-confirm-yes");
+  const promoteHtml = mainApi.memorySection({ memory: [{ ...cand, title: "Candidate" }] }, promoteAsked.ui);
+  assert.match(promoteHtml, /aria-label="Confirm promote: Candidate"/);
+  assert.match(promoteHtml, /aria-label="Confirm promote memory: Candidate"/);
+  assert.match(promoteHtml, /aria-label="Cancel promote: Candidate"/);
+  assert.deepEqual(mainApi.memoryStep(promoteAsked.ui, "promote-yes", "mem_c", cand).message, { type: "memory.promote", id: "mem_c", revision: 1 });
+  assert.equal(mainApi.memoryStep(promoteAsked.ui, "promote-yes", "other", cand).message, undefined);
+  const promoteNo = mainApi.memoryStep(promoteAsked.ui, "promote-no", "mem_c", cand);
+  assert.equal(promoteNo.ui.confirm, null);
+  assert.equal(promoteNo.focus, "mem-promote-mem_c");
+  const retireAsked = mainApi.memoryStep(memUi0, "retire", "mem_c", cand);
+  assert.deepEqual(retireAsked.ui.confirm, { id: "mem_c", rev: 1, action: "retire" });
+  assert.match(mainApi.memorySection({ memory: [cand] }, retireAsked.ui), /Retire this memory\?/);
+  assert.deepEqual(mainApi.memoryStep(retireAsked.ui, "retire-yes", "mem_c", cand).message, { type: "memory.retire", id: "mem_c", revision: 1 });
+  const asked = mainApi.memoryStep(memUi0, "delete", "mem_c", { ...cand, revision: 7 });
+  assert.equal(asked.message, undefined);
+  assert.equal(asked.focus, "mem-confirm-yes");
+  assert.match(mainApi.memorySection({ memory: [cand] }, asked.ui), /Delete permanently/);
+  assert.equal(mainApi.memoryStep(asked.ui, "delete-yes", "other", cand).message, undefined);
+  const yes = mainApi.memoryStep(asked.ui, "delete-yes", "mem_c", cand);
+  assert.deepEqual(yes.message, { type: "memory.delete", id: "mem_c", revision: 7 });
+  const gone = mainApi.memoryResult(yes.ui, { type: "memory.result", id: "mem_c", action: "delete", ok: true });
+  assert.equal(gone.ui.confirmId, "");
+  assert.equal(gone.focus, "mem-section");
+  const no = mainApi.memoryStep(asked.ui, "delete-no", "mem_c");
+  assert.equal(no.ui.confirmId, "");
+  assert.equal(no.focus, "mem-del-mem_c");
+});
+
+test("memory reply timeout: a dropped reply clears the busy lock, announces an alert and re-enables controls", () => {
+  const cand = { id: "mem_c", revision: 1, state: "candidate", source: "agent", title: "Candidate", body: "c" };
+  const sent = mainApi.memoryStep({ ...memUi0, confirm: { id: "mem_c", rev: 1, action: "promote" } }, "promote-yes", "mem_c", cand);
+  assert.match(mainApi.memorySection({ memory: [cand] }, { ...sent.ui, busy: "mem_c" }), /data-mem-action="edit"[^>]*disabled/);
+  const timedOut = mainApi.memoryTimedOut({ ...sent.ui, busy: "mem_c" }, "mem_c");
+  assert.equal(timedOut.busy, "");
+  assert.equal(timedOut.confirm, null);
+  assert.equal(timedOut.notice.kind, "alert");
+  assert.match(timedOut.notice.text, /No reply from Relo/);
+  assert.equal(timedOut.focus, "mem-edit-mem_c");
+  const html = mainApi.memorySection({ memory: [cand] }, timedOut);
+  assert.match(html, /role="alert"[^>]*>No reply from Relo/);
+  assert.doesNotMatch(html, /data-mem-action="edit"[^>]*disabled/);
+  assert.doesNotMatch(html, /data-mem-action="promote"[^>]*disabled/);
+  assert.equal(mainApi.memoryTimedOut(timedOut, "mem_c"), timedOut, "a settled action is left alone");
+  assert.equal(mainApi.memoryTimedOut({ ...sent.ui, busy: "mem_other" }, "mem_c").busy, "mem_other", "another entry's timer does not clear this one");
+  const saving = mainApi.memoryStep({ ...memUi0, editId: "mem_v", editRev: 4, title: "T", body: "B" }, "save", "mem_v", null);
+  assert.equal(mainApi.memoryTimedOut(saving.ui, "mem_v").focus, "mem-save");
+  const deleting = mainApi.memoryStep({ ...memUi0, confirmId: "mem_c", confirmRev: 1 }, "delete-yes", "mem_c", cand);
+  assert.equal(mainApi.memoryTimedOut(deleting.ui, "mem_c").focus, "mem-confirm-yes");
+  assert.ok(mainApi.MEM_TIMEOUT_MS > 0);
+});
+
+test("memory focus: after promote the moved entry keeps focus on its keyed Edit button, and a deleted entry falls back to the section", () => {
+  const cand = { id: "mem_c", revision: 1, state: "candidate", source: "agent", title: "Candidate", body: "c" };
+  const keysOf = (html) => [...html.matchAll(/data-mem-key="([^"]+)"/g)].map((m) => m[1]);
+  const before = mainApi.memorySection({ memory: [cand] }, memUi0);
+  const asking = mainApi.memoryStep(memUi0, "promote", "mem_c", cand);
+  assert.equal(asking.focus, "mem-confirm-yes");
+  const pressed = mainApi.memoryStep(asking.ui, "promote-yes", "mem_c", cand);
+  assert.equal(pressed.focus, "mem-section", "focus leaves the confirmed action while the write is in flight");
+  const done = mainApi.memoryResult(pressed.ui, { type: "memory.result", id: "mem_c", action: "promote", ok: true });
+  assert.equal(done.ui.busy, "");
+  assert.equal(done.focus, "mem-edit-mem_c");
+  const promoted = { ...cand, state: "verified", source: "user", revision: 3, verified: new Date().toISOString() };
+  const after = mainApi.memorySection({ memory: [promoted] }, { ...done.ui, notice: null });
+  assert.match(after, /<h4 class="mem-h" id="mem-group-verified"/);
+  assert.equal(mainApi.memoryRestoreKey("mem-edit-mem_c", keysOf(after)), "mem-edit-mem_c");
+  assert.ok(keysOf(before).includes("mem-promote-mem_c"), "before the move the Promote button is keyed by the entry");
+  assert.equal(mainApi.memoryRestoreKey("mem-edit-mem_c", keysOf(mainApi.memorySection({ memory: [] }, memUi0))), "mem-section");
+  const asked = mainApi.memoryStep(memUi0, "retire", "mem_v", { ...promoted, state: "verified" });
+  const retired = mainApi.memoryStep(asked.ui, "retire-yes", "mem_v", { ...promoted, state: "verified" });
+  assert.equal(retired.focus, "mem-section");
+  assert.equal(mainApi.memoryRestoreKey("mem-search", ["mem-search", "mem-section"]), "mem-search");
+  assert.equal(mainApi.memoryRestoreKey("", ["mem-section"]), "mem-section");
+});
+
+test("memory filters: state and kind filters and a search over loaded text narrow the list", () => {
+  const rows = [
+    { id: "mem_a", revision: 1, kind: "command", state: "verified", source: "user", title: "Run tests", body: "npm test" },
+    { id: "mem_b", revision: 1, kind: "fact", state: "verified", source: "user", title: "Layout", body: "uses Grid" },
+    { id: "mem_c", revision: 1, kind: "fact", state: "candidate", source: "agent", title: "Cache", body: "grid cache" },
+  ];
+  const ids = (ui) => [...mainApi.memorySection({ memory: rows }, ui).matchAll(/data-mem-key="mem-edit-([^"]+)"/g)].map((m) => m[1]);
+  assert.equal(mainApi.memoryVisible(rows[0], memUi0), true);
+  assert.deepEqual(ids({ ...memUi0, filterState: "verified" }), ["mem_a", "mem_b"]);
+  assert.deepEqual(ids({ ...memUi0, filterKind: "fact" }), ["mem_c", "mem_b"], "groups keep state order: candidate first");
+  assert.deepEqual(ids({ ...memUi0, filterState: "verified", filterKind: "fact" }), ["mem_b"]);
+  assert.deepEqual(ids({ ...memUi0, query: "GRID" }), ["mem_c", "mem_b"], "search is case-insensitive over body");
+  assert.deepEqual(ids({ ...memUi0, query: "  tests " }), ["mem_a"]);
+  assert.deepEqual(ids({ ...memUi0, query: "nothing-matches" }), []);
+  const none = mainApi.memorySection({ memory: rows }, { ...memUi0, query: "zzz" });
+  assert.match(none, /No entries match these filters/);
+  const controls = mainApi.memorySection({ memory: rows }, memUi0);
+  assert.match(controls, /<select data-mem-field="filterState" data-mem-key="mem-filter-state">/);
+  assert.match(controls, /<option value="candidate">Awaiting head review<\/option>/);
+  assert.match(controls, /<option value="fact">fact<\/option>/);
+  assert.match(controls, /type="search" data-mem-field="query" data-mem-key="mem-search"/);
+  assert.match(controls, /not the whole catalog/);
+  const typed = mainApi.memorySection({ memory: rows }, { ...memUi0, query: '<b>x' });
+  assert.match(typed, /value="&lt;b&gt;x"/);
+});
+
+test("memory evidence: each entry shows an evidence summary and head rationale without raw commands or paths", () => {
+  const entry = {
+    id: "mem_e", revision: 3, kind: "command", state: "verified", source: "user", title: "Build", body: "b",
+    evidence: [{ type: "command", ref: "sess_1", observedAt: "2026-10-30T10:00:00Z", commit: "abcdef1234567", files: [{ path: "secret/key.txt" }], command: "curl -H token=abc", result: "pass" }],
+    promotion: { headTurnId: "t1", rationale: "Verified <img src=x onerror=1> by head", promotedAt: "2026-10-31T09:00:00Z" },
+  };
+  const html = mainApi.memorySection({ memory: [entry] }, memUi0);
+  assert.match(html, /<summary class="mini">Evidence \(1\)<\/summary>/);
+  assert.match(html, /command · 2026-10-30 · commit abcdef1 · 1 file\(s\) · result pass/);
+  assert.match(html, /Head rationale: Verified &lt;img src=x onerror=1&gt; by head · promoted 2026-10-31/);
+  assert.doesNotMatch(html, /curl|token=abc|secret\/key|sess_1|<img src=x/);
+  const plain = mainApi.memorySection({ memory: [{ id: "mem_n", revision: 1, kind: "fact", state: "verified", source: "user", title: "N", body: "", evidence: [] }] }, memUi0);
+  assert.match(plain, /No evidence recorded/);
+  assert.doesNotMatch(plain, /Evidence not loaded/);
+  // A list of entries without usable objects is still a recorded list, not an absent payload.
+  const unusable = mainApi.memoryEvidence({ evidence: [null, 3] });
+  assert.match(unusable, /No evidence recorded/);
+  assert.match(unusable, /<summary class="mini">Evidence \(0\)<\/summary>/);
+  const unloaded = mainApi.memorySection({ memory: [{ id: "mem_u", revision: 1, kind: "fact", state: "verified", source: "user", title: "U" }] }, memUi0);
+  assert.match(unloaded, /Evidence not loaded/);
+  assert.doesNotMatch(unloaded, /No evidence recorded/, "'not loaded' stays only for a payload without an evidence list");
+  assert.match(mainApi.memoryEvidence({}), /Evidence not loaded/);
+  assert.match(mainApi.memoryEvidence({ evidence: null }), /Evidence not loaded/);
+});
+
+test("memory review list: flagged entries appear once in the flagged list, not in their state group", () => {
+  const flaggedEntry = { id: "mem_f", revision: 2, kind: "fact", state: "verified", source: "user", title: "Flagged one", body: "x", flagged: true, verified: "" };
+  const html = mainApi.memorySection({ memory: [flaggedEntry, { ...flaggedEntry, id: "mem_g", flagged: false, title: "Plain" }] }, memUi0);
+  assert.match(html, /<h4 class="mem-h" id="mem-group-flagged">Flagged for review \(1\)<\/h4>/);
+  assert.match(html, /Nothing changes until you edit, promote, retire or delete one/);
+  assert.equal(html.split('data-mem-key="mem-edit-mem_f"').length - 1, 1, "flagged entry rendered once");
+  assert.match(html, /flagged as contradicting another entry/);
+  assert.match(html, /id="mem-group-verified"[^]*Plain/);
+  assert.doesNotMatch(mainApi.memorySection({ memory: [{ ...flaggedEntry, flagged: false }] }, memUi0), /Flagged for review/);
+});
+
+test("memory per entry: a reply or timeout for one entry leaves the other entry busy", () => {
+  const a = { id: "mem_a", revision: 2, state: "candidate", source: "agent", title: "A", body: "a" };
+  const b = { id: "mem_b", revision: 5, state: "verified", source: "user", title: "B", body: "b" };
+  const both = { ...memUi0, busy: "" };
+  // The drawer disables only the entry named by busy.
+  assert.match(mainApi.memorySection({ memory: [a, b] }, { ...both, busy: "mem_a" }), /data-id="mem_a"[^>]*disabled/);
+  assert.doesNotMatch(mainApi.memorySection({ memory: [a, b] }, { ...both, busy: "mem_a" }), /data-id="mem_b"[^>]*disabled/);
+  // A reply for A does not clear B's lock.
+  const repliedA = mainApi.memoryResult({ ...both, busy: "mem_b" }, { type: "memory.result", id: "mem_a", action: "promote", ok: true });
+  assert.equal(repliedA.ui.busy, "mem_b", "the busy lock belongs to B and stays");
+  assert.equal(repliedA.ui.notice.kind, "status");
+  // A timeout for A neither clears nor is cleared by B's lock.
+  assert.equal(mainApi.memoryTimedOut({ ...both, busy: "mem_b" }, "mem_a").busy, "mem_b");
+  assert.equal(mainApi.memoryTimedOut({ ...both, busy: "mem_a" }, "mem_a").busy, "");
+  // Saving B is allowed while A is busy; the busy check names only the entry being saved.
+  const editingB = { ...memUi0, editId: "mem_b", editRev: 5, title: "B", body: "b", busy: "mem_a" };
+  assert.deepEqual(mainApi.memoryStep(editingB, "save", "mem_b", b).message, { type: "memory.update", id: "mem_b", revision: 5, title: "B", body: "b" });
+  assert.equal(mainApi.memoryStep(editingB, "save", "mem_a", a).message, undefined);
+  // A conflicted draft still cannot save.
+  assert.equal(mainApi.memoryStep({ ...memUi0, editId: "mem_b", editRev: 5, title: "B", stale: true }, "save", "mem_b", b).message, undefined);
+  // One confirmation at a time, so the confirm keys stay unique.
+  const cand = (id, rev) => ({ id, revision: rev, state: "candidate", source: "agent", title: id });
+  assert.equal(mainApi.memoryTimedOut({ ...memUi0, busy: "mem_b" }, "mem_a").notice, null, "a timeout for A announces nothing for B");
+  assert.equal(mainApi.memoryStep({ ...memUi0, editId: "mem_a", editRev: 1, title: "A", busy: "mem_a" }, "save", "mem_a", cand("mem_a", 1)).message, undefined, "the entry being written cannot save twice");
+  const confirmedA = mainApi.memoryStep(memUi0, "promote", "mem_a", cand("mem_a", 1));
+  const confirmedB = mainApi.memoryStep(confirmedA.ui, "promote", "mem_b", cand("mem_b", 2));
+  assert.deepEqual(confirmedB.ui.confirm, { id: "mem_b", rev: 2, action: "promote" }, "one confirmation at a time");
+  assert.equal(mainApi.memorySection({ memory: [cand("mem_a", 1), cand("mem_b", 2)] }, confirmedB.ui).split('data-mem-key="mem-confirm-yes"').length - 1, 1);
+});
+
+test("memory draft and refresh: a refresh keeps the draft, drops a stale confirm, and the flag gates it", () => {
+  const draft = { ...memUi0, editId: "mem_a", editRev: 2, title: "Draft <b>", body: "typed" };
+  const after = mainApi.memorySection({ memory: [{ id: "mem_a", revision: 2, state: "candidate", source: "agent", title: "A", body: "a" }, { id: "mem_new", revision: 1, state: "verified", source: "user", title: "New", body: "n" }] }, draft);
+  assert.match(after, /<h4 class="mem-h" id="mem-group-verified">Verified \(1\)<\/h4>/);
+  assert.match(after, /value="Draft &lt;b&gt;"/, "the unsaved title stays in the editor");
+  assert.match(after, /typed/, "the unsaved body stays in the editor");
+  // A confirm whose revision is gone is dropped by the refresh handler; the renderer still keys it to its entry.
+  const moved = mainApi.memorySection({ memory: [{ id: "mem_a", revision: 3, state: "candidate", source: "agent", title: "A" }] }, { ...memUi0, confirm: { id: "mem_a", rev: 2, action: "promote" } });
+  assert.match(moved, /Confirm promote memory: A/, "the dialog is shown for the entry");
+  assert.equal(mainApi.memoryEnabled(true, {}), true, "a window that has not seen the flag keeps refreshing");
+  assert.equal(mainApi.memoryEnabled(false, {}), false);
+  assert.equal(mainApi.memoryEnabled(true, { values: { "relo.context.projectMemory": false } }), false, "relo.context.projectMemory off stops the refresh");
+  const browser = loadBrowser();
+  const host = browser.host;
+  host.setUi({ ...memUi0, editId: "mem_a", editRev: 2, title: "Draft <b>", body: "typed" });
+  browser.send({ type: "memory.refresh", memory: [{ id: "mem_a", revision: 2, state: "candidate", source: "agent", title: "A" }, { id: "mem_new", revision: 1, state: "verified", source: "user", title: "New" }] });
+  assert.equal(host.ui().editId, "mem_a", "the draft stays open");
+  assert.equal(host.ui().title, "Draft <b>");
+  assert.equal(host.ui().body, "typed");
+  host.setUi({ ...host.ui(), confirm: { id: "mem_gone", rev: 2, action: "promote" } });
+  browser.send({ type: "memory.refresh", memory: [{ id: "mem_a", revision: 3, state: "candidate", source: "agent", title: "A" }] });
+  assert.equal(host.ui().confirm, null, "a confirm for an entry the refresh no longer lists is dropped");
+  assert.equal(host.ui().editId, "mem_a", "dropping the confirm keeps the draft");
 });

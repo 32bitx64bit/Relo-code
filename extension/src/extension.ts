@@ -5,7 +5,7 @@ import { repositoryInfo, snapRepository } from "./repository";
 import { CoreClient } from "./client";
 import { emptyState, reduce, routingFrom, type ReloState, type AgentInfo, type CacheInfo, type ChangeDiff, type SessionSummary, normalizeCache } from "./protocol";
 import { ChatView, openDashboard, openInspector } from "./webview";
-import { CORE_SETTING_SECTIONS, checkCommand, checkQuestionMessage, checkSessionId, checkSetting, modelsSignature, settingsReply, type SettingsSchema } from "./settingsBridge";
+import { CORE_SETTING_SECTIONS, checkCommand, checkMemoryMessage, checkQuestionMessage, checkSessionId, checkSetting, modelsSignature, settingsReply, type MemoryCheck, type SettingsSchema } from "./settingsBridge";
 import { applyCollapse, cleanCollapsed, type Collapsed } from "./uiState";
 import { askWebChallenge, redetectSearchProvider, showWebStatus, type WebDeps } from "./webFlows";
 import { CrashBreaker } from "./crashBreaker";
@@ -13,6 +13,7 @@ import { locateCore } from "./coreLocate";
 import { PROVIDER_ID_RE, sanitizeDiscovered, sanitizeProviderList, secretKey, validateBaseURL, validateProvider, MAX_PROVIDERS, type ProviderConfig } from "./providers";
 import { dirtyPathsFor } from "./dirtyGate";
 import { CanvasManager } from "./canvas/manager";
+import { loadMemoryList, MemoryRefresh } from "./memoryRefresh";
 
 let client: CoreClient;
 let state: ReloState = emptyState();
@@ -39,6 +40,7 @@ const crashes = new CrashBreaker();
 let coreLifecycle: Promise<void> = Promise.resolve();
 let postedRepository = "";
 let canvas: CanvasManager;
+let memoryRefresh: MemoryRefresh;
 
 
 export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
@@ -49,6 +51,10 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   client = new CoreClient(log);
   canvas = new CanvasManager(workspacePath);
   chat = new ChatView(ctx, client, () => state, (m) => onWebviewMessage(ctx, m));
+  memoryRefresh = new MemoryRefresh({
+    enabled: () => cfg().get<boolean>("context.projectMemory", true) !== false && client.ready,
+    load: () => refreshMemoryList(),
+  });
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
   status.command = "relo.open";
   status.text = "$(hubot) Relo: Starting";
@@ -57,6 +63,11 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   ctx.subscriptions.push(
     status, output, canvas,
     { dispose: () => chat.dispose() },
+    { dispose: () => memoryRefresh.dispose() },
+    // memory.updated is process-local, so a window that comes back into view asks core for the list again (design §8).
+    vscode.window.onDidChangeWindowState((s) => {
+      if (s.focused) memoryRefresh.trigger();
+    }),
     vscode.window.registerWebviewViewProvider(ChatView.viewType, chat, { webviewOptions: { retainContextWhenHidden: true } }),
     vscode.workspace.registerTextDocumentContentProvider(DIFF_SCHEME, diffProvider),
     vscode.workspace.onDidChangeConfiguration((e) => {
@@ -84,6 +95,14 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
         (error: unknown) => client.request("canvas.reply", { requestId, error: errorText(error) }),
       ).catch((error: unknown) => log(`canvas.reply failed: ${errorText(error)}`));
       return;
+    }
+    // memory.updated carries no body, so an upsert first loads the entry; the reducer applies it when it arrives.
+    if (method === "memory.updated") {
+      const p = (params ?? {}) as { id?: unknown; change?: unknown };
+      if (typeof p.id === "string" && p.change !== "deleted") {
+        void refreshMemory(p.id);
+        return;
+      }
     }
     state = reduce(state, method, params);
     chat.post();
@@ -151,7 +170,16 @@ function registerCommands(ctx: vscode.ExtensionContext): void {
     await postSessions();
   });
   cmd("relo.dashboard", async () => {
-    dashboard = await openDashboard(ctx, client, () => state, (m) => onDash(m));
+    const panel = await openDashboard(ctx, client, () => state, (m) => onDash(m));
+    dashboard = panel;
+    // A dashboard revealed or shown again refreshes the memory list, like the chat view.
+    panel.onDidChangeViewState((e) => {
+      if (e.webviewPanel.visible) memoryRefresh.trigger();
+    });
+    panel.onDidDispose(() => {
+      if (dashboard === panel) dashboard = undefined;
+    });
+    memoryRefresh.trigger();
   });
   cmd("relo.runTask", () => promptUser("build"));
   cmd("relo.planTask", async () => {
@@ -321,12 +349,73 @@ function onWebviewMessage(ctx: vscode.ExtensionContext, m: unknown): void {
       if (id) void deleteSession(id).catch((err) => void vscode.window.showErrorMessage(`Relo: could not delete the session: ${errorText(err)}`));
       return;
     }
+    case "memory.update":
+    case "memory.promote":
+    case "memory.retire":
+    case "memory.delete":
+      onMemoryMessage(m, (reply) => chat.send(reply));
+      return;
+    case "memory.list":
+      void refreshMemoryList().catch((err) => log(`memory.list failed: ${errorText(err)}`));
+      return;
     case "settings.open":
       void vscode.commands.executeCommand("workbench.action.openSettings", "@ext:relocode.relo-code");
       return;
     default:
       return;
   }
+}
+
+// A user memory write goes to core with the revision the user saw. The webview learns the outcome from memory.result;
+// the list itself changes through memory.updated. A conflict also reloads the entry so the user sees the current revision.
+// Validates a webview memory write and runs it. The reply goes back to the window that sent it (chat view or dashboard).
+function onMemoryMessage(m: unknown, reply: (msg: unknown) => void): void {
+  const check = checkMemoryMessage(m as Parameters<typeof checkMemoryMessage>[0]);
+  if (check) void runMemoryAction(check, reply);
+}
+
+async function runMemoryAction(check: MemoryCheck, reply: (msg: unknown) => void): Promise<void> {
+  const id = String(check.params.id);
+  try {
+    await client.request(check.method, check.params);
+    reply({ type: "memory.result", id, action: check.action, ok: true });
+  } catch (err) {
+    const code = errorCode(err);
+    if (code === "conflict") await refreshMemory(id);
+    reply({ type: "memory.result", id, action: check.action, ok: false, code, message: errorText(err) });
+  }
+}
+
+// Loads the whole memory list and posts it to the open windows. Design §8: notifications are process-local, so focus
+// and visibility refresh from the catalog. A failed request keeps the current list rather than blanking the drawer.
+async function refreshMemoryList(): Promise<void> {
+  const { ok, items } = await loadMemoryList((method, params) => client.request(method, params));
+  if (!ok) return;
+  state = { ...state, memory: items };
+  chat.post();
+  chat.send({ type: "memory.refresh", memory: items });
+  dashboard?.webview.postMessage({ type: "state", state });
+}
+
+// Loads one memory entry into state. not_found means it was deleted elsewhere, so it is dropped.
+async function refreshMemory(id: string): Promise<void> {
+  try {
+    const entry = await client.request("memory.get", { id });
+    state = reduce(state, "memory.updated", { id, change: "updated", entry });
+  } catch (err) {
+    if (errorCode(err) === "not_found") state = reduce(state, "memory.updated", { id, change: "deleted" });
+    else {
+      log(`memory.get failed: ${errorText(err)}`);
+      return;
+    }
+  }
+  chat.post();
+  dashboard?.webview.postMessage({ type: "state", state });
+}
+
+function errorCode(err: unknown): string {
+  const code = (err as { code?: unknown } | undefined)?.code;
+  return typeof code === "string" ? code : "";
 }
 
 type DiscoverMessage = { kind?: unknown; baseURL?: unknown; apiKey?: unknown; id?: unknown; requestId?: unknown };
@@ -564,6 +653,9 @@ function onDash(m: unknown): void {
   if (msg.type === "submit" && msg.text) void client.request("prompt.submit", { text: msg.text }).catch((err) => void vscode.window.showErrorMessage(`Relo: prompt failed: ${errorText(err)}`));
   if (msg.type === "cancel") void client.request("prompt.cancel", {}).catch(() => {});
   if (msg.type === "mode" && msg.mode) void client.request("mode.set", { mode: msg.mode }).catch(() => {});
+  if (msg.type === "memory.update" || msg.type === "memory.promote" || msg.type === "memory.retire" || msg.type === "memory.delete") {
+    onMemoryMessage(m, (reply) => dashboard?.webview.postMessage(reply));
+  }
 }
 
 async function promptUser(mode: string): Promise<void> {

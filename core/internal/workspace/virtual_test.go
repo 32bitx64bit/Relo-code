@@ -1,14 +1,17 @@
 package workspace
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/relocode/relo/internal/integration"
+	"github.com/relocode/relo/internal/vws"
 )
 
 // virtualRepo makes a repository with some history, uncommitted user work and an untracked file, and a Manager
@@ -675,4 +678,78 @@ func TestRefusedToolFilesAreReportedOnce(t *testing.T) {
 	if err != nil || strings.Join(sortedPaths(files), ",") != "a:ok.txt" {
 		t.Fatalf("changes = %v %v", sortedPaths(files), err)
 	}
+}
+
+// Close must leave no path that reopens the engine: a query after it fails with ErrClosed, and the engine stays
+// closed. Before the fix the query reopened the engine, and its recovery wrote checkpoints into the repository.
+func TestQueriesAfterCloseNeverReopenTheEngine(t *testing.T) {
+	m, _ := virtualRepo(t, ModeVirtual)
+	if _, err := m.EnsureTree("agent-1", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.VirtualWorkspace("agent-1"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("VirtualWorkspace after Close: err = %v, want ErrClosed", err)
+	}
+	if _, err := m.VirtualWorkspaces(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("VirtualWorkspaces after Close: err = %v, want ErrClosed", err)
+	}
+	if eng := m.engine(true); eng != nil {
+		t.Fatal("the engine was reopened after Close")
+	}
+}
+
+// wantVirtual and VirtualMetrics must report a closed manager instead of falling back or reopening the engine.
+func TestWantVirtualAndMetricsAfterCloseReportClosed(t *testing.T) {
+	m, _ := virtualRepo(t, ModeVirtual)
+	if _, err := m.EnsureTree("agent-1", false); err != nil {
+		t.Fatal(err)
+	}
+	if want, why, err := m.wantVirtual(); err != nil || !want {
+		t.Fatalf("wantVirtual before Close = %v %q %v", want, why, err)
+	}
+	if _, opened := m.VirtualMetrics(); !opened {
+		t.Fatal("VirtualMetrics before Close did not see the open engine")
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if want, why, err := m.wantVirtual(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("wantVirtual after Close = %v %q %v, want ErrClosed", want, why, err)
+	}
+	if _, opened := m.VirtualMetrics(); opened {
+		t.Fatal("VirtualMetrics after Close reported an open engine")
+	}
+	if eng := m.engine(true); eng != nil {
+		t.Fatal("the engine was reopened after Close")
+	}
+}
+
+// Close waits for an observer already running, and events published after Close are not delivered.
+func TestCloseWaitsForInFlightObservers(t *testing.T) {
+	m := New(t.TempDir())
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var finished atomic.Bool
+	m.SetObserver(func(vws.Event) {
+		close(entered)
+		<-release
+		finished.Store(true)
+	})
+	m.observeAsync(vws.Event{})
+	<-entered
+	closed := make(chan struct{})
+	go func() {
+		_ = m.Close()
+		close(closed)
+	}()
+	close(release)
+	<-closed
+	if !finished.Load() {
+		t.Fatal("Close returned before the in-flight observer finished")
+	}
+	m.observeAsync(vws.Event{})
+	m.observers.Wait()
 }

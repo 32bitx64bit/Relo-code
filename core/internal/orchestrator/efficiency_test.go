@@ -95,19 +95,18 @@ func TestEfficiencyRetrySpawnSetsAttempt(t *testing.T) {
 	}
 }
 
-func TestEfficiencyScopeDropsMemoryForAutoWorker(t *testing.T) {
+func TestEfficiencyScopeAllowsMemoryForAutoWorker(t *testing.T) {
 	prefs := style.Prefs{Preset: "auto"}
 	res := style.Resolve(prefs, agent.Worker, "medium", 1, 16000)
-	if res.Scope.Memory {
-		t.Fatalf("worker scope should drop memory")
+	if !res.Scope.Memory {
+		t.Fatalf("worker scope should carry memory")
 	}
-	if len(res.Scope.Classes) > 0 {
-		for _, cls := range res.Scope.Classes {
-			if cls == "memory" {
-				t.Fatalf("memory class leaked into worker scope")
-			}
+	for _, cls := range res.Scope.Classes {
+		if cls == "memory" {
+			return
 		}
 	}
+	t.Fatalf("worker scope classes %v lack memory", res.Scope.Classes)
 }
 
 func TestFreshAgentReflectsRegistryStatus(t *testing.T) {

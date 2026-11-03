@@ -472,6 +472,288 @@
     }).join("") + capped.toggle;
   }
 
+  // Project memory in the Context drawer. Drafts and the pending action live in memoryUi, so a re-render keeps them.
+  const MEM_TITLE_MAX = 120;
+  const MEM_BODY_MAX = 600;
+  const MEM_GROUPS = [["candidate", "Awaiting head review"], ["verified", "Verified"], ["stale", "Stale"], ["retired", "Retired"]];
+  const MEM_SOURCES = { user: "your edit", agent: "agent proposal", legacy: "earlier version" };
+  const MEM_DONE = { update: "Saved. Your edit is verified with your provenance.", promote: "Promoted to verified.", retire: "Retired. Agents no longer recall this entry.", delete: "Deleted. Its text is removed." };
+  const MEM_VERB = { update: "save", promote: "promote", retire: "retire", delete: "delete" };
+  const MEM_CONFLICT = "This memory changed since you last saw it, so nothing was saved. The latest version is shown; check it and try again.";
+  let memoryUi = { editId: "", editRev: 0, title: "", body: "", stale: false, confirmId: "", confirmRev: 0, confirm: null, busy: "", focus: "", notice: null, filterState: "", filterKind: "", query: "" };
+  // A bridge reply can be dropped: after this long with no memory.result the controls come back with an alert.
+  const MEM_TIMEOUT_MS = 15000;
+  const MEM_TIMEOUT = "No reply from Relo for this change, so it may or may not have been saved. Check the entry, then try again.";
+  // One reply timer per entry id ({action, timer}), so concurrent writes cannot clear each other's lock.
+  let memPending = Object.create(null);
+  const MEM_STATES = [["", "All states"], ["candidate", "Awaiting head review"], ["verified", "Verified"], ["stale", "Stale"], ["retired", "Retired"]];
+
+  // The last flag value seen, for the paused copy when the settings cache has not loaded yet.
+  const memoryFlagOn = { on: true };
+  function memoryEnabledNow() {
+    return valueOf("relo.context.projectMemory") !== false && memoryFlagOn.on !== false;
+  }
+
+  // Pure transition for a memory action: next UI state, message for the extension (if any), and where focus goes.
+  function memoryStep(ui, action, id, entry) {
+    const cleared = { ...ui, notice: null };
+    const e = entry || {};
+    switch (action) {
+      case "edit":
+        return { ui: { ...cleared, editId: id, editRev: e.revision, title: e.title || "", body: e.body || "", stale: false, confirmId: "" }, focus: "mem-title" };
+      case "reload":
+        return { ui: { ...cleared, editRev: e.revision, title: e.title || "", body: e.body || "", stale: false }, focus: "mem-title" };
+      case "cancel":
+        return { ui: { ...cleared, editId: "", stale: false }, focus: "mem-edit-" + id };
+      case "save":
+        if (ui.stale || ui.busy === id) return { ui };
+        if (!ui.title.trim()) return { ui: { ...cleared, notice: { kind: "alert", text: "Title is required." } }, focus: "mem-title" };
+        return { ui: { ...cleared, busy: id }, focus: "mem-section", message: { type: "memory.update", id, revision: ui.editRev, title: ui.title, body: ui.body } };
+      // Promote and retire ask first: they change what agents recall, and an entry can move group under the caret.
+      case "promote":
+        return { ui: { ...cleared, confirm: { id, rev: e.revision, action: "promote" }, editId: ui.editId === id ? "" : ui.editId }, focus: "mem-confirm-yes" };
+      case "retire":
+        return { ui: { ...cleared, confirm: { id, rev: e.revision, action: "retire" }, editId: ui.editId === id ? "" : ui.editId }, focus: "mem-confirm-yes" };
+      case "promote-no":
+      case "retire-no":
+        return { ui: { ...cleared, confirm: null }, focus: "mem-" + action.replace("-no", "") + "-" + id };
+      case "promote-yes":
+        if (!ui.confirm || ui.confirm.id !== id || ui.confirm.action !== "promote") return { ui };
+        return { ui: { ...cleared, confirm: null, busy: id }, focus: "mem-section", message: { type: "memory.promote", id, revision: ui.confirm.rev } };
+      case "retire-yes":
+        if (!ui.confirm || ui.confirm.id !== id || ui.confirm.action !== "retire") return { ui };
+        return { ui: { ...cleared, confirm: null, busy: id }, focus: "mem-section", message: { type: "memory.retire", id, revision: ui.confirm.rev } };
+      case "delete":
+        return { ui: { ...cleared, confirmId: id, confirmRev: e.revision, editId: ui.editId === id ? "" : ui.editId }, focus: "mem-confirm-yes" };
+      case "delete-no":
+        return { ui: { ...cleared, confirmId: "" }, focus: "mem-del-" + id };
+      case "delete-yes":
+        if (ui.confirmId !== id) return { ui };
+        return { ui: { ...cleared, busy: id }, message: { type: "memory.delete", id, revision: ui.confirmRev } };
+      default:
+        return { ui: cleared };
+    }
+  }
+
+  // Applies a memory.result from the extension: the outcome, the notice, and where focus goes next.
+  // Only the entry the reply names leaves the busy state, so a reply for A never clears B's lock or timer.
+  function memoryResult(ui, msg) {
+    const id = String(msg.id || "");
+    const action = String(msg.action || "");
+    const base = { ...ui, busy: ui.busy === id ? "" : ui.busy, notice: null };
+    if (msg.ok) {
+      const done = { kind: "status", text: MEM_DONE[action] || "Done." };
+      const settled = ui.confirm && ui.confirm.id === id ? { ...base, confirm: null } : base;
+      if (action === "delete") return { ui: { ...settled, confirmId: "", editId: ui.editId === id ? "" : ui.editId, notice: done }, focus: "mem-section" };
+      if (action === "promote" || action === "retire") return { ui: { ...settled, notice: done }, focus: "mem-edit-" + id };
+      return { ui: { ...settled, editId: action === "update" ? "" : ui.editId, stale: false, notice: done }, focus: "mem-edit-" + id };
+    }
+    const conflict = msg.code === "conflict";
+    const alert = { kind: "alert", text: conflict ? MEM_CONFLICT : `Could not ${MEM_VERB[action] || "change"} this memory: ${msg.message || "try again"}` };
+    if (action === "delete") return { ui: { ...base, confirmId: "", notice: alert }, focus: "mem-section" };
+    if (action === "promote" || action === "retire") return { ui: { ...base, confirm: null, notice: alert }, focus: "mem-edit-" + id };
+    if (action === "update") {
+      if (conflict) return { ui: { ...base, stale: true, notice: alert }, focus: "mem-reload" };
+      return { ui: { ...base, notice: alert }, focus: "mem-save" };
+    }
+    return { ui: { ...base, notice: alert }, focus: "mem-edit-" + id };
+  }
+
+  // No memory.result arrived in time: clear the busy lock so controls work again, announce the failure, and return focus.
+  function memoryTimedOut(ui, id) {
+    if (!ui.busy || ui.busy !== id) return ui;
+    const confirmed = ui.confirm && ui.confirm.id === id;
+    const focus = ui.editId === id ? "mem-save" : confirmed ? "mem-confirm-yes" : ui.confirmId === id ? "mem-confirm-yes" : "mem-edit-" + id;
+    return { ...ui, busy: "", confirm: confirmed ? null : ui.confirm, notice: { kind: "alert", text: MEM_TIMEOUT }, focus };
+  }
+
+  // Where focus goes after a re-render: the same keyed element if it still exists, else the section heading.
+  function memoryRestoreKey(prevKey, presentKeys) {
+    return prevKey && presentKeys.includes(prevKey) ? prevKey : "mem-section";
+  }
+
+  // Filters and search over the entries loaded here: state, kind, then a case-insensitive match on title, body or kind.
+  function memoryVisible(m, ui) {
+    if (ui.filterState && m.state !== ui.filterState) return false;
+    if (ui.filterKind && m.kind !== ui.filterKind) return false;
+    const q = String(ui.query || "").trim().toLowerCase();
+    if (!q) return true;
+    return [m.title, m.body, m.kind].some((v) => String(v || "").toLowerCase().includes(q));
+  }
+
+  // The reviewed entry's copy: the summary names its action, the body names the entry, and deleting is spelled out.
+  function memoryConfirm(ev, m, busy) {
+    const id = String(m.id);
+    const label = String(m.title || "Untitled memory");
+    const what = ev.action === "delete"
+      ? "Delete this memory? Its text is removed and cannot be restored."
+      : ev.action === "promote"
+        ? "Promote this memory to verified? Agents recall it from then on, with your provenance."
+        : "Retire this memory? Agents no longer recall it, and it stays here as history.";
+    const yes = ev.action === "delete" ? "Delete permanently" : ev.action === "promote" ? "Promote now" : "Retire now";
+    return `<div class="mem-actions" role="group" aria-label="${attr("Confirm " + ev.action + ": " + label)}"><span>${esc(what)}</span>
+        <button type="button" class="link-btn" data-mem-action="${attr(ev.action + "-yes")}" data-id="${attr(id)}" data-mem-key="mem-confirm-yes" aria-label="${attr("Confirm " + ev.action + " memory: " + label)}"${busy}>${esc(yes)}</button>
+        <button type="button" class="link-btn" data-mem-action="${attr(ev.action + "-no")}" data-id="${attr(id)}" data-mem-key="${attr("mem-" + ev.action + "-" + id)}" aria-label="${attr("Cancel " + ev.action + ": " + label)}">Cancel</button></div>`;
+  }
+
+  // Evidence as a summary: type, observed date, commit, file count and result. Raw commands and file paths are not shown.
+  function memoryEvidence(m, loaded) {
+    const ev = loaded === undefined ? (Array.isArray(m.evidence) ? m.evidence.filter((e) => e && typeof e === "object") : null) : loaded;
+    const prom = m.promotion && typeof m.promotion === "object" ? m.promotion : null;
+    const day = (v) => String(v || "").slice(0, 10);
+    const rows = (ev || []).map((e) => `<li>${esc(e.type || "evidence")}${e.observedAt ? " · " + esc(day(e.observedAt)) : ""}${e.commit ? " · commit " + esc(String(e.commit).slice(0, 7)) : ""}${Array.isArray(e.files) ? " · " + esc(e.files.length) + " file(s)" : ""}${e.result ? " · result " + esc(e.result) : ""}</li>`).join("");
+    const head = prom ? `<div class="mini">Head rationale: ${esc(prom.rationale || "none recorded")}${prom.promotedAt ? " · promoted " + esc(day(prom.promotedAt)) : ""}</div>` : "";
+    const body = ev === null ? `<div class="mini">Evidence not loaded</div>` : rows ? `<ul class="mini">${rows}</ul>` : `<div class="mini">No evidence recorded</div>`;
+    return `<details class="mem-evidence"><summary class="mini">Evidence${ev ? " (" + ev.length + ")" : ""}</summary>${head}${body}</details>`;
+  }
+
+  // Freshness in words: candidates wait, verified shows when, stale and retired show why.
+  function memoryFreshness(m) {
+    if (m.state === "candidate") return "Waiting for head review";
+    if (m.state === "stale") return "Stale" + (m.staleReason ? ": " + m.staleReason : "");
+    if (m.state === "retired") return "Retired" + (m.retiredBy ? " by " + m.retiredBy : "");
+    const when = Date.parse(m.verified || "");
+    return when > Date.parse("2000-01-01T00:00:00Z") ? "Verified " + relTime(m.verified) : "Verified";
+  }
+
+  function memoryItem(m, ui, conf) {
+    const id = String(m.id);
+    // While this entry knows nothing about its evidence the payload did not carry it; an empty list is a recorded "none".
+    const evidence = Array.isArray(m.evidence) ? m.evidence.filter((e) => e && typeof e === "object") : null;
+    const label = String(m.title || "Untitled memory");
+    const busy = ui.busy === id ? " disabled" : "";
+    const btn = (action, text, key) => `<button type="button" class="link-btn mem-btn" data-mem-action="${action}" data-id="${attr(id)}" data-mem-key="${attr(key)}" aria-label="${attr(text + " memory: " + label)}"${busy}>${esc(text)}</button>`;
+    const sourceText = MEM_SOURCES[m.source] || String(m.source || "unknown source");
+    const meta = `<div class="mini">${esc(m.kind || "memory")} · ${esc(sourceText)} · r${esc(Number(m.revision) || 0)} · ${esc(memoryFreshness(m))}${m.flagged ? " · flagged as contradicting another entry" : ""}${m.reviewRequested ? " · review requested" : ""}</div>`;
+    // A user may promote candidates, and user-owned stale or retired entries; core refuses agent-owned stale or retired ones.
+    const canPromote = m.state === "candidate" || ((m.state === "stale" || m.state === "retired") && m.source === "user");
+    const ev = conf && conf.id === id ? { action: ui.confirmId === id ? "delete" : conf.action, busy: conf.busy } : null;
+    let controls;
+    if (ev) {
+      controls = memoryConfirm(ev, m, busy);
+    } else if (ui.confirmId === id) {
+      controls = `<div class="mem-actions" role="group" aria-label="${attr("Confirm delete: " + label)}"><span>Delete this memory? Its text is removed and cannot be restored.</span>
+        <button type="button" class="link-btn" data-mem-action="delete-yes" data-id="${attr(id)}" data-mem-key="mem-confirm-yes" aria-label="${attr("Confirm delete memory: " + label)}"${busy}>Delete permanently</button>
+        <button type="button" class="link-btn" data-mem-action="delete-no" data-id="${attr(id)}" data-mem-key="${attr("mem-del-" + id)}" aria-label="${attr("Cancel delete: " + label)}">Cancel</button></div>`;
+    } else if (ui.editId === id) {
+      controls = `<div class="mem-edit" role="group" aria-label="${attr("Edit memory: " + label)}">
+        <label>Title <input type="text" data-mem-field="title" maxlength="${MEM_TITLE_MAX}" value="${attr(ui.title)}" data-mem-key="mem-title"/></label>
+        <label>Body <textarea data-mem-field="body" maxlength="${MEM_BODY_MAX}" data-mem-key="mem-body">${esc(ui.body)}</textarea></label>
+        <div class="mem-actions">
+          <button type="button" data-mem-action="save" data-id="${attr(id)}" data-mem-key="mem-save" aria-label="${attr("Save memory: " + label)}"${ui.stale || busy ? " disabled" : ""}>Save</button>
+          ${ui.stale ? `<button type="button" data-mem-action="reload" data-id="${attr(id)}" data-mem-key="mem-reload" aria-label="${attr("Reload latest memory: " + label)}">Reload latest</button>` : ""}
+          <button type="button" data-mem-action="cancel" data-id="${attr(id)}" data-mem-key="${attr("mem-edit-" + id)}" aria-label="${attr("Cancel edit: " + label)}">Cancel</button>
+        </div></div>`;
+    } else {
+      controls = `<div class="mem-actions">${btn("edit", "Edit", "mem-edit-" + id)}${canPromote ? btn("promote", "Promote", "mem-promote-" + id) : ""}${m.state !== "retired" ? btn("retire", "Retire", "mem-retire-" + id) : ""}${btn("delete", "Delete", "mem-del-" + id)}</div>`;
+    }
+    return `<div class="mem-item" role="listitem" data-key="${attr("mem-" + id)}">
+      <div class="mem-title">${esc(label)}</div>
+      ${meta}
+      ${m.body ? `<div class="mem-body">${esc(m.body)}</div>` : ""}
+      ${memoryEvidence(m, evidence)}
+      ${controls}
+    </div>`;
+  }
+
+  // The memory section of the Context drawer: entries grouped by state, the paused notice, and the last action's outcome.
+  function memorySection(s, ui = memoryUi) {
+    const items = (s.memory || []).filter((m) => m && typeof m.id === "string");
+    const paused = !memoryEnabledNow()
+      ? `<div class="drawer-row mini mem-paused" role="note">Project memory is paused: relo.context.projectMemory is off. Agents neither capture nor recall memory. You can still review, edit, promote, retire or delete entries here.</div>`
+      : "";
+    const help = `<div class="drawer-row mini">Your edits apply at once as verified entries with your provenance. Agent proposals wait for head review.</div>`;
+    const notice = ui.notice ? `<div class="drawer-row mini mem-notice${ui.notice.kind === "alert" ? " alert" : ""}" role="${ui.notice.kind === "alert" ? "alert" : "status"}">${esc(ui.notice.text)}</div>` : "";
+    const kinds = [...new Set(items.map((m) => String(m.kind || "")).filter(Boolean))].sort();
+    if (ui.filterKind && !kinds.includes(ui.filterKind)) kinds.push(ui.filterKind);
+    const filters = `<div class="drawer-row mem-filters" role="group" aria-label="Filter project memory">
+      <label class="mini">State <select data-mem-field="filterState" data-mem-key="mem-filter-state">${MEM_STATES.map(([v, t]) => `<option value="${attr(v)}"${v === ui.filterState ? " selected" : ""}>${esc(t)}</option>`).join("")}</select></label>
+      <label class="mini">Kind <select data-mem-field="filterKind" data-mem-key="mem-filter-kind"><option value="">All kinds</option>${kinds.map((k) => `<option value="${attr(k)}"${k === ui.filterKind ? " selected" : ""}>${esc(k)}</option>`).join("")}</select></label>
+      <label class="mini">Search <input type="search" data-mem-field="query" data-mem-key="mem-search" value="${attr(ui.query)}"/></label>
+      <div class="mini">Search covers the entries loaded here, not the whole catalog.</div></div>`;
+    const visible = items.filter((m) => memoryVisible(m, ui));
+    // One confirmation at a time: a new one replaces the old, so its keyed buttons stay unique.
+    const conf = ui.confirm && typeof ui.confirm.id === "string" ? { ...ui.confirm, busy: ui.busy === ui.confirm.id ? " disabled" : "" } : null;
+    // Flagged entries appear once, in the review list; the state groups hold the rest so every key stays unique.
+    const flagged = visible.filter((m) => m.flagged === true);
+    const review = flagged.length ? `<h4 class="mem-h" id="mem-group-flagged">Flagged for review (${flagged.length})</h4><div class="drawer-row mini">Agents flagged these entries as contradicting another entry. Nothing changes until you edit, promote, retire or delete one.</div><div role="list" aria-labelledby="mem-group-flagged">${flagged.map((m) => memoryItem(m, ui, conf)).join("")}</div>` : "";
+    const known = MEM_GROUPS.map((g) => g[0]);
+    const rest = visible.filter((m) => m.flagged !== true);
+    const groups = MEM_GROUPS.map(([st, label]) => ({ st, label, rows: rest.filter((m) => m.state === st) }))
+      .concat([{ st: "other", label: "Other", rows: rest.filter((m) => !known.includes(m.state)) }]);
+    const lists = groups.filter((g) => g.rows.length).map((g) => `<h4 class="mem-h" id="mem-group-${g.st}">${esc(g.label)} (${g.rows.length})</h4><div role="list" aria-labelledby="mem-group-${g.st}">${g.rows.map((m) => memoryItem(m, ui, conf)).join("")}</div>`).join("");
+    const empty = !items.length ? `<div class="drawer-row mini">No project memory yet</div>` : !visible.length ? `<div class="drawer-row mini">No entries match these filters</div>` : "";
+    return `<section class="mem" aria-labelledby="mem-heading"><h3 class="mem-h" id="mem-heading" tabindex="-1" data-mem-key="mem-section">Project memory</h3>${paused}${help}${notice}${filters}${empty}${review}${lists}</section>`;
+  }
+
+  // Moves focus to the element a memory action named (data-mem-key), so keyboard users keep their place.
+  function focusMemoryKey() {
+    const key = memoryUi.focus;
+    memoryUi.focus = "";
+    if (!key) return;
+    const el = Array.from(document.querySelectorAll("[data-mem-key]")).find((n) => n.getAttribute("data-mem-key") === key);
+    if (el && typeof el.focus === "function") el.focus();
+  }
+
+  function runMemoryAction(action, id) {
+    const entry = (state.memory || []).find((m) => m && m.id === id);
+    if (!entry && ["edit", "reload", "promote", "retire", "delete"].includes(action)) return;
+    const r = memoryStep(memoryUi, action, id, entry);
+    memoryUi = { ...r.ui, focus: r.focus || "" };
+    if (r.message) {
+      memPending[id] = { action: r.message.type, timer: 0 };
+      post(r.message);
+      armMemoryTimer(id);
+    }
+    render();
+    focusMemoryKey();
+  }
+
+  // Starts the 15s reply timer for one memory write. A dropped reply ends in memoryTimedOut for that entry only.
+  function armMemoryTimer(id) {
+    const p = memPending[id];
+    if (!p) return;
+    if (p.timer) clearTimeout(p.timer);
+    p.timer = setTimeout(() => {
+      p.timer = 0;
+      if (memPending[id] === p) delete memPending[id];
+      const next = memoryTimedOut(memoryUi, id);
+      if (next === memoryUi) return;
+      memoryUi = next;
+      render();
+      focusMemoryKey();
+    }, MEM_TIMEOUT_MS);
+  }
+
+  // A reply arrived for one entry: stop that entry's timer and leave every other entry's timer running.
+  function settleMemoryReply(ui, msg) {
+    const id = String(msg.id || "");
+    const p = id ? memPending[id] : undefined;
+    if (p) {
+      if (p.timer) clearTimeout(p.timer);
+      delete memPending[id];
+    }
+    return memoryResult(ui, msg);
+  }
+
+  // Keyed memory elements that focus can return to after a re-render (the drawer is rebuilt on every state change).
+  function memoryFocusSnapshot() {
+    const a = document.activeElement;
+    const key = a && a.getAttribute ? a.getAttribute("data-mem-key") : null;
+    if (!key || !a.closest || !a.closest(".mem")) return null;
+    return { key, caret: typeof a.selectionStart === "number" ? a.selectionStart : null };
+  }
+
+  function memoryFocusRestore(snap) {
+    if (!snap || memoryUi.focus) return;
+    const keys = Array.from(document.querySelectorAll(".mem [data-mem-key]")).filter((n) => !n.disabled).map((n) => n.getAttribute("data-mem-key"));
+    const target = memoryRestoreKey(snap.key, keys);
+    const el = Array.from(document.querySelectorAll("[data-mem-key]")).find((n) => n.getAttribute("data-mem-key") === target);
+    if (!el || typeof el.focus !== "function") return;
+    el.focus();
+    if (snap.caret !== null && target === snap.key && typeof el.setSelectionRange === "function") el.setSelectionRange(snap.caret, snap.caret);
+  }
+
   function drawerRowsContext(s) {
     const agents = (s.agents || []).filter((a) => a.window || a.contextTokens);
     const cache = (s.cache && s.cache.session) || null;
@@ -489,7 +771,8 @@
       </div>`;
     }).join("");
     const head = hit === null ? "" : `<div class="drawer-row mini">Cache hit ${hit}%</div>`;
-    return (head + rows) || `<div class="drawer-row mini">No context generation yet</div>`;
+    const generations = (head + rows) || `<div class="drawer-row mini">No context generation yet</div>`;
+    return generations + memorySection(s);
   }
 
   // A change waits for a decision until it is accepted or rejected. Direct-mode edits ("applied") are already on disk.
@@ -1585,7 +1868,7 @@
       runPanelHtml: (s, now, ui) => withState(s, () => runPanelHtml(s, now, ui)),
       msgHtml: (m) => msgHtml(m),
       chatHtml: (s) => withState(s, chat),
-      questionCards, questionItems, chatFeed, chatItemCount, questionAnswerMessage,
+      questionCards, questionItems, chatFeed, chatItemCount, questionAnswerMessage, memoryStep, memoryResult, memorySection, memoryTimedOut, memoryRestoreKey, memoryVisible, memoryEvidence, MEM_TIMEOUT_MS, memoryEnabled: (flag, cache) => withSettings(cache, "", () => { const prev = memoryFlagOn.on; memoryFlagOn.on = flag; try { return memoryEnabledNow(); } finally { memoryFlagOn.on = prev; } }),
       dashboardHtml: (s) => withState(s, dashboard),
       agentRowsHtml: (agents) => agentRows(agents),
       efficiencyHtml: (eff) => efficiencyHtml(eff),
@@ -1641,6 +1924,16 @@
   expandedLists = saved.expandedLists && typeof saved.expandedLists === "object" ? saved.expandedLists : {};
   composerDraft = typeof saved.draft === "string" ? saved.draft : "";
   const post = (message) => vscode.postMessage(message);
+  // Node test hooks for the timer, draft and refresh rules: the same module, driven through its own post.
+  const memTest = {
+    step: memoryStep,
+    result: memoryResult,
+    ui: () => memoryUi,
+    setUi: (u) => { memoryUi = u; },
+    pending: () => memPending,
+  };
+  if (typeof module !== "undefined") module.exports.__host = memTest;
+  if (typeof __reloTestHook === "object" && __reloTestHook) __reloTestHook.mem = memTest;
 
   // State is saved so a reloaded webview paints at once. Serialising it is not free, so writes are batched.
   let persistTimer = 0;
@@ -1668,6 +1961,9 @@
     if (msg.type === "state") {
       const before = state.session && state.session.id;
       state = msg.state || state;
+      // The flag drives the paused copy; keep the last value seen so a state without settings does not clear it.
+      const flag = msg.state && msg.state.settings && msg.state.settings["relo.context.projectMemory"];
+      if (typeof flag === "boolean") memoryFlagOn.on = flag;
       if (before && state.session && state.session.id !== before) {
         // A different session: per-run UI state of the old one means nothing here.
         runUi.cardOpen = {};
@@ -1682,6 +1978,20 @@
       // An open provider form keeps focus: streaming state must not rebuild the page under the cursor.
       if (page === "settings" && (providerForm || openPicker)) persist();
       else render();
+    } else if (msg.type === "memory.result") {
+      const r = settleMemoryReply(memoryUi, msg);
+      memoryUi = { ...r.ui, focus: r.focus || "" };
+      render();
+      focusMemoryKey();
+    } else if (msg.type === "memory.refresh" && Array.isArray(msg.memory)) {
+      // A memory flash must not be swallowed: an unsaved draft stays, but the list is replaced and its notice shown.
+      // Entries with a write in flight keep the run's copy, so a reply is not lost to a list that has not caught up.
+      // A confirm for an entry the refresh no longer lists is dropped, so a stale yes cannot be sent.
+      const inFlight = (m) => m && typeof m.id === "string" && !!memPending[m.id];
+      state = { ...state, memory: [...msg.memory.filter((m) => !inFlight(m)), ...(state.memory || []).filter(inFlight)] };
+      const c = memoryUi.confirm;
+      if (c && !msg.memory.some((m) => m && m.id === c.id)) memoryUi = { ...memoryUi, confirm: null };
+      if (openDrawerName === "context") render();
     } else if (msg.type === "question.error") {
       if (msg.taskId) { pendingQuestions.delete(msg.taskId); questionErrors[msg.taskId] = msg.error || "Answer failed"; }
       render();
@@ -1813,6 +2123,7 @@
     const kind = view !== "chat" ? view : page;
     const inChat = kind === "chat";
     const prevView = inChat && lastKind === "chat" ? captureView() : null;
+    const memSnap = memoryFocusSnapshot();
     let html;
     if (view === "dashboard") html = dashboard();
     else if (view === "context") html = inspector();
@@ -1836,6 +2147,7 @@
         if (q) { q.focus(); q.setSelectionRange(q.value.length, q.value.length); }
       }
     }
+    memoryFocusRestore(memSnap);
     persist();
   }
 
@@ -1892,6 +2204,7 @@
     const at = (selector) => t.closest(selector);
     let el;
     if ((el = at("[data-question-option], [data-question-custom]"))) { sendQuestionAnswer(el); return; }
+    if ((el = at("[data-mem-action]"))) { runMemoryAction(el.getAttribute("data-mem-action"), el.getAttribute("data-id") || ""); return; }
     if (menuOpen && !at("#more-menu") && !at("#more")) setMenu(false, false); // a click elsewhere closes the menu
     if ((el = at("[data-menu-cmd]"))) { setMenu(false, false); post({ type: "command", command: el.getAttribute("data-menu-cmd") }); return; }
     if (at("#more")) { setMenu(!menuOpen, true); return; }
@@ -1961,6 +2274,7 @@
   function onRootKeydown(e) {
     const t = e.target;
     if (!t || !t.closest) return;
+    if (e.key === "Escape" && t.getAttribute && t.getAttribute("data-mem-field")) { e.preventDefault(); runMemoryAction("cancel", memoryUi.editId); return; }
     if (t.id === "box") {
       const act = enterAction(e);
       if (act === "ignore") return;
@@ -1999,9 +2313,15 @@
   root.addEventListener("keydown", onRootKeydown);
   root.addEventListener("input", (e) => {
     if (e.target && e.target.id === "box") { composerDraft = e.target.value; autosize(); persist(); }
+    const field = e.target && e.target.getAttribute ? e.target.getAttribute("data-mem-field") : null;
+    if (field === "title") memoryUi.title = e.target.value;
+    else if (field === "body") memoryUi.body = e.target.value;
+    else if (field === "query") { memoryUi.query = e.target.value; render(); }
   });
   root.addEventListener("change", (e) => {
     if (e.target && e.target.id === "mode") post({ type: "mode", mode: e.target.value });
+    const memFilter = e.target && e.target.getAttribute ? e.target.getAttribute("data-mem-field") : null;
+    if (memFilter === "filterState" || memFilter === "filterKind") { memoryUi[memFilter] = e.target.value; render(); }
     if (e.target && e.target.matches("[data-auto-apply]")) post({ type: "settings.set", key: "relo.changes.autoApply", value: e.target.checked });
     if (e.target && e.target.matches("[data-question-delegate]")) post({ type: "question.delegate", enabled: e.target.checked });
   });

@@ -217,16 +217,17 @@ func (a *App) sweepTemp() {
 // than an hour, is swept. It lives outside os.TempDir(), so the temp sweep never sees it.
 //
 // At startup this core's own marker is not there yet, or is planted concurrently by startRuntime: the sweep must
-// never clear it, or another core could collect this core's temp files. onClose drops this core's marker first
-// (its runtime has stopped by then) and sweeps after, which still keeps everything while another core is live.
+// never clear it, or another core could collect this core's temp files. Each core plants its own marker and drops
+// only that one, so a core in this process closing does not unmark the root another core still writes to. onClose
+// drops this core's marker first (its runtime has stopped by then) and sweeps after, which still keeps everything
+// while another core is live.
 func (a *App) sweepStateTemp(onClose bool) {
 	root := a.stateRoot()
 	if root == "" {
 		return
 	}
-	pid := os.Getpid()
 	if onClose {
-		if err := opencode.UnmarkTmp(root, pid); err != nil {
+		if err := a.dropStateTmpMarker(root); err != nil {
 			a.Log.Warn("unmark open code temp dir", map[string]any{"error": err.Error()})
 		}
 	}
@@ -239,6 +240,28 @@ func (a *App) sweepStateTemp(onClose bool) {
 			a.Log.Info("removed stale temp data", map[string]any{"count": n, "dir": opencode.TmpDir(root)})
 		}
 	}
+}
+
+// holdStateTmpMarker plants this core's marker in OpenCode's private temp directory and remembers it for Close.
+func (a *App) holdStateTmpMarker(root string) {
+	marker, err := opencode.EnsureTmp(root, os.Getpid())
+	if err != nil {
+		a.Log.Warn("open code temp dir", map[string]any{"error": err.Error()})
+		return
+	}
+	a.tmpMu.Lock()
+	a.tmpMarker = marker
+	a.tmpMu.Unlock()
+}
+
+// dropStateTmpMarker drops the marker this core planted, and only that one: pid's own marker from an earlier path
+// stays when another core in this process still holds it.
+func (a *App) dropStateTmpMarker(root string) error {
+	a.tmpMu.Lock()
+	marker := a.tmpMarker
+	a.tmpMarker = 0
+	a.tmpMu.Unlock()
+	return opencode.UnmarkTmp(root, marker)
 }
 
 // newSession stops whatever is running, saves the session being left and starts a blank one.

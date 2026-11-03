@@ -3,6 +3,7 @@ package persistence
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"math"
 	"net/url"
 	"os"
@@ -118,7 +119,6 @@ func importLegacyCatalog(path string, catalog *sql.DB) error {
 	}
 	for _, spec := range []struct{ table, columns string }{
 		{"kv", "k,v,updated_at"},
-		{"memory", "id,workspace,payload,updated_at"},
 		{"vworkspaces", "workspace,agent_id,session_id,base_commit,revision,tree_oid,state,payload,updated_at"},
 		{"sessions", "id,workspace,updated_at"},
 	} {
@@ -132,6 +132,11 @@ func importLegacyCatalog(path string, catalog *sql.DB) error {
 		if err := copyRows(legacy, tx, spec.table, spec.columns, "", nil); err != nil {
 			return fmt.Errorf("import catalog %s: %w", spec.table, err)
 		}
+	}
+	// Memory rows never pass through copyRows: they are intake-checked and rewritten as schema v2 candidates in
+	// the memory package, inside this transaction, so the import cannot leave a raw or unguarded row behind.
+	if err := importLegacyMemory(legacy, tx); err != nil {
+		return fmt.Errorf("import catalog memory: %w", err)
 	}
 	for _, table := range []string{"agents", "tasks", "generations", "findings", "reports", "changes", "verification"} {
 		ok, err := legacyTableExists(legacy, table)
@@ -170,6 +175,76 @@ func importLegacyCatalog(path string, catalog *sql.DB) error {
 	}
 	return tx.Commit()
 }
+
+// importLegacyMemory rewrites the legacy memory rows as schema v2 candidates on the catalog transaction, applying
+// the intake of the memory store through the registered LegacyMemoryImporter: a raw legacy row is never copied, it
+// is either converted or dropped and counted, so the import cannot leave an unguarded or unscrubbed row behind. A
+// payload that is not JSON fails the whole import, exactly as the memory migration does.
+func importLegacyMemory(legacy *sql.DB, tx *sql.Tx) error {
+	ok, err := legacyTableExists(legacy, "memory")
+	if err != nil || !ok {
+		return err
+	}
+	rows, err := legacy.Query(`SELECT id, workspace, payload, updated_at FROM memory ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	var all []LegacyMemoryRow
+	for rows.Next() {
+		var r LegacyMemoryRow
+		if err := rows.Scan(&r.ID, &r.Workspace, &r.Payload, &r.Updated); err != nil {
+			rows.Close()
+			return err
+		}
+		all = append(all, r)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	// The guard refuses the legacy payloads themselves, so it is lifted for this transaction and reinstalled before
+	// the commit. Any other writer stays blocked while this write transaction holds the catalog.
+	if err := EnsureMemorySchema(tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS memory_guard_insert; DROP TRIGGER IF EXISTS memory_guard_update;`); err != nil {
+		return err
+	}
+	kept, scrubbed := 0, 0
+	if len(all) > 0 {
+		if EnsureLegacyMemoryIntake == nil {
+			return fmt.Errorf("%w: memory intake not registered", syscall.ENOTSUP)
+		}
+		var err error
+		kept, scrubbed, err = EnsureLegacyMemoryIntake(tx, all)
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(MemoryGuardSQL); err != nil {
+		return err
+	}
+	if scrubbed > 0 {
+		log.Printf("persistence: legacy memory import: %d candidates kept, %d scrubbed", kept, scrubbed)
+	}
+	return nil
+}
+
+// LegacyMemoryRow is one pre-v2 memory row of the legacy database. Payload is the raw stored JSON.
+type LegacyMemoryRow struct {
+	ID, Workspace, Payload string
+	Updated                int64
+}
+
+// LegacyMemoryIntake converts pre-v2 rows with the intake of the memory store, inserts the candidates on tx and
+// reports how many were kept and how many were scrubbed.
+type LegacyMemoryIntake func(tx *sql.Tx, rows []LegacyMemoryRow) (kept, scrubbed int, err error)
+
+// EnsureLegacyMemoryIntake is installed by internal/memory at init, so every binary that imports memory (the core
+// does, through app) imports legacy rows through the same intake as its migration. Without it the import fails
+// rather than copying raw rows or dropping rows it cannot classify.
+var EnsureLegacyMemoryIntake LegacyMemoryIntake
 
 // copyRows copies a fixed, caller-supplied column list; identifiers never come
 // from the database or user input.

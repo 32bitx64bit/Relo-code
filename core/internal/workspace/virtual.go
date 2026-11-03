@@ -123,6 +123,16 @@ func (m *Manager) tell(kind, message string) {
 	}
 }
 
+// ErrClosed is returned by the virtual workspace queries once Close has run. The manager never reopens the engine
+// after Close: its recovery would write checkpoints into the repository while the owner is tearing it down.
+var ErrClosed = errors.New("workspace manager is closed")
+
+func (m *Manager) isClosed() bool {
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	return m.closed
+}
+
 func (m *Manager) observe(ev vws.Event) {
 	m.vmu.Lock()
 	fn := m.observer
@@ -132,6 +142,21 @@ func (m *Manager) observe(ev vws.Event) {
 	}
 }
 
+// observeAsync runs the observer in its own goroutine, because the engine may publish while it holds vmu. An event
+// that arrives after Close is dropped; Close waits for the ones already running.
+func (m *Manager) observeAsync(ev vws.Event) {
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	if m.closed {
+		return
+	}
+	m.observers.Add(1)
+	go func() {
+		defer m.observers.Done()
+		m.observe(ev)
+	}()
+}
+
 // reloWorktrees is the folder execution directories live in. It is where worktree mode keeps its worktrees too, so
 // an agent's path is the same in both modes.
 func (m *Manager) reloWorktrees() string { return filepath.Join(m.root, ".relo", "worktrees") }
@@ -139,22 +164,32 @@ func (m *Manager) reloWorktrees() string { return filepath.Join(m.root, ".relo",
 // engine returns the virtual workspace engine, opening it on first use. Without create it opens only when Git
 // already holds virtual workspaces to adopt, so a repository that never used the feature pays nothing for it.
 func (m *Manager) engine(create bool) *vws.Engine {
+	eng, _ := m.openEngine(create)
+	return eng
+}
+
+// openEngine is engine, but it reports ErrClosed after Close, so a caller can tell a closed manager from an engine
+// that does not exist.
+func (m *Manager) openEngine(create bool) (*vws.Engine, error) {
 	m.vmu.Lock()
 	defer m.vmu.Unlock()
+	if m.isClosed() {
+		return nil, ErrClosed
+	}
 	if m.eng != nil {
-		return m.eng
+		return m.eng, nil
 	}
 	if !isGit(m.root) {
-		return nil
+		return nil, nil
 	}
 	if !create {
 		if m.vwsAbsent {
-			return nil
+			return nil, nil
 		}
 		out, err := git(m.root, "for-each-ref", "--count=1", "--format=%(refname)", "refs/relo/vws/")
 		if err != nil || out == "" {
 			m.vwsAbsent = true
-			return nil
+			return nil, nil
 		}
 	}
 	eng, err := vws.Open(m.root, vws.Options{
@@ -163,18 +198,18 @@ func (m *Manager) engine(create bool) *vws.Engine {
 		Ignore:       isReloPath,
 		ExecRoot:     m.reloWorktrees(),
 		Materializer: &vws.WorktreeMaterializer{Prepare: func(dir string) { linkDeps(m.root, dir) }},
-		Observer:     func(ev vws.Event) { go m.observe(ev) },
+		Observer:     m.observeAsync,
 	})
 	if err != nil {
 		m.engErr = err
-		return nil
+		return nil, nil
 	}
 	m.eng, m.vwsAbsent = eng, false
 	if rep, err := eng.Recover(context.Background()); err == nil && (len(rep.Recovered) > 0 || len(rep.Problems) > 0) {
 		m.recovered = rep
 		go m.reportRecovery(rep)
 	}
-	return eng
+	return eng, nil
 }
 
 // Recovered is what the last start found: workspaces restored, materializations that were still open, and
@@ -194,19 +229,23 @@ func (m *Manager) reportRecovery(rep vws.RecoverReport) {
 	}
 }
 
-// wantVirtual says whether a new isolated copy should be a virtual workspace, and why not when it should not.
-func (m *Manager) wantVirtual() (bool, string) {
+// wantVirtual says whether a new isolated copy should be a virtual workspace, and why not when it should not. It
+// reports ErrClosed after Close rather than falling back to a worktree.
+func (m *Manager) wantVirtual() (bool, string, error) {
 	if cfg := m.Config(); cfg.Mode != ModeVirtual && cfg.Mode != ModeAuto {
-		return false, ""
+		return false, "", nil
 	}
-	eng := m.engine(true)
+	eng, err := m.openEngine(true)
+	if err != nil {
+		return false, "", err
+	}
 	if eng == nil {
-		return false, "the virtual workspace engine could not be opened"
+		return false, "the virtual workspace engine could not be opened", nil
 	}
 	if c := eng.RefreshCompat(); !c.OK {
-		return false, "this repository rewrites file content on checkout (" + strings.Join(c.Reasons, "; ") + ")"
+		return false, "this repository rewrites file content on checkout (" + strings.Join(c.Reasons, "; ") + ")", nil
 	}
-	return true, ""
+	return true, "", nil
 }
 
 // reportRejected tells the user, once per path, about files an agent's tools made that were not imported: a link that
@@ -259,7 +298,10 @@ func (m *Manager) virtualTreeLocked(agentID, dir string) (Tree, bool, error) {
 	if _, err := os.Stat(dir); err == nil {
 		return Tree{}, false, nil // an existing worktree is adopted as one
 	}
-	want, why := m.wantVirtual()
+	want, why, err := m.wantVirtual()
+	if err != nil {
+		return Tree{}, false, err
+	}
 	if !want {
 		if why != "" {
 			m.fellBack(why)
@@ -273,7 +315,14 @@ func (m *Manager) virtualTreeLocked(agentID, dir string) (Tree, bool, error) {
 			return Tree{}, false, err
 		}
 	}
-	w, err := m.engine(true).Create(agentID, base, vws.CreateOptions{})
+	eng, err := m.openEngine(true)
+	if err != nil {
+		return Tree{}, false, err
+	}
+	if eng == nil {
+		return Tree{}, false, errors.New("the virtual workspace engine could not be opened")
+	}
+	w, err := eng.Create(agentID, base, vws.CreateOptions{})
 	if err != nil {
 		if errors.Is(err, vws.ErrUnsupportedRepo) {
 			m.fellBack(err.Error())
@@ -629,44 +678,55 @@ func (m *Manager) sweepVirtual(keep, live map[string]bool) (removed int) {
 
 // VirtualWorkspaces lists the virtual workspaces that exist, oldest first. It opens the engine only when Git already
 // holds some, so a repository that never used the feature pays nothing for asking.
-func (m *Manager) VirtualWorkspaces() []vws.VirtualWorkspace {
-	eng := m.engine(false)
-	if eng == nil {
-		return nil
+// After Close it returns ErrClosed, so a caller cannot mistake a closed manager for an empty one.
+func (m *Manager) VirtualWorkspaces() ([]vws.VirtualWorkspace, error) {
+	eng, err := m.openEngine(false)
+	if err != nil {
+		return nil, err
 	}
-	return eng.List()
+	if eng == nil {
+		return nil, nil
+	}
+	return eng.List(), nil
 }
 
-// VirtualWorkspace returns one agent's workspace record.
-func (m *Manager) VirtualWorkspace(agentID string) (vws.VirtualWorkspace, bool) {
-	eng := m.engine(false)
+// VirtualWorkspace returns one agent's workspace record. It returns ErrClosed after Close.
+func (m *Manager) VirtualWorkspace(agentID string) (vws.VirtualWorkspace, bool, error) {
+	eng, err := m.openEngine(false)
+	if err != nil {
+		return vws.VirtualWorkspace{}, false, err
+	}
 	if eng == nil {
-		return vws.VirtualWorkspace{}, false
+		return vws.VirtualWorkspace{}, false, nil
 	}
 	w, ok := eng.Get(agentID)
 	if !ok {
-		return vws.VirtualWorkspace{}, false
+		return vws.VirtualWorkspace{}, false, nil
 	}
-	return w.Info(), true
+	return w.Info(), true, nil
 }
 
-// VirtualMetrics reports the work the virtual engine has done since it opened, for comparison with worktrees.
+// VirtualMetrics reports the work the virtual engine has done since it opened, for comparison with worktrees. It
+// reads the engine through openEngine, so a closed manager never reopens it.
 func (m *Manager) VirtualMetrics() (vws.Metrics, bool) {
-	m.vmu.Lock()
-	eng := m.eng
-	m.vmu.Unlock()
-	if eng == nil {
+	eng, err := m.openEngine(false)
+	if err != nil || eng == nil {
 		return vws.Metrics{}, false
 	}
 	return eng.Metrics(), true
 }
 
-// Close stops the helper processes of the virtual engine. Workspaces and their refs are untouched.
+// Close stops the helper processes of the virtual engine. Workspaces and their refs are untouched. Once it returns,
+// no observer is running and the engine is not reopened, so nothing is written to the repository after it.
 func (m *Manager) Close() error {
+	m.closeMu.Lock()
+	m.closed = true
+	m.closeMu.Unlock()
 	m.vmu.Lock()
 	eng := m.eng
 	m.eng = nil
 	m.vmu.Unlock()
+	m.observers.Wait()
 	if eng != nil {
 		return eng.Close()
 	}

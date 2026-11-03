@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -235,7 +234,8 @@ func TestIsolationEnvAndChildEnv(t *testing.T) {
 // live, a live-marked directory survives the sweep whatever its age, and only old unmarked entries are removed.
 func TestEnsureTmpAndStaleTmpDirs(t *testing.T) {
 	root := t.TempDir()
-	if err := EnsureTmp(root, os.Getpid()); err != nil {
+	marker, err := EnsureTmp(root, os.Getpid())
+	if err != nil {
 		t.Fatal(err)
 	}
 	if st, err := os.Stat(TmpDir(root)); err != nil || !st.IsDir() {
@@ -261,7 +261,7 @@ func TestEnsureTmpAndStaleTmpDirs(t *testing.T) {
 		t.Fatalf("live-marked dir listed %v (%v), want nothing", names, err)
 	}
 	// Once that core is gone (marker removed), only the old entry is stale.
-	if err := UnmarkTmp(root, os.Getpid()); err != nil {
+	if err := UnmarkTmp(root, marker); err != nil {
 		t.Fatal(err)
 	}
 	names, err := StaleTmpDirs(root)
@@ -278,7 +278,7 @@ func TestEnsureTmpAndStaleTmpDirs(t *testing.T) {
 	if _, err := os.Stat(fresh); err != nil {
 		t.Fatalf("fresh entry removed: %v", err)
 	}
-	if EnsureTmp("", os.Getpid()) != nil || len(Isolation("")) != 0 {
+	if marker, err := EnsureTmp("", os.Getpid()); marker != os.Getpid() || err != nil || len(Isolation("")) != 0 {
 		t.Fatal("an empty root must mean no isolation and no temp dir")
 	}
 }
@@ -293,7 +293,8 @@ func TestALiveMarkedEntrySurvivesTheSweep(t *testing.T) {
 	}
 	// The other core's marker: the test binary itself stands in for it, because it is a running process.
 	other := os.Getppid()
-	if err := tempdir.Mark(dir, other); err != nil {
+	otherMarker, err := tempdir.MarkUnique(dir, other)
+	if err != nil {
 		t.Fatal(err)
 	}
 	old := time.Now().Add(-2 * tmpStaleAge)
@@ -306,7 +307,7 @@ func TestALiveMarkedEntrySurvivesTheSweep(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "go-build999")); err != nil {
 		t.Fatalf("live core's temp data removed: %v", err)
 	}
-	if err := os.Remove(filepath.Join(dir, strconv.Itoa(other)+".live")); err != nil {
+	if err := tempdir.UnmarkUnique(dir, otherMarker); err != nil {
 		t.Fatal(err)
 	}
 	if names, _ := StaleTmpDirs(root); len(names) != 1 {

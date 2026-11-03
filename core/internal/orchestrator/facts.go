@@ -8,6 +8,11 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
+
+	ctxeng "github.com/relocode/relo/internal/context"
+	"github.com/relocode/relo/internal/memory"
+	"github.com/relocode/relo/internal/taskgraph"
 )
 
 // refreshSnapshot re-reads the user's working tree so that agents started from now on are cut from what the user
@@ -240,6 +245,149 @@ func (c *Coord) settled() bool {
 	return c.Graph.Settled()
 }
 
-// staleMemory prefixes what memory recalls. It is what a worker reported in an earlier session, true then; the
-// code may have changed since, and a recalled "the rename is done" has misled the Primary about the present.
-const staleMemory = "From an earlier session, may be out of date: "
+// recalledNote heads every recalled memory. It is what was observed in an earlier session, quoted as data: the code may
+// have changed since, and a recalled "the rename is done" has misled the Primary about the present.
+const recalledNote = "Untrusted historical project observation; verify before use. "
+
+// Recall limits for one prompt, per docs/design/project-memory.md §5. Tokens are estimated with ctxeng.Tokens over the
+// rendered item; bytes are the rendered text. Both caps and memory.RecallLimit apply together.
+const (
+	recallMaxTokens = 300
+	recallMaxBytes  = 1200
+	// memoryExpiry is how long command evidence stays current; older command evidence marks its entry stale.
+	memoryExpiry = 30 * 24 * time.Hour
+)
+
+// recallItems returns the memory fit for q as seen from root: verified entries only, whose evidence is current in that
+// view. Expired command evidence marks its entry stale for every view; a view-specific mismatch only drops the entry here
+// and never changes it. Result is capped by CapRecall.
+func (c *Coord) recallItems(root string, q memory.RecallQuery) []ctxeng.Item {
+	view := newWorktreeView(root)
+	now := time.Now().UTC()
+	var expired []memory.Entry
+	// Freshness is judged before the entry cap, so stale matches never use up a recall slot.
+	recalled := c.Memory.RecallScopedWhere(q, func(e memory.Entry) bool {
+		if commandExpired(e, now) {
+			expired = append(expired, e)
+			return false
+		}
+		f, _ := memory.CheckFreshness(e, view)
+		return f == memory.FreshCurrent
+	})
+	for _, e := range expired {
+		if _, err := c.Memory.MarkStale(e.ID, e.Revision, "expired: command evidence older than 30 days"); err != nil {
+			c.logWarn("memory stale", err)
+		}
+	}
+	items := make([]ctxeng.Item, 0, len(recalled))
+	for _, e := range recalled {
+		items = append(items, recalledItem(e))
+	}
+	return ctxeng.CapRecall(items, memory.RecallLimit, recallMaxTokens, recallMaxBytes)
+}
+
+// refreshRecall replaces the recalled memory of agentID with what q recalls as seen from root. With Settings.Memory off it
+// clears the group, so a prompt rendered after the flag turns off carries no recalled memory.
+func (c *Coord) refreshRecall(agentID, root string, q memory.RecallQuery) {
+	if !c.settings().Memory {
+		c.Engine.SetRecall(agentID, nil)
+		return
+	}
+	c.Engine.SetRecall(agentID, c.recallItems(root, q))
+}
+
+// integrationRecallQuery is the recall query for a Primary prompt after workers finish: the objective, with the files the
+// completed tasks name. It is recomputed each time so recall reflects the work done, not the first turn's text.
+func (c *Coord) integrationRecallQuery(s *Session) memory.RecallQuery {
+	q := memory.RecallQuery{Text: s.Objective}
+	seen := map[string]bool{}
+	add := func(f string) {
+		if !seen[f] {
+			seen[f] = true
+			q.Files = append(q.Files, f)
+		}
+	}
+	for _, t := range c.Graph.List() {
+		if t.Status != taskgraph.Done {
+			continue
+		}
+		for f := range taskScopeFiles(t) {
+			add(f)
+		}
+		for _, f := range t.Paths {
+			add(f)
+		}
+	}
+	return q
+}
+
+// commandExpired reports whether any command evidence of e was observed more than memoryExpiry before now.
+func commandExpired(e memory.Entry, now time.Time) bool {
+	for _, ev := range e.Evidence {
+		if ev.Type == memory.EvidenceCommandResult && now.Sub(ev.ObservedAt) > memoryExpiry {
+			return true
+		}
+	}
+	return false
+}
+
+// recalledItem renders a recalled entry as untrusted data: its ID, observation time and evidence paths, then the body
+// quoted. It is never Verified and never carries the verified_fact source.
+func recalledItem(e memory.Entry) ctxeng.Item {
+	var observed time.Time
+	for _, ev := range e.Evidence {
+		if ev.ObservedAt.After(observed) {
+			observed = ev.ObservedAt
+		}
+	}
+	content := fmt.Sprintf("%sID %s, observed %s, evidence %s.\nQuoted data:\n%s", recalledNote, e.ID,
+		observed.Format(time.DateOnly), strings.Join(e.Files, ", "), e.Body)
+	return ctxeng.Item{Class: ctxeng.ClassMemory, Source: ctxeng.SourceRecalled, Title: e.Title, Content: content, Files: e.Files, Durability: 0.8}
+}
+
+// maxPendingMemoryListed bounds the head's review queue so a large candidate backlog cannot flood the context.
+const maxPendingMemoryListed = 20
+
+// pendingMemoryItems lists the agent candidates the head may promote, reject or retire. The listing carries ids,
+// revisions, kinds, evidence refs and titles only: what a memoryActions decision cites, never the entry body.
+func (c *Coord) pendingMemoryItems() []ctxeng.Item {
+	// Only the candidates listed below may be decided in the Primary's next turn: a decision on any other id, or on a
+	// listed id at a different revision, is refused (see applyMemoryActions).
+	presented := map[string]int64{}
+	defer func() { c.setPresentedMemory(presented) }()
+	entries, err := c.Memory.Load()
+	if err != nil {
+		// A failed load lists nothing, so nothing may be decided: clear the set rather than leave the previous turn's
+		// listing in place.
+		c.dropPresentedMemory()
+		c.logWarn("load pending memory candidates", err)
+		return nil
+	}
+	var lines []string
+	overflow := 0
+	for _, e := range entries {
+		// Candidates may be promoted or rejected; verified agent entries may be retired. User entries are never listed.
+		listable := e.State == memory.StateCandidate || (e.State == memory.StateVerified && e.Source != memory.SourceUser)
+		if !listable {
+			continue
+		}
+		if len(lines) == maxPendingMemoryListed {
+			overflow++
+			continue
+		}
+		refs := make([]string, 0, len(e.Evidence))
+		for _, ev := range e.Evidence {
+			refs = append(refs, ev.Ref)
+		}
+		presented[e.ID] = e.Revision
+		lines = append(lines, fmt.Sprintf("- id %s revision %d state %s kind %s evidence [%s]: %s", e.ID, e.Revision, e.State, e.Kind, strings.Join(refs, ", "), e.Title))
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	if overflow > 0 {
+		lines = append(lines, fmt.Sprintf("- %d more pending candidates are not listed; decide them in a later turn.", overflow))
+	}
+	return []ctxeng.Item{{Source: ctxeng.SourceSystem, Kind: ctxeng.KindConstraint, Durability: 0.8,
+		Content: "## Pending memory candidates (agent-proposed, not yet permanent) and verified agent entries. Decide each with memoryActions {op,id,revision,evidence,rationale}. Cite the id and revision exactly as listed; decide only listed ids. promote makes it permanent and needs its listed evidence refs; reject discards a candidate and needs no evidence; retire withdraws a listed verified entry. Core applies each decision through the head gate and refuses the rest. A turn may carry memoryActions with tasks [].\n" + strings.Join(lines, "\n")}}
+}

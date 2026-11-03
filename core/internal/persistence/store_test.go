@@ -3,9 +3,11 @@ package persistence
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -285,5 +287,151 @@ func TestVWorkspaceTableNeedsNoSchemaVersion(t *testing.T) {
 	var version int
 	if err := testSessionDB(t, s, "s1").QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
 		t.Fatalf("user_version = %d %v, want 2", version, err)
+	}
+}
+
+// The generic store refuses the memory table: rows exist only through memory.Store, with v2 payloads.
+func TestGenericAccessRefusesMemoryTable(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.PutSession("s1", "workspace", struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutJSON("memory", "m1", "s1", "", map[string]string{"id": "m1"}); err == nil {
+		t.Fatal("PutJSON accepted memory")
+	}
+	if err := s.Get("memory", "m1", &struct{}{}); err == nil {
+		t.Fatal("Get accepted memory")
+	}
+	if err := s.GetIn("memory", "m1", "s1", &struct{}{}); err == nil {
+		t.Fatal("GetIn accepted memory")
+	}
+	if _, err := s.List("memory", "workspace"); err == nil {
+		t.Fatal("List accepted memory")
+	}
+	var n int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM memory`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("memory rows=%d err=%v", n, err)
+	}
+}
+
+// A catalog opened without memory.Open still carries the guard triggers, so an older writer is refused from the start.
+func TestOpenInstallsMemoryGuard(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var n int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN ('memory_guard_insert','memory_guard_update')`).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("guards=%d err=%v", n, err)
+	}
+	_, err = s.DB().Exec(`INSERT INTO memory(id, workspace, payload, updated_at) VALUES('m1', '/home/me@example.com/repo', '{"id":"m1","title":"legacy"}', 1)`)
+	if err == nil {
+		t.Fatal("legacy memory write accepted")
+	}
+}
+
+// The guard accepts a v2 retired or stale row in an opaque partition, still refuses a legacy payload, and refuses a
+// state it does not know, including on UPDATE of an existing row.
+func TestMemoryGuardAllowsRetiredAndStale(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.DB().Exec(`INSERT INTO memory(id, workspace, payload, updated_at, revision, state) VALUES('m2', 'ws_abc', '{"schemaVersion":2,"id":"m2"}', 1, 1, 'retired')`); err != nil {
+		t.Fatalf("retired v2 write refused: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE memory SET state='stale' WHERE id='m2'`); err != nil {
+		t.Fatalf("stale v2 write refused: %v", err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO memory(id, workspace, payload, updated_at, revision, state) VALUES('m4', 'ws_abc', '{"schemaVersion":2,"id":"m4"}', 1, 1, 'stale')`); err != nil {
+		t.Fatalf("stale v2 insert refused: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE memory SET state='archived' WHERE id='m2'`); err == nil {
+		t.Fatal("unknown state accepted")
+	}
+	if _, err := s.DB().Exec(`INSERT INTO memory(id, workspace, payload, updated_at, revision, state) VALUES('m3', 'ws_abc', '{"id":"m3","title":"legacy"}', 1, 1, 'retired')`); err == nil {
+		t.Fatal("legacy payload accepted for retired state")
+	}
+	if _, err := s.DB().Exec(`INSERT INTO memory(id, workspace, payload, updated_at, revision, state) VALUES('m5', 'ws_abc', '{"id":"m5","title":"legacy"}', 1, 1, 'stale')`); err == nil {
+		t.Fatal("legacy payload accepted for stale state")
+	}
+}
+
+// Legacy rows are converted in the import transaction: unsafe rows are scrubbed, the rest become v2 candidates in an
+// opaque partition and stay covered by the guard afterwards.
+func TestLegacyCatalogImportRewritesMemoryRows(t *testing.T) {
+	// This package does not link internal/memory (memory is built on it), so the test installs the intake memory
+	// registers at init in a real binary.
+	prev := EnsureLegacyMemoryIntake
+	t.Cleanup(func() { EnsureLegacyMemoryIntake = prev })
+	EnsureLegacyMemoryIntake = func(tx *sql.Tx, rows []LegacyMemoryRow) (int, int, error) {
+		kept, scrubbed := 0, 0
+		for _, r := range rows {
+			var raw struct {
+				Kind  string `json:"kind"`
+				Title string `json:"title"`
+				Body  string `json:"body"`
+			}
+			if err := json.Unmarshal([]byte(r.Payload), &raw); err != nil {
+				return 0, 0, err
+			}
+			if strings.Contains(raw.Title, "key") || strings.Contains(raw.Body, "sk-live-") {
+				scrubbed++
+				continue
+			}
+			payload, _ := json.Marshal(map[string]any{"schemaVersion": 2, "id": r.ID, "revision": 1,
+				"kind": "fact", "state": "candidate", "title": raw.Title, "body": raw.Body, "source": "legacy"})
+			if _, err := tx.Exec(`INSERT INTO memory(id, workspace, payload, revision, state, updated_at) VALUES(?,?,?,1,'candidate',?)`,
+				r.ID, "ws_test", payload, r.Updated); err != nil {
+				return 0, 0, err
+			}
+			kept++
+		}
+		return kept, scrubbed, nil
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "relo.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.Close()
+	legacy.SetMaxOpenConns(1)
+	if _, err := legacy.Exec(testLegacySchema); err != nil {
+		t.Fatal(err)
+	}
+	rows := []struct{ id, workspace, payload string }{
+		{"mem_ok", "/home/me@example.com/repo", `{"id":"mem_ok","kind":"fact","title":"Run core tests","body":"go test from core","files":["core/go.mod"],"verified":true,"source":"worker","score":0.9}`},
+		{"mem_bad", "/home/me@example.com/repo", `{"id":"mem_bad","kind":"fact","title":"key","body":"sk-live-0123456789abcdef0123456789abcdef"}`},
+		{"mem_kind", "/home/me@example.com/repo", `{"id":"mem_kind","kind":"note","title":"Note","body":"kept as fact"}`},
+	}
+	for _, r := range rows {
+		if _, err := legacy.Exec(`INSERT INTO memory(id,workspace,payload,updated_at) VALUES(?,?,?,?)`, r.id, r.workspace, r.payload, 1767225600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := Open(filepath.Join(dir, "catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var n int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM memory WHERE id='mem_bad'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("unsafe row kept: %d %v", n, err)
+	}
+	if err := s.DB().QueryRow(`SELECT count(*) FROM memory WHERE workspace LIKE '/home/%' OR json_extract(payload, ?) IS NOT 2 OR json_extract(payload, ?) IS NOT 'candidate'`, "$.schemaVersion", "$.state").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("raw or non-candidate rows=%d err=%v", n, err)
+	}
+	if err := s.DB().QueryRow(`SELECT count(*) FROM memory`).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("migrated rows=%d err=%v", n, err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO memory(id, workspace, payload, updated_at) VALUES('mem_new', '/home/me@example.com/repo', '{"id":"mem_new"}', 2)`); err == nil {
+		t.Fatal("guard missing after legacy import")
 	}
 }

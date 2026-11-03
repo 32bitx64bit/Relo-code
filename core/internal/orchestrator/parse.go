@@ -51,6 +51,19 @@ type Turn struct {
 	// ResolvedBlocks answers tasks waiting on a question. Core records each answer on its task before admission;
 	// an unknown or already answered taskId is ignored.
 	ResolvedBlocks []ResolvedBlock `json:"resolvedBlocks"`
+	// MemoryActions are the head's decisions on pending agent memory candidates. Only the Primary's turn carries them;
+	// worker reports never do. Core applies them through the head gate.
+	MemoryActions []MemoryAction `json:"memoryActions"`
+}
+
+// MemoryAction is one head decision on a pending candidate: promote (needs evidence refs), reject, or retire a
+// verified agent entry. Revision is the revision the head read in the context listing.
+type MemoryAction struct {
+	Op        string   `json:"op"`
+	ID        string   `json:"id"`
+	Revision  int64    `json:"revision"`
+	Evidence  []string `json:"evidence,omitempty"`
+	Rationale string   `json:"rationale"`
 }
 
 type ResolvedBlock struct {
@@ -309,6 +322,20 @@ func ParseTurn(body string, known func(id string) bool) (Turn, error) {
 	}
 	if err := taskgraph.ValidateDependencies(graphTasks, known); err != nil {
 		problems = append(problems, err.Error())
+	}
+	for i, m := range turn.MemoryActions {
+		prefix := fmt.Sprintf("memoryActions[%d]", i)
+		switch m.Op {
+		case "promote", "reject", "retire":
+		default:
+			problems = append(problems, fmt.Sprintf("%s has unknown op %q", prefix, m.Op))
+		}
+		if strings.TrimSpace(m.ID) == "" || m.Revision <= 0 {
+			problems = append(problems, prefix+" needs an id and a revision")
+		}
+		if strings.TrimSpace(m.Rationale) == "" {
+			problems = append(problems, prefix+" field \"rationale\" is required")
+		}
 	}
 	if len(problems) > 0 {
 		return Turn{}, fmt.Errorf("invalid turn: %s", strings.Join(problems, "; "))

@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/relocode/relo/internal/agent"
+	ctxeng "github.com/relocode/relo/internal/context"
 	"github.com/relocode/relo/internal/routing"
 )
 
@@ -102,8 +103,9 @@ func Resolve(p Prefs, role agent.Role, difficulty string, attempt int, baseBudge
 	profile, scope := matrix(role)
 	preset := strings.ToLower(strings.TrimSpace(p.Preset))
 	if preset == "" || preset == "off" {
-		// Budget 0 means "caller keeps its default".
-		return Resolved{Profile: Profile{Voice: LevelOff, Craft: LevelOff}, Scope: Scope{Budget: baseBudget}}
+		// Budget 0 means "caller keeps its default". Efficiency features are off, but memory is still gated by role:
+		// a probe or reviewer must never receive recalled memory only because the preset is off.
+		return Resolved{Profile: Profile{Voice: LevelOff, Craft: LevelOff}, Scope: Scope{Budget: baseBudget, Memory: ctxeng.RoleAllowsMemory(string(role))}}
 	}
 	if preset != "max" {
 		preset = "auto"
@@ -172,7 +174,7 @@ func capLite(l Level) Level {
 
 func matrix(role agent.Role) (Profile, Scope) {
 	p := Profile{Voice: LevelOff, Craft: LevelOff}
-	s := Scope{Budget: 12000, Memory: true}
+	s := Scope{Budget: 12000, Memory: ctxeng.RoleAllowsMemory(string(role))}
 	switch role {
 	case agent.Primary:
 		s.Budget = 24000
@@ -180,17 +182,17 @@ func matrix(role agent.Role) (Profile, Scope) {
 		p.Voice, s.Budget = LevelLite, 12000
 	case agent.Probe:
 		p.Voice, s.Budget = LevelUltra, 6000
-		s.Memory, s.DependencyReportsOnly, s.ReadOnly = false, true, true
+		s.DependencyReportsOnly, s.ReadOnly = true, true
 	case agent.Worker, agent.Debug, agent.Integration:
 		p.Voice, p.Craft, s.Budget = LevelFull, LevelLite, 16000
-		s.Classes, s.Memory, s.DependencyReportsOnly, s.MaxItemTokens = []string{"task_state", "code", "report", "finding"}, false, true, 2000
+		s.Classes, s.DependencyReportsOnly, s.MaxItemTokens = []string{"task_state", "code", "report", "finding", "memory"}, true, 2000
 	case agent.Architect:
 		p.Voice, p.Craft, s.Budget = LevelFull, LevelLite, 16000
 	case agent.Test:
 		p.Voice, s.Budget = LevelUltra, 8000
 	case agent.Reviewer:
 		p.Voice, p.Review, s.Budget = LevelFull, true, 12000
-		s.Classes, s.Memory = []string{"task_state", "finding", "code"}, false
+		s.Classes = []string{"task_state", "finding", "code"}
 	}
 	return p, s
 }

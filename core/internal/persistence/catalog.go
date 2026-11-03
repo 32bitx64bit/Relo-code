@@ -9,7 +9,12 @@ import (
 func (s *Store) migrateCatalog() error {
 	_, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL, updated_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS memory (id TEXT PRIMARY KEY, workspace TEXT NOT NULL, payload TEXT NOT NULL, updated_at INTEGER NOT NULL);
+-- memory rows are written and read only through memory.Open, which owns the v2 payload schema, the guard triggers
+-- installed by MemoryGuardSQL, and the migration that rewrites legacy rows. Generic store access is refused. The
+-- revision and state columns are declared here, not added by ALTER TABLE, so a rebuilt catalog keeps SQLite's stable
+-- column order and older rows and INSERT lists that name only the original four columns still work.
+CREATE TABLE IF NOT EXISTS memory (id TEXT PRIMARY KEY, workspace TEXT NOT NULL, payload TEXT NOT NULL,
+  updated_at INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL DEFAULT 'candidate');
 CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, workspace TEXT NOT NULL, updated_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace, updated_at);
 CREATE TABLE IF NOT EXISTS ids (kind TEXT NOT NULL, id TEXT NOT NULL, session_id TEXT NOT NULL, PRIMARY KEY(kind,id));
@@ -42,13 +47,9 @@ func (s *Store) GetIn(table, id, session string, dest any) error {
 	if !validTable(table) {
 		return fmt.Errorf("unknown table %s", table)
 	}
-	db := s.db
-	if table != "memory" {
-		var err error
-		db, err = s.sessionDB(session)
-		if err != nil {
-			return err
-		}
+	db, err := s.sessionDB(session)
+	if err != nil {
+		return err
 	}
 	var payload string
 	if err := db.QueryRow(`SELECT payload FROM `+table+` WHERE id=?`, id).Scan(&payload); err != nil {

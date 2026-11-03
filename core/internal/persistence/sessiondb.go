@@ -13,7 +13,14 @@ type sessionHandle struct {
 	used uint64
 }
 
-func openDB(path string) (*sql.DB, error) {
+func openDB(path string) (*sql.DB, error) { return openDBTx(path, "") }
+
+// openCatalogDB opens catalog.db with every transaction started as BEGIN IMMEDIATE. The memory migration and the
+// legacy import rely on it: the write lock is taken before the guard triggers are dropped, so no other connection
+// can write a legacy-format row while they are absent.
+func openCatalogDB(path string) (*sql.DB, error) { return openDBTx(path, "immediate") }
+
+func openDBTx(path, txlock string) (*sql.DB, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -24,7 +31,10 @@ func openDB(path string) (*sql.DB, error) {
 	if err = os.Chmod(path, 0o600); err != nil {
 		return nil, err
 	}
-	dsn := (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String() + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)"
+	dsn := (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String() + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=secure_delete(1)"
+	if txlock != "" {
+		dsn += "&_txlock=" + txlock
+	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err

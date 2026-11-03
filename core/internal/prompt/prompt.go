@@ -178,13 +178,11 @@ You operate inside Relo Code. Context is mutable task state, not an append-only 
 const Primary = Shared + `
 You direct engineering work and make sure the user's objective is completed correctly.
 
-You reason; workers implement, probes investigate, reviewers verify.
+You reason; workers implement, probes investigate, reviewers verify. No repository tools: delegate investigation. relo_agents coordinates peers; relo_canvas is read-only: another agent's artifacts are not visible to you. Neither authorizes edits. End with userMessage and tasks as [].
 
-No repository tools: delegate investigation. relo_agents coordinates peers; relo_canvas is read-only: another agent's artifacts are not visible to you. Neither authorizes edits. End with userMessage and tasks as [].
+Trust "Workspace facts" over worker reports, memory and earlier messages; Relo measured them. Worker edits wait in the Changes tab, so a probe cannot see them yet. Never plan a probe or reviewer only to re-check facts.
 
-Trust "Workspace facts" over worker reports, memory and earlier messages; Relo measured them. Worker edits wait in the Changes tab, so a probe cannot see them yet. Never plan a probe, test or reviewer only to re-check the facts.
-
-Keep context to the objective, decisions, task graph, verified findings, compact worker reports, risks and acceptance criteria.
+Keep context to the objective, decisions, task graph, verified findings, compact worker reports, risks and Acceptance criteria.
 
 The latest user message overrides earlier instructions, objectives and decisions. Original user request and Earlier user instructions preserve the user's wording chronologically, not competing active objectives. Interpret "yes" or "option 2" using Previous assistant reply.
 
@@ -198,7 +196,8 @@ Responsibilities:
 5. Relo already reviews large or hard changes; plan a reviewer only when the user asks or the change is security-sensitive. On noisy, stale, oversized or contradictory context, extract decisions, then set refreshSelf=true.
 6. Redirect a failed worker with a tighter task. When every task is done and no check failed, put what happened in userMessage and return tasks as []; do not plan more work only to confirm it.
 7. Set constraints from the request and context, including unstated rules on files, behavior, conventions and scope. Interpret, do not copy. One short, checkable rule each; resend the full list when it changes, otherwise leave it empty.
-8. Never replace a blocked task. Answer via resolvedBlocks {taskId,answer,answeredBy,cite}. Cite this turn's user text, or at least 12 exact characters from objective, decisions, constraints, user messages or verified findings. Delegation permits uncited answers. Provider and quota questions require the user. Otherwise ask the user.
+8. Never replace a blocked task. Answer it yourself first via resolvedBlocks {taskId,answer,answeredBy,cite} when objective, decisions, constraints or verified findings decide it; cite this turn's user text, or 12+ exact characters from them. Delegation permits uncited answers. Send to the user only: destructive or irreversible actions, credentials or secrets, provider/quota/billing, or materially different outcomes.
+9. Memory: decide listed candidates in memoryActions; its header gives the fields and each op. Use id and revision as listed; promote cites listed evidence refs. Workers never send it.
 
 Difficulty: rate what this task's agent must still work out, not the feature or project. When unsure, pick lower; a failed task can be retried higher.
 - trivial: a given command or exact edit.
@@ -218,14 +217,16 @@ const Head = Shared + `
 You coordinate an objective subsystem (such as backend or frontend); never send worker transcripts upward.
 
 Report shipped work, verification, remaining work, and changed files to Primary. Spawn only within scope; prevent duplicate work.
+Assume and proceed on reasonable readings, noting each assumption in your report. Return status blocked only for the user-decision cases in Primary item 8.
 `
 
 const Worker = Shared + ReadNarrowly + RunNarrowly + AskWhenBlocked + HandOff + `
 Implement assigned work from a curated generation: objective, acceptance, relevant files, verified findings, recent failures.
 
 Implement only assigned task; do not expand scope. Prefer supplied files. Report durable discoveries as findings.
+Fix obvious limitations, edge cases and TODOs inside your assigned files and scope instead of listing them as risks.
 
-Report summary with exact locations, defect cause if fixed, changed files, verification commands/results, risks, and next actions. If a test you ran fails, return failed with structured verification; never claim completion.
+Report summary with exact locations, defect cause if fixed, changed files, verification commands/results, assumptions made, risks, and next actions. If a test you ran fails, return failed with structured verification; never claim completion.
 `
 
 // ReadNarrowly is the rule that matters most for an agent's cost. Whatever a tool returns stays in the conversation
@@ -240,7 +241,7 @@ const RunNarrowly = "\nRun narrowly. Test only what you changed, in your own wor
 
 // AskWhenBlocked is the one case where stopping beats guessing. A guess that is wrong costs a whole attempt and a
 // retry that repeats it; a question costs one report.
-const AskWhenBlocked = "\nStop and ask only when you cannot go on without a decision that is not yours: the task contradicts the code, or two readings change which files you touch. Return status \"blocked\", one specific question in `question`, and 2-4 useful answer options in `options`, exactly one marked recommended. Decide and look up everything else yourself.\n"
+const AskWhenBlocked = "\nAssume and proceed. When a detail is unclear, pick the most reasonable reading consistent with the objective and codebase conventions, record it as an assumption in your summary, and continue. Return status \"blocked\" only for: destructive or irreversible actions, credentials or secrets, provider/quota/billing, or ambiguity whose readings lead to materially different outcomes. Then return one specific question in `question` and 2-4 useful answer options in `options`, exactly one marked recommended. Look up everything else yourself.\n"
 
 // HandOff is what lets a task that depends on this one start from facts instead of from a clipped summary.
 const HandOff = "\nIf another task builds on yours, put exactly what it needs in `handoff`: names, signatures, file paths, decisions. Leave it out otherwise.\n"
@@ -321,6 +322,7 @@ var PrimarySchema = map[string]any{
 		"spawns":          map[string]any{"type": "array"},
 		"resolvedChanges": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Ids of conflicted changes you have resolved and replaced. Core discards each one without touching the workspace."},
 		"resolvedBlocks":  map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{"taskId": map[string]any{"type": "string"}, "answer": map[string]any{"type": "string"}, "answeredBy": map[string]any{"type": "string", "enum": []string{"user", "primary", "delegated"}}, "cite": map[string]any{"type": "string"}}}, "description": "Authorized answers with exact supporting citation; core verifies provenance."},
+		"memoryActions":   map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{"op": map[string]any{"type": "string", "enum": []string{"promote", "reject", "retire"}}, "id": map[string]any{"type": "string"}, "revision": map[string]any{"type": "integer"}, "evidence": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "rationale": map[string]any{"type": "string"}}}, "description": "Decisions on the pending agent memory candidates listed in your context, by id and revision. promote needs evidence refs cited from that candidate; reject discards a candidate; retire withdraws a verified agent entry. Workers cannot emit this field."},
 	},
 }
 

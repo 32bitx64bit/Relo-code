@@ -33,7 +33,10 @@ func (a *App) mirrorLocked(agentID string) {
 		return
 	}
 	root := ws.Root()
-	info, ok := ws.VirtualWorkspace(agentID)
+	info, ok, err := ws.VirtualWorkspace(agentID)
+	if err != nil {
+		return // the manager is closed: nothing to mirror, and a missing row must not be read as a deletion
+	}
 	if !ok {
 		if err := a.Store.DeleteVWorkspace(root, agentID); err != nil {
 			a.Log.Warn("forget workspace failed", map[string]any{"agent": agentID, "error": err.Error()})
@@ -66,7 +69,11 @@ func (a *App) reconcileWorkspaces() {
 	defer a.vwMu.Unlock()
 	root := ws.Root()
 	live := map[string]bool{}
-	for _, info := range ws.VirtualWorkspaces() {
+	infos, err := ws.VirtualWorkspaces()
+	if err != nil {
+		return // the manager is closed: keep the stored rows rather than forget workspaces it cannot list
+	}
+	for _, info := range infos {
 		live[info.AgentID] = true
 		a.mirrorLocked(info.AgentID)
 	}

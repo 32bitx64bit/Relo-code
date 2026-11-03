@@ -34,7 +34,9 @@ const (
 	SourceTest       Source = "test_result"
 	SourceRepo       Source = "repository_source"
 	SourceParent     Source = "parent_report"
-	SourceSystem     Source = "system"
+	// SourceRecalled labels project memory recalled from an earlier session. It is never verified_fact.
+	SourceRecalled Source = "recalled_memory"
+	SourceSystem   Source = "system"
 )
 
 type Phase string

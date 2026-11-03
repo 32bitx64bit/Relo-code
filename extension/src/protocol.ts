@@ -7,7 +7,7 @@ export const Methods = {
   agentList: "agent.list", agentGet: "agent.get", agentStop: "agent.stop", agentRedirect: "agent.redirect", agentMessage: "agent.message", agentChangeModel: "agent.changeModel", agentRefreshContext: "agent.refreshContext", agentInspectContext: "agent.inspectContext", agentOpenWorktree: "agent.openWorktree",
   taskList: "task.list", taskGet: "task.get", taskCancel: "task.cancel", taskRetry: "task.retry", taskSetPriority: "task.setPriority",
   contextGet: "context.get", contextGenerations: "context.generations", contextRefresh: "context.refresh", contextRebuild: "context.rebuild", contextPin: "context.pin", contextRemove: "context.remove", contextPromote: "context.promote",
-  findingsList: "findings.list", memoryList: "memory.list", memoryUpdate: "memory.update", memoryDelete: "memory.delete",
+  findingsList: "findings.list", memoryList: "memory.list", memoryGet: "memory.get", memoryUpdate: "memory.update", memoryRetire: "memory.retire", memoryDelete: "memory.delete",
   changesList: "changes.list", changesAccept: "changes.accept", changesReject: "changes.reject", changesAcceptAll: "changes.acceptAll", changesRejectAll: "changes.rejectAll", changesDiff: "changes.diff", changesUndo: "changes.undo", changesRebase: "changes.rebase", changesResolve: "changes.resolve", changesResolveConflicts: "changes.resolveConflicts", workspaceDirty: "workspace.dirty", verificationList: "verification.list",
   modelsList: "models.list", modelsSet: "models.set", backendStatus: "backend.status", backendRestart: "backend.restart", settingsApply: "settings.apply", providersDiscover: "providers.discover", modeSet: "mode.set",
   orchestratorPause: "orchestrator.pause", orchestratorResume: "orchestrator.resume", orchestratorStopAll: "orchestrator.stopAll",
@@ -444,8 +444,14 @@ export function reduce(state: ReloState, event: string, payload: unknown): ReloS
     case "finding.created":
       next.findings = [...next.findings, payload];
       break;
-    case "memory.updated":
+    case "memory.updated": {
+      // Notifications carry no body: the extension fetches the entry and sends it as `entry`. A deleted id is dropped.
+      const id = typeof p.id === "string" ? p.id : "";
+      if (!id) break;
+      if (p.change === "deleted") next.memory = next.memory.filter((m) => (m as { id?: unknown }).id !== id);
+      else if (p.entry && typeof p.entry === "object") next.memory = upsertMemory(next.memory, p.entry);
       break;
+    }
     case "verification.completed":
       next.verification = [...next.verification, payload];
       break;
@@ -492,6 +498,19 @@ function upsertAgent(list: AgentInfo[], item: AgentInfo): AgentInfo[] {
   if (typeof item.rev === "number" && typeof existing.rev === "number" && item.rev < existing.rev) return list;
   const copy = list.slice();
   copy[i] = { ...existing, ...item };
+  return copy;
+}
+
+// Memory entries are keyed by id. An entry older than the stored revision is a late event and is ignored.
+export function upsertMemory(list: unknown[], entry: unknown): unknown[] {
+  const item = entry as { id?: unknown; revision?: unknown };
+  if (typeof item.id !== "string" || !item.id) return list;
+  const i = list.findIndex((x) => (x as { id?: unknown }).id === item.id);
+  if (i < 0) return [...list, entry];
+  const existing = list[i] as { revision?: unknown };
+  if (typeof item.revision === "number" && typeof existing.revision === "number" && item.revision < existing.revision) return list;
+  const copy = list.slice();
+  copy[i] = entry;
   return copy;
 }
 

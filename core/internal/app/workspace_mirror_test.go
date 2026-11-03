@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/relocode/relo/internal/logging"
 	"github.com/relocode/relo/internal/orchestrator"
+	"github.com/relocode/relo/internal/persistence"
+	"github.com/relocode/relo/internal/workspace"
 )
 
 // openVirtualCore opens a core over an existing repository and database, with virtual workspaces on, so a test can
@@ -81,7 +84,10 @@ func TestWorkspaceMirrorFollowsGit(t *testing.T) {
 	if err := core.Coord.WS.Sync("agent_m"); err != nil {
 		t.Fatal(err)
 	}
-	info, _ := core.Coord.WS.VirtualWorkspace("agent_m")
+	info, _, err := core.Coord.WS.VirtualWorkspace("agent_m")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if info.Revision < 1 || !info.Dirty {
 		t.Fatalf("workspace = %+v", info)
 	}
@@ -193,4 +199,43 @@ func TestLostWorkspaceRefsAreReportedOnlyWhenEditsWereLost(t *testing.T) {
 	if strings.Count(out, "workspace.lost") != 1 {
 		t.Fatalf("a clean workspace that vanished was reported as a loss:\n%s", out)
 	}
+}
+
+// A closed manager cannot list or read workspaces, so the mirror must leave the stored rows alone rather than read
+// ErrClosed as "the workspace is gone".
+func TestMirrorKeepsRowsWhenTheManagerIsClosed(t *testing.T) {
+	dir := initRepo(t)
+	core, _ := openVirtualCore(t, dir, filepath.Join(t.TempDir(), "relo.db"))
+	defer core.Close()
+	core.Coord.CreateSession(dir, "", orchestrator.ModeBuild)
+	root := core.Coord.WS.Root()
+	err := core.Store.PutVWorkspace(persistence.VWorkspace{
+		Workspace: root, AgentID: "agent_c", SessionID: core.Coord.SessionID(), BaseCommit: "base",
+		Revision: 7, Tree: "tree7", State: "ready", Payload: []byte(`{"agentId":"agent_c","revision":7}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.Coord.WS.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Coord.WS.VirtualWorkspace("agent_c"); !errors.Is(err, workspace.ErrClosed) {
+		t.Fatalf("VirtualWorkspace after Close: err = %v, want ErrClosed", err)
+	}
+
+	assertKept := func(after string) {
+		t.Helper()
+		rows, err := core.Store.ListVWorkspaces(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0].AgentID != "agent_c" || rows[0].Revision != 7 {
+			t.Fatalf("rows after %s = %+v, want agent_c at revision 7", after, rows)
+		}
+	}
+
+	core.mirrorLocked("agent_c")
+	assertKept("mirrorLocked")
+	core.reconcileWorkspaces()
+	assertKept("reconcileWorkspaces")
 }

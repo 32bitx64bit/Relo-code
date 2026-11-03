@@ -43,6 +43,10 @@ func TestScopedWorkerGetsItsTaskOnceAndNoListOfWhatItWasNotShown(t *testing.T) {
 		Role: string(agent.Worker), Workspace: s.Workspace, Model: "mock/t1", Difficulty: "medium",
 	})
 	a := c.spawn(task, agent.Worker)
+	// Phase 1 recalls no memory and workerSeed keeps only findings and reports its task needs, so nothing reaches the
+	// worker's pool that its scope can drop: the "Left out" line would have nothing to say and this test would pass
+	// vacuously. The pool is read-only to tools, so the working set a worker did read is what its scope leaves out.
+	c.Engine.Ingest(a.ID, []ctxeng.Item{{Class: ctxeng.ClassEphemeral, Source: ctxeng.SourceRepo, Content: "grep output from exploring the whole monorepo", Phase: ctxeng.PhaseExplore}})
 	if err := c.execWorker(context.Background(), task, a); err != nil {
 		t.Fatal(err)
 	}
@@ -79,35 +83,5 @@ func TestEveryClassAScopeNamesIsOneTheEngineKnows(t *testing.T) {
 				}
 			}
 		}
-	}
-}
-
-func TestPrimaryMemoryDoesNotGrowWithEveryTurn(t *testing.T) {
-	c := New(logging.New(nil, logging.Error))
-	c.SetRuntime(newDispatchRuntime())
-	s := c.CreateSession(t.TempDir(), "Propose renames for the efficiency tab labels", ModeBuild)
-	c.Settings.Memory = true
-	p := c.Agents.Create(agent.Agent{Role: agent.Primary, Workspace: s.Workspace, Model: "mock/p"})
-	seedMemory(c, 20)
-
-	memoryItems := func() int {
-		n := 0
-		for _, it := range c.Engine.SnapshotPool(p.ID) {
-			if it.Class == ctxeng.ClassMemory {
-				n++
-			}
-		}
-		return n
-	}
-	c.seedPrimary("Propose renames for the efficiency tab labels", nil)
-	first := memoryItems()
-	if first == 0 || first > memory.RecallLimit {
-		t.Fatalf("a request about the efficiency tab recalled %d entries, want 1 to %d", first, memory.RecallLimit)
-	}
-	for _, text := range []string{"ALright looks good.\n\nI approve", "Alright, rebuild the client and install it", "Propose renames for the efficiency tab labels"} {
-		c.seedPrimary(text, nil)
-	}
-	if got := memoryItems(); got > memory.RecallLimit {
-		t.Fatalf("after four turns the Primary holds %d memory entries, want at most %d", got, memory.RecallLimit)
 	}
 }

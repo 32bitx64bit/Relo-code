@@ -269,6 +269,9 @@ type Coord struct {
 	runWG           sync.WaitGroup
 	pending         map[string]*PendingPerm
 	reviewed        map[string]bool
+	memoryMu        sync.Mutex
+	memoryPresented map[string]int64  // candidate ID -> revision listed to the Primary in its latest turn; guarded by memoryMu
+	checkOwners     map[string]string // check result ID -> agent that ran it; guarded by mu
 	runtimeMu       sync.Mutex
 	runtimeSessions map[string]*runtimeSession
 	messageMu       sync.Mutex

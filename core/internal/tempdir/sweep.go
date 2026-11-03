@@ -74,13 +74,21 @@ func rootStale(path string, info fs.FileInfo, self int) bool {
 	if err != nil {
 		return false // unreadable: not ours to judge
 	}
-	owners, live := []int{}, []int{}
+	owners, live, unknown := []int{}, []int{}, false
 	for _, e := range entries {
+		// An owner is named for its pid; a live marker may be a MarkUnique slot, whose content is the real pid.
 		if pid, ok := pidNamed(e.Name(), ".owner"); ok {
 			owners = append(owners, pid)
-		} else if pid, ok := pidNamed(e.Name(), ".live"); ok {
-			live = append(live, pid)
+		} else if strings.HasSuffix(e.Name(), ".live") {
+			if pid, ok := recordedPid(path, e.Name()); ok {
+				live = append(live, pid)
+			} else {
+				unknown = true // an unreadable marker is never proof its core is gone
+			}
 		}
+	}
+	if unknown {
+		return false
 	}
 	if len(live) > 0 {
 		return !anyAlive(live)

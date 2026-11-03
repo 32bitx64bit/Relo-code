@@ -92,6 +92,30 @@ A context-window provider error prefers this path over failing the task.
 
 The engine records generation count, tokens, refresh reasons, retries, and repeated actions so strategies can be compared later.
 
+## Project memory storage and erasure
+
+Project memory lives only in the `memory` table of the workspace catalog; it is never a project file or a separate index. Rows are versioned JSON (`schemaVersion: 2`) and only `core/internal/memory` reads or writes them: the generic persistence accessors (`PutJSON`, `Get`, `GetIn`, `List`) refuse the table, so no code path can bypass the intake, the provenance fields or the revision check-and-set.
+
+### Guard
+
+`persistence.Open` installs the database guard (`persistence.MemoryGuardSQL`) before the legacy import can run, and `memory.Open` installs it again after its migration. The triggers refuse every insert or update whose payload is not schema v2, whose partition is not an opaque `ws_` ID, or whose `state` is not `candidate`, `verified`, `stale`, `retired` or `deleted`. An older binary that writes a legacy payload or a raw workspace path fails at the database instead of silently reintroducing unvalidated memory.
+
+### Legacy import
+
+`importLegacyCatalog` never copies `memory` rows with `copyRows`. It hands them to the intake registered by `core/internal/memory` (`EnsureLegacyMemoryIntake`), inside the same catalog transaction, so the import either commits only schema v2 candidates with an opaque partition or rolls back. Rows that fail intake (unsafe content, over-limit strings, invalid ID or path) are dropped and counted; a payload that is not JSON fails the whole import. The guard is lifted for that one transaction and reinstalled before the commit. If the intake is not registered, the import fails rather than copying raw rows.
+
+### WAL and free pages
+
+Deleting or rewriting a row does not erase the bytes from earlier files, so the policy is explicit and deliberately not a claim of erasure:
+
+| Step | When | Effect |
+|---|---|---|
+| `PRAGMA secure_delete=ON` | catalog open, and every `memory.Open` | future writes of this connection overwrite the cells they free instead of leaving them on the free list |
+| `VACUUM` | `memory.Open`, best effort | rewrites free pages where SQLite performs it; under modernc with `journal_mode=wal` it is a no-op |
+| WAL checkpoint, then `PRAGMA wal_checkpoint(TRUNCATE)` | `memory.Open`, best effort | copies the WAL into the main file and truncates the WAL to zero, so removed payloads are not left in `catalog.db-wal` |
+
+Residual exposure: pages written before the catalog adopted `secure_delete`, and pages SQLite has not rewritten since, can still be read from `catalog.db` by anyone with the file. Backups made before this policy can contain the same payloads. Migration cannot honestly guarantee erasure from old files or backups; deleting the catalog and its `-wal`/`-shm` files is the only complete removal. No new backup containing unsafe payloads is created.
+
 ## Inspector
 
 The Context view shows generation, usage, included/excluded items, and composition by class. Manual controls: refresh, rebuild, pin, remove, promote to project memory, view previous generation.
@@ -101,3 +125,11 @@ Pinned user constraints survive automatic compression. Mandatory/pinned content 
 ## Retrieval
 
 `Retrieve(task, files, symbols, keywords, role, phase, failures)` scores the pool afresh per build. Finding verification updates only the exact finding identity. Finding promotion stores a structured finding in the context engine pool; separate explicit promotion or orchestrator memory persistence writes project memory.
+
+## Recalled project memory
+
+`Settings.Memory` (`relo.context.projectMemory`) gates recall for the Primary (`seedPrimary`) and for Worker, Debug and Integration agents (`workerSeed`). Probes and Reviewers are excluded by their `style` scope; Architect and Test follow their scope defaults, and `workerSeed` is the only worker path. Off, recall is empty and any prior recalled group is removed.
+
+Each prompt recalls at most `memory.RecallLimit` (4) entries through `memory.Store.RecallScoped`, which selects only verified entries. Before rendering, each entry must pass `memory.CheckFreshness` as `current` in the recipient's own `worktreeView`; `stale` and `unknown` entries are dropped and never rendered. Command evidence older than 30 days marks its entry stale for every view. A view-specific hash or ancestry mismatch only drops the entry for that view.
+
+Recalled items enter as `ctxeng.SourceRecalled` (`recalled_memory`), never `verified_fact`, unverified, and headed by `Untrusted historical project observation; verify before use.` with ID, observation date, evidence paths and the body quoted. `Engine.SetRecall` replaces the previous group on every prompt. `ctxeng.CapRecall` bounds the combined rendered block to 300 estimated tokens (`ctxeng.Tokens`) and 1200 bytes, skipping any item that does not fit whole.

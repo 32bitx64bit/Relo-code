@@ -19,7 +19,7 @@ Every request must use `v: 1`, `kind: "req"`, non-empty `id` and `method`, and o
 
 ## Selected methods
 
-`initialize`, `shutdown`, `session.create|get|list|clear|open|delete`, `prompt.submit|cancel|retry`, `agent.list|get|stop|redirect|message|changeModel|refreshContext|inspectContext|openWorktree`, `task.list|get|cancel|retry|setPriority`, `context.get|generations|refresh|rebuild|pin|remove|promote`, `findings.list`, `memory.list|update|delete`, `changes.list|accept|reject|acceptAll|rejectAll|diff|undo|rebase|resolve|resolveConflicts`, `workspace.dirty`, `verification.list`, `models.list|set`, `backend.status|restart`, `settings.apply`, `providers.discover`, `mode.set`, `orchestrator.pause|resume|stopAll`, `question.answer|delegate`, `permission.respond`, `logs.tail`, `snapshot`, `cache.get`.
+`initialize`, `shutdown`, `session.create|get|list|clear|open|delete`, `prompt.submit|cancel|retry`, `agent.list|get|stop|redirect|message|changeModel|refreshContext|inspectContext|openWorktree`, `task.list|get|cancel|retry|setPriority`, `context.get|generations|refresh|rebuild|pin|remove|promote`, `findings.list`, `memory.list|get|update|retire|delete`, `changes.list|accept|reject|acceptAll|rejectAll|diff|undo|rebase|resolve|resolveConflicts`, `workspace.dirty`, `verification.list`, `models.list|set`, `backend.status|restart`, `settings.apply`, `providers.discover`, `mode.set`, `orchestrator.pause|resume|stopAll`, `question.answer|delegate`, `permission.respond`, `logs.tail`, `snapshot`, `cache.get`.
 
 ## Events
 
@@ -76,6 +76,10 @@ Snapshot payloads may include additive `efficiency: { "preset": "off", "profiles
 Virtual workspaces (`relo.workspace.mode` `virtual` or `auto`, see [virtual-workspaces.md](virtual-workspaces.md)) add no IPC methods. Their revisions are written to the event log as `workspace.create|write|delete|rename|chmod|symlink|commit|rebase|capture|discard|dispose` with `{ agentId, revision, kind, paths, tree, commit, at }`, and are not sent to clients. What the workspace layer decides by itself reaches the user as a system chat message: `workspace.fallback` (virtual mode on a repository that rewrites content), `workspace.skipped` (a tool-made file that was not kept), `workspace.virtualReads` (the runtime cannot be routed), `workspace.lost` (edits no longer in Git). A change made from a virtual workspace carries `rev`, the revision it was proposed at.
 
 The peer messaging tool (`agents`, MCP server `relo-agentmsg`) takes `paths` (at most 32 workspace-relative paths, 512 bytes each) on `send` to attach a pointer to files the sender changed, and `{ action: "import", message, paths }` to let the recipient copy those files into its own workspace. Nothing is delivered implicitly.
+
+## Memory writes
+
+Project memory has two write paths and they never cross. Client RPCs are user-only and apply directly: `memory.update` (`{id,revision,patch}` → entry), `memory.retire` (`{id,revision}` → entry), `memory.delete` (`{id,revision}` → `{ok:true}`), `memory.get` (`{id}` → entry), and `context.promote` (`{agentId,itemId}` → entry). Core stamps `source: user`, ignores any caller-supplied `source`, `state` or provenance, and requires `revision` to match the stored revision (`conflict` otherwise). No client RPC accepts agent-originated memory writes, and no method proposes, promotes, rejects or retires a candidate (no `memory.propose`). Agent writes are orchestrator agent actions: workers propose candidates on completion with core-observed evidence; only the Primary's turn may carry `memoryActions` (`promote`, `reject`, `retire`), and any other agent is refused. `memory.updated` carries `{id,revision,change}` with the revision the store committed. Recall stays off until the retrieval phase.
 
 ## Settings and provider payloads
 

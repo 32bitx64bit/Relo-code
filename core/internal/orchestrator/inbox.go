@@ -154,6 +154,8 @@ func (c *Coord) stepQueued(ctx context.Context) {
 	}
 	if text != "" {
 		c.ingestGuidance(p.ID, text, refs)
+	} else {
+		c.Engine.SetTaskState(p.ID, "Latest user message", nil)
 	}
 	// The step says what woke it. A peer-only wake once said "The user sent this" with nothing after it, which the
 	// head read as the user resending the original request, still in its Latest user message.
@@ -169,6 +171,10 @@ func (c *Coord) stepQueued(ctx context.Context) {
 	c.syncPeerContext(c.SessionID(), p.ID)
 	settings := c.settings()
 	c.pinBlocks(p.ID)
+	if !settings.Memory {
+		// Recall already in the pool must not outlive Settings.Memory being turned off.
+		c.Engine.SetRecall(p.ID, nil)
+	}
 	gen, err := c.Engine.Refresh(p.ID, reason)
 	if err != nil {
 		c.logWarn("refresh primary for guidance", err)
@@ -178,6 +184,8 @@ func (c *Coord) stepQueued(ctx context.Context) {
 	resolved := style.Resolve(settings.Efficiency, p.Role, p.Difficulty, p.Attempt, settings.Budget)
 	extra := c.workspaceFacts() + c.constraintsNote() + note
 	parts := prompt.ComposePartsWith(p.Role, *gen, extra, resolved.Profile.Fragment(p.Role))
+	// Guidance and peer turns refresh the context without re-listing candidates, so they make no memory decisions.
+	c.dropPresentedMemory()
 	turn, err := c.primaryTurn(ctx, p, parts, ask)
 	c.closeAgentSession(p.ID)
 	if err != nil {
@@ -185,9 +193,7 @@ func (c *Coord) stepQueued(ctx context.Context) {
 		c.reportFailure(p, failed, err)
 		return
 	}
-	if turn.UserMessage != "" {
-		c.chat("assistant", turn.UserMessage, p.ID)
-	}
+	c.publishPrimaryReply(p.ID, turn.UserMessage, text != "")
 	c.applyTurn(p, turn, text)
 	c.honorRefreshSelf(p.ID, turn)
 	c.primaryWaits()

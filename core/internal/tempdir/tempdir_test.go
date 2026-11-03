@@ -252,4 +252,129 @@ func TestMarkAndLive(t *testing.T) {
 	if err := Unmark(dir, os.Getpid()); err != nil {
 		t.Fatalf("unmark of a missing marker must be a no-op, got %v", err)
 	}
+	// Two cores in one process: each MarkUnique takes its own name, so dropping one keeps the dir live for the other.
+	// The stand-in pid is the test binary's own: it runs, so the slots stay live and are not reused underneath the test.
+	self := os.Getpid()
+	first, err := MarkUnique(dir, self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := MarkUnique(dir, self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("two cores got the same marker %d", first)
+	}
+	if err := UnmarkUnique(dir, first); err != nil {
+		t.Fatal(err)
+	}
+	if !Live(dir) {
+		t.Fatal("dropping one core's marker unmarked a dir another core still holds")
+	}
+	if err := UnmarkUnique(dir, second); err != nil {
+		t.Fatal(err)
+	}
+	if Live(dir) {
+		t.Fatal("dir still live after the last core dropped its marker")
+	}
+}
+
+// deadPid is a pid no live process can hold: above every pid_max (4194304), so a process-table check always says it
+// is gone. A pid below that is never a safe stand-in, because the kernel may hand it to a live process.
+const deadPid = 100000000
+
+// TestOldUniqueMarkerWithDeadPidIsNotLive is the leftover-unique-marker defect: a core that was never Closed left a
+// slot behind, and once its process is gone the slot neither keeps the dir live nor stays taken forever.
+func TestOldUniqueMarkerWithDeadPidIsNotLive(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "tmp")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Dead-process slots record a real pid, so liveness is decided by that pid, never by the synthetic slot name.
+	// Slot 1 holds a fresh dead-pid marker; slot 2 holds the same marker aged past the freshness shortcut.
+	freshSlot, oldSlot := uniqueNames+uniqueSlots, uniqueNames+2*uniqueSlots
+	// Liveness is decided by content, never by the slot name: a name must never read as a live pid by itself.
+	for _, slot := range []int{freshSlot, oldSlot} {
+		marker := filepath.Join(dir, markerName(slot))
+		if err := os.WriteFile(marker, []byte(strconv.Itoa(deadPid)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if slot == oldSlot {
+			old := time.Now().Add(-2 * liveMarkerAge)
+			if err := os.Chtimes(marker, old, old); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if Live(dir) {
+		t.Fatal("a unique marker whose process is gone must not keep the dir live")
+	}
+	again, err := MarkUnique(dir, os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != freshSlot {
+		t.Fatalf("reused slot %d, want the lowest free slot %d", again, freshSlot)
+	}
+	marker := filepath.Join(dir, markerName(again))
+	if got, err := os.ReadFile(marker); err != nil || string(got) != strconv.Itoa(os.Getpid()) {
+		t.Fatalf("unique marker content %q (%v), want the real pid %d", got, err, os.Getpid())
+	}
+}
+
+// TestAllUniqueSlotsTakenDoesNotFailStartup documents the full-range behaviour: every slot held by a live process
+// means the dir stays live, and the caller still gets a usable marker instead of an error that stops a core.
+func TestAllUniqueSlotsTakenDoesNotFailStartup(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "tmp")
+	// The test binary stands in for live pids: ProcessAlive only asks whether a process with the recorded pid runs.
+	live := os.Getpid()
+	taken := map[int]bool{}
+	for i := 0; i < uniqueMarkers; i++ {
+		slot, err := MarkUnique(dir, live)
+		if err != nil {
+			t.Fatalf("slot %d: %v", i, err)
+		}
+		if taken[slot] {
+			t.Fatalf("slot %d handed out twice", slot)
+		}
+		taken[slot] = true
+	}
+	slot, err := MarkUnique(dir, live)
+	if err != nil {
+		t.Fatalf("a full marker range must not fail startup, got %v", err)
+	}
+	if slot != live {
+		t.Fatalf("full range returned slot %d, want pid %d back", slot, live)
+	}
+	if !Live(dir) {
+		t.Fatal("a dir with a live slot must stay live")
+	}
+}
+
+// TestSweepReapsRootWhoseUniqueMarkerNamesADeadProcess is the sweep half of the same defect: a root left by a core
+// that was never Closed must be collected, and one a live core still marks must not be.
+func TestSweepReapsRootWhoseUniqueMarkerNamesADeadProcess(t *testing.T) {
+	base := inTemp(t)
+	staleRoot := filepath.Join(base, "relo-tmp-dead")
+	liveRoot := filepath.Join(base, "relo-tmp-live")
+	for _, root := range []string{staleRoot, liveRoot} {
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	slot := markerName(uniqueNames + uniqueSlots)
+	if err := os.WriteFile(filepath.Join(staleRoot, slot), []byte(strconv.Itoa(deadPid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(liveRoot, slot), []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	Sweep(os.Getpid())
+	if exists(t, staleRoot) {
+		t.Fatal("sweep kept a root whose only marker names a dead process")
+	}
+	if !exists(t, liveRoot) {
+		t.Fatal("sweep removed a root a live process still marks")
+	}
 }

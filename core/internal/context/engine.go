@@ -89,6 +89,68 @@ func (st *state) hold(it Item) bool {
 func (e *Engine) Ingest(agentID string, items []Item) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.ingestLocked(agentID, items)
+}
+
+// SetRecall replaces the recalled project memory of agentID with items, so each prompt carries only its own recall and
+// nothing accumulates across turns. Prior SourceRecalled memory items are dropped; an item whose title and content repeat
+// a prior one keeps that item's ID and creation time. Every item is forced to ClassMemory, SourceRecalled and unverified,
+// so recall never labels its own output as verified. Nil items clear the group.
+func (e *Engine) SetRecall(agentID string, items []Item) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	st := e.ensure(agentID)
+	prior := map[string]Item{}
+	kept := make([]Item, 0, len(st.Pool))
+	for _, have := range st.Pool {
+		if have.Class == ClassMemory && have.Source == SourceRecalled {
+			prior[have.Title+"\x00"+have.Content] = have
+			continue
+		}
+		kept = append(kept, have)
+	}
+	st.Pool = kept
+	fresh := make([]Item, 0, len(items))
+	for _, it := range items {
+		it.Class, it.Source, it.Verified, it.Pinned = ClassMemory, SourceRecalled, false, false
+		if old, ok := prior[it.Title+"\x00"+it.Content]; ok {
+			it.ID, it.Created = old.ID, old.Created
+		}
+		fresh = append(fresh, it)
+	}
+	e.ingestLocked(agentID, fresh)
+}
+
+// RenderItems returns the text the engine renders for items, in order: headings, provenance labels and content.
+func RenderItems(items []Item) string {
+	var b strings.Builder
+	for _, it := range items {
+		renderItem(&b, it)
+	}
+	return b.String()
+}
+
+// CapRecall keeps items in order while the combined rendered block still fits: at most maxItems, at most maxTokens by
+// Tokens, and at most maxBytes. An item that does not fit is skipped whole, never truncated, and a later smaller item
+// may still fit.
+func CapRecall(items []Item, maxItems, maxTokens, maxBytes int) []Item {
+	var out []Item
+	for _, it := range items {
+		if len(out) >= maxItems {
+			break
+		}
+		// Full-capacity slice so the append below never writes into the caller's backing array.
+		block := RenderItems(append(out[:len(out):len(out)], it))
+		if Tokens(block) > maxTokens || len(block) > maxBytes {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+// ingestLocked is Ingest for a caller that already holds e.mu.
+func (e *Engine) ingestLocked(agentID string, items []Item) {
 	st := e.ensure(agentID)
 	now := e.now()
 	for _, it := range items {
@@ -652,6 +714,17 @@ func (e *Engine) buildLocked(req BuildRequest, boundary bool) (*Generation, erro
 		st.DependencyTaskIDs = append([]string(nil), req.DependencyTaskIDs...)
 	}
 	scope := st.Scope
+	// Recalled memory is gated by role in every efficiency preset, not only when a preset supplies a scope. A probe
+	// or reviewer whose caller leaves Scope nil must still not receive historical observations it is meant to verify.
+	if !RoleAllowsMemory(st.Role) {
+		if scope == nil {
+			scope = &Scope{}
+		} else {
+			gated := *scope
+			scope = &gated
+		}
+		scope.Memory = false
+	}
 	dependencies := st.DependencyTaskIDs
 	var scopeDropped []Dropped
 	// Scope and freshness drop items by ID and class, so they run before dedupe: a newer out-of-scope or stale copy
@@ -761,6 +834,17 @@ func carryDeferred(prior *Generation, items []Item) []string {
 		}
 	}
 	return out
+}
+
+// RoleAllowsMemory reports whether role may receive recalled project memory. Probes explore and reviewers verify, so
+// historical bodies would bias them toward a past claim; every other role may recall. It is the single role rule the
+// style matrix, every preset and the engine share.
+func RoleAllowsMemory(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "probe", "reviewer":
+		return false
+	}
+	return true
 }
 
 func applyScopeToItems(items []Item, scope *Scope, dependencyTaskIDs []string) ([]Item, []Dropped) {
@@ -1171,8 +1255,42 @@ func renderItem(b *strings.Builder, it Item) {
 	if it.Stale != "" {
 		b.WriteString("Stale - " + it.Stale + "; check the file before relying on this.\n")
 	}
-	b.WriteString(it.Content)
+	content := it.Content
+	if it.Source == SourceRecalled {
+		// A recalled body is data, not prompt structure: a line that looks like a heading or code fence must not end
+		// the memory block or start a new section the model reads as instructions.
+		content = neutraliseMarkers(content)
+	}
+	b.WriteString(content)
 	b.WriteString("\n\n")
+}
+
+// neutraliseMarkers escapes ATX heading and code fence markers at the start of a line, leaving the text readable as
+// data. Leading whitespace is kept so indented body text keeps its shape.
+func neutraliseMarkers(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimLeft(line, " \t")
+		indent := line[:len(line)-len(trimmed)]
+		if isMarkdownMarker(trimmed) {
+			lines[i] = indent + `\` + trimmed
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func isMarkdownMarker(s string) bool {
+	if strings.HasPrefix(s, "```") || strings.HasPrefix(s, "~~~") {
+		return true
+	}
+	if !strings.HasPrefix(s, "#") {
+		return false
+	}
+	n := 0
+	for n < len(s) && s[n] == '#' {
+		n++
+	}
+	return n <= 6 && (n == len(s) || s[n] == ' ' || s[n] == '\t')
 }
 
 func sortItems(items []Item) {

@@ -398,6 +398,7 @@ func (c *Coord) execWorker(ctx context.Context, t taskgraph.Task, a agent.Agent)
 	c.Agents.Update(a.ID, func(x *agent.Agent) { x.Status = agent.Starting; x.Phase = "context"; x.Activity = "Building context" })
 	c.emit("agent.started", c.freshAgent(a))
 	c.Engine.Ingest(a.ID, c.workerSeed(t, a.Role))
+	c.Engine.SetRecall(a.ID, c.workerRecall(a, t))
 	c.bindWorkspaceContext(a.ID)
 	gen, err := c.Engine.Build(ctxeng.BuildRequest{
 		AgentID: a.ID, TaskID: t.ID, Role: string(a.Role), Phase: phaseFor(a.Role),
@@ -960,7 +961,6 @@ func (c *Coord) clampReportFor(role agent.Role, rep RawReport) RawReport {
 // carry only the findings and reports their task needs: those from dep tasks, transitively, and findings naming
 // files in the task's scope. Every finding keeps its source task as provenance. Other roles keep all findings.
 func (c *Coord) workerSeed(t taskgraph.Task, role agent.Role) []ctxeng.Item {
-	settings := c.settings()
 	s := c.Current()
 	objective := ""
 	if s != nil {
@@ -1001,12 +1001,21 @@ func (c *Coord) workerSeed(t taskgraph.Task, role agent.Role) []ctxeng.Item {
 	if scoped {
 		items = append(items, c.depReports(deps)...)
 	}
-	if settings.Memory {
-		for _, e := range c.Memory.Recall(t.Title + " " + t.Description) {
-			items = append(items, ctxeng.Item{Class: ctxeng.ClassMemory, Title: staleMemory + e.Title, Content: e.Body, Files: e.Files, Verified: e.Verified, Durability: 0.75})
-		}
-	}
 	return items
+}
+
+// workerRecall returns the memory recalled for task t, judged in the dispatched agent's own worktree rather than the
+// session workspace. It is empty when Settings.Memory is off or the agent has no workspace.
+func (c *Coord) workerRecall(a agent.Agent, t taskgraph.Task) []ctxeng.Item {
+	if !c.settings().Memory || a.Workspace == "" {
+		return nil
+	}
+	q := memory.RecallQuery{Text: t.Title + " " + t.Description}
+	for f := range taskScopeFiles(t) {
+		q.Files = append(q.Files, f)
+	}
+	q.Files = append(q.Files, t.Paths...)
+	return c.recallItems(a.Workspace, q)
 }
 
 // architectFindingCap bounds the findings an architect pack carries, most relevant first.
@@ -1265,9 +1274,8 @@ func (c *Coord) acceptReport(t taskgraph.Task, a agent.Agent, rep RawReport, out
 		})
 		c.emit("finding.created", f)
 	}
-	if settings.Memory && !blocked {
-		c.Memory.Upsert(memory.Entry{Kind: "finding", Title: firstLine(short), Body: ctxeng.CompressReport(short, files, verifyLines(rep), rep.Risks, rep.Cause), Files: files, Verified: st == agent.Completed && !checksFailed && a.Role != agent.Probe, Score: 0.6})
-		c.emit("memory.updated", map[string]any{"agentId": a.ID})
+	if settings.Memory && !blocked && st == agent.Completed {
+		c.proposeMemory(a, firstLine(short), ctxeng.CompressReport(short, files, verifyLines(rep), rep.Risks, rep.Cause), files)
 	}
 	if parent, ok := c.Agents.Primary(); ok {
 		sum := ctxeng.CompressReport(short, files, verifyLines(rep), rep.Risks, rep.Cause)
@@ -1572,6 +1580,11 @@ func (c *Coord) runVerifyWith(ctx context.Context, a agent.Agent, runner verific
 		c.mu.Lock()
 		if c.sess != nil {
 			c.sess.Verify = append(c.sess.Verify, res)
+			// Memory evidence cites this record by ID; the owner binds that citation to the agent that ran it.
+			if c.checkOwners == nil {
+				c.checkOwners = map[string]string{}
+			}
+			c.checkOwners[res.ID] = a.ID
 		}
 		c.mu.Unlock()
 		c.emit("verification.completed", res)
