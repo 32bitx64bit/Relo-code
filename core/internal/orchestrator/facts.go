@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/relocode/relo/internal/agent"
 	ctxeng "github.com/relocode/relo/internal/context"
 	"github.com/relocode/relo/internal/memory"
 	"github.com/relocode/relo/internal/taskgraph"
@@ -85,6 +86,10 @@ func (c *Coord) workspaceFacts() string {
 
 	if cmds := c.projectCommands(); cmds != "" {
 		b.WriteString("- Project commands: " + cmds + "\n")
+	}
+
+	if line := c.pathFacts(); line != "" {
+		b.WriteString(line)
 	}
 
 	b.WriteString("Worker edits wait in the Changes tab, so a probe, which reads the user's folder, cannot see them yet. Relo reads changed files from git and runs the project's checks itself.\n")
@@ -390,4 +395,78 @@ func (c *Coord) pendingMemoryItems() []ctxeng.Item {
 	}
 	return []ctxeng.Item{{Source: ctxeng.SourceSystem, Kind: ctxeng.KindConstraint, Durability: 0.8,
 		Content: "## Pending memory candidates (agent-proposed, not yet permanent) and verified agent entries. Decide each with memoryActions {op,id,revision,evidence,rationale}. Cite the id and revision exactly as listed; decide only listed ids. promote makes it permanent and needs its listed evidence refs; reject discards a candidate and needs no evidence; retire withdraws a listed verified entry. Core applies each decision through the head gate and refuses the rest. A turn may carry memoryActions with tasks [].\n" + strings.Join(lines, "\n")}}
+}
+
+// factsMaxFiles bounds the files whose existence the facts settle.
+const factsMaxFiles = 6
+
+// namedPath finds repository paths in free text: a few directories and a file name with an extension.
+var namedPath = regexp.MustCompile("[A-Za-z0-9_][A-Za-z0-9_.+-]*(?:/[A-Za-z0-9_.+-]+)+\\.[A-Za-z][A-Za-z0-9]{0,5}\\b")
+
+// pathFacts settles by looking which files exist, for the paths that blocked or failed tasks and the agents' messages to
+// the Primary name. The Primary has no tools, so a worker's "this file does not exist" and the head's own belief that
+// it does are both guesses; one session spent six turns on a source file that had vanished from the folder, the head
+// first telling the user the file was in the working tree, then that agents are cut from git alone, neither true.
+func (c *Coord) pathFacts() string {
+	s := c.Current()
+	if s == nil || s.Workspace == "" {
+		return ""
+	}
+	var texts []string
+	for _, t := range c.Graph.List() {
+		if t.Status != taskgraph.Asking && t.Status != taskgraph.Failed && t.Status != taskgraph.Blocked {
+			continue
+		}
+		texts = append(texts, t.Title, t.Description, t.Scope)
+		if t.BlockedOn != nil {
+			texts = append(texts, t.BlockedOn.Question)
+		}
+		if rep, ok := t.Report.(agent.Report); ok {
+			texts = append(texts, rep.Summary, rep.Question)
+		}
+	}
+	if p, ok := c.Agents.Primary(); ok {
+		c.mu.Lock()
+		for _, m := range s.PeerMessages {
+			if m.To == p.ID && (m.State == "queued" || m.State == "injected") {
+				texts = append(texts, m.Text)
+			}
+		}
+		c.mu.Unlock()
+	}
+	seen := map[string]bool{}
+	var lines []string
+	for _, text := range texts {
+		for _, at := range namedPath.FindAllStringIndex(text, -1) {
+			// A path that continues one written before it (../x, /etc/x, ~/x, $HOME/x) is not a path in the workspace.
+			if at[0] > 0 && strings.ContainsRune("/.~$", rune(text[at[0]-1])) {
+				continue
+			}
+			rel := filepath.ToSlash(filepath.Clean(text[at[0]:at[1]]))
+			if seen[rel] || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, "../") || strings.HasPrefix(rel, ".relo/") {
+				continue
+			}
+			seen[rel] = true
+			if len(lines) == factsMaxFiles {
+				continue
+			}
+			info, err := os.Stat(filepath.Join(s.Workspace, filepath.FromSlash(rel)))
+			switch {
+			case err == nil && !info.IsDir():
+				lines = append(lines, fmt.Sprintf("`%s` is in the working tree (%d bytes)", rel, info.Size()))
+			case os.IsNotExist(err):
+				line := fmt.Sprintf("`%s` is NOT in the working tree", rel)
+				if ws := c.workspace(); ws != nil {
+					if copy, found := ws.RecoverableCopy(rel); found {
+						line += fmt.Sprintf("; Relo recorded a copy in commit %s (%s), restore it with `git show %s:%s > %s`", copy.Commit[:min(7, len(copy.Commit))], copy.At.Format("2006-01-02 15:04Z"), copy.Commit[:min(12, len(copy.Commit))], rel, rel)
+					}
+				}
+				lines = append(lines, line)
+			}
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "- Relo looked at the files that blocked or failed tasks and agent messages name: " + strings.Join(lines, "; ") + ". This is measured, not reported: it outranks what an agent or you believed.\n"
 }

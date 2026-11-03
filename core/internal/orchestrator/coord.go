@@ -263,6 +263,9 @@ type Coord struct {
 	lineageProblems map[string]lineageProblem // agent ID -> a recorded base that could not be re-stacked; guarded by mu
 	inbox           map[string][]queuedNote   // session ID -> user messages waiting for the head's next step; guarded by mu
 	wake            chan struct{}             // buffered nudge: the inbox has something for a head waiting on its sub agents
+	peerStepEnd     time.Time                 // when the head last finished a turn that only a sub agent's message woke; guarded by mu
+	peerStepTimer   bool                      // a deferred head wake for peer messages is already scheduled; guarded by mu
+	asks            askState                  // the Primary's questions to the code reader; see ask.go
 	sessionCtx      context.Context
 	runCancel       context.CancelFunc
 	runID           uint64
@@ -294,6 +297,7 @@ type Coord struct {
 	imageSlots      chan struct{}          // bounds images decoded at once; created lazily under imageMu
 	art             artState               // the art tools: whether they are on, and the relo_sprite call rate
 	escalations     map[string]string
+	stalledAt       map[string]time.Time        // model -> when it last went silent on an agent; guarded by mu. See stall.go.
 	failures        map[string]string           // task ID -> why its last attempt failed, for the attempt that replaces it; guarded by mu
 	directSem       chan struct{}               // guarded by mu; one mutating agent at a time in direct mode
 	directHolder    directHold                  // who holds directSem now, so a queued agent can say what it waits for; guarded by mu

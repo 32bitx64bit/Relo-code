@@ -651,15 +651,73 @@ func (a *App) conflictPrompt(conflicted []orchestrator.Change) string {
 		"The task description must include the conflicting hunks of both versions shown below.\n" +
 		"After you have delegated the replacement work, list the id of each change below that you resolved in the turn's resolvedChanges array. " +
 		"Each listed change is discarded: its agent copy is kept for recovery and nothing in the workspace is written. Only the ids below qualify.\n")
+	missing := false
 	for _, ch := range conflicted {
 		title := ch.Path
 		if t, ok := a.Coord.Graph.Get(ch.TaskID); ok && t.Title != "" {
 			title = t.Title
 		}
 		fmt.Fprintf(&b, "\n- id: %s\n  title: %s\n  path: %s\n  reason: %s\n", ch.ID, title, ch.Path, ch.Conflict)
+		if block := a.missingFileBlock(ch); block != "" {
+			missing = true
+			b.WriteString(block)
+			continue
+		}
 		b.WriteString(a.agentConflictCopy(ch))
 		b.WriteString(a.currentConflictCopy(ch))
 	}
+	if missing {
+		b.WriteString("\nA change marked \"file missing\" is not a question for the user. Its one task first checks whether the project still needs the file " +
+			"(grep for its name in build files, includes and tests). If it does, the task restores the file from the recovery copy named under it " +
+			"(`git show <commit>:<path> > <path>`), then applies the agent's patch and the accepted changes listed, and builds. " +
+			"If nothing needs it, the deletion was deliberate: the task drops the agent's change and says so. Give it difficulty medium. " +
+			"Do not ask the user to restore, accept or commit anything.\n")
+	}
+	return b.String()
+}
+
+// missingFileBlock describes a conflicted change whose file is gone from the workspace, which the usual two-sided
+// hunks cannot: there is no current version to keep. It names the newest copy Relo recorded of the user's working
+// tree, the changes accepted on the file since the agent started (a restored copy may predate them), and the agent's
+// own patch. It is empty when the file exists.
+func (a *App) missingFileBlock(ch orchestrator.Change) string {
+	if _, err := os.Stat(filepath.Join(a.Cfg.Workspace, filepath.FromSlash(ch.Path))); err == nil || !os.IsNotExist(err) {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("  file missing: it is not in the workspace.\n")
+	if ws := a.Coord.WS; ws != nil {
+		if cp, ok := ws.RecoverableCopy(ch.Path); ok {
+			fmt.Fprintf(&b, "  recovery copy: commit %s (%s), the newest snapshot of the working tree that held it.\n", cp.Commit, cp.At.Format("2006-01-02 15:04 UTC"))
+		} else {
+			b.WriteString("  recovery copy: none recorded. The agent's whole file is its worktree copy; rebuild from the patch below and the design.\n")
+		}
+	}
+	if ch.Integration != nil && len(ch.Integration.Since) > 0 {
+		var titles []string
+		for _, id := range ch.Integration.Since {
+			if other, ok := a.Coord.FindChange(id); ok {
+				t := other.Path
+				if task, ok := a.Coord.Graph.Get(other.TaskID); ok && task.Title != "" {
+					t = task.Title
+				}
+				titles = append(titles, fmt.Sprintf("%q (%s)", t, id))
+			}
+		}
+		if len(titles) > 0 {
+			b.WriteString("  accepted on this file since the agent started (a recovery copy may predate them; re-apply any it lacks): " + strings.Join(titles, ", ") + "\n")
+		}
+	}
+	if a.Coord.WS != nil {
+		if patch, err := a.Coord.WS.PatchPath(ch.AgentID, ch.Path); err == nil && strings.TrimSpace(patch) != "" {
+			if len(patch) > 2*promptDiffBytes {
+				patch = patch[:2*promptDiffBytes] + "\n[truncated]"
+			}
+			b.WriteString("  agent patch against its base:\n```diff\n" + patch + "\n```\n")
+			return b.String()
+		}
+	}
+	b.WriteString(a.agentConflictCopy(ch))
 	return b.String()
 }
 

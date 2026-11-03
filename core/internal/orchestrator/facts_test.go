@@ -170,3 +170,62 @@ func TestWorkspaceFactsNameTheProjectsOwnCommands(t *testing.T) {
 		t.Errorf("facts list a variable or a pattern rule as a command:\n%s", facts)
 	}
 }
+
+// A worker says a file is missing, the head believes it is there: Relo looks and settles it, and for a file that is
+// gone names the snapshot copy to restore from. The head has no tools, so without this it can only guess.
+func TestFactsSettleWhetherANamedFileExists(t *testing.T) {
+	dir := gitRepo(t)
+	write := func(rel, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, rel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, rel), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("engine/src/ai/facts.c", "int facts;\n")
+	write("engine/src/ai/here.c", "int here;\n")
+
+	c := New(logging.New(nil, logging.Error))
+	ws := workspace.New(dir)
+	c.SetWorkspaceManager(ws)
+	c.CreateSession(dir, "fix it", ModeBuild)
+	snap, err := ws.Snapshot() // an agent is cut from the tree while facts.c still exists
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "update-ref", "refs/relo/vws/agent_x/base", snap.Commit)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("update-ref: %v\n%s", err, out)
+	}
+	if err := os.Remove(filepath.Join(dir, "engine/src/ai/facts.c")); err != nil {
+		t.Fatal(err)
+	}
+
+	c.Graph.Add(taskgraph.Task{Title: "Build it", Role: "worker", Status: taskgraph.Failed,
+		Description: "engine/src/ai/facts.c is missing, so engine/src/ai/here.c cannot link; see ../outside/x.c and /etc/passwd.x"})
+	facts := c.workspaceFacts()
+	for _, want := range []string{
+		"`engine/src/ai/facts.c` is NOT in the working tree",
+		"git show " + snap.Commit[:12] + ":engine/src/ai/facts.c > engine/src/ai/facts.c",
+		"`engine/src/ai/here.c` is in the working tree (10 bytes)",
+		"it outranks what an agent or you believed",
+	} {
+		if !strings.Contains(facts, want) {
+			t.Errorf("facts lack %q:\n%s", want, facts)
+		}
+	}
+	if strings.Contains(facts, "outside/x.c") || strings.Contains(facts, "passwd") {
+		t.Errorf("facts looked outside the workspace:\n%s", facts)
+	}
+
+	// Nothing blocked or failed names a file: the facts stay as short as before.
+	quiet := New(logging.New(nil, logging.Error))
+	quiet.SetWorkspaceManager(workspace.New(dir))
+	quiet.CreateSession(dir, "q", ModeBuild)
+	if strings.Contains(quiet.workspaceFacts(), "Relo looked at the files") {
+		t.Error("facts listed files with no blocked or failed task naming one")
+	}
+}

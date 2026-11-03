@@ -129,3 +129,65 @@ func TestConflictPromptAsksForResolvedChanges(t *testing.T) {
 		t.Fatalf("conflict prompt = %q", prompt)
 	}
 }
+
+// A file that vanished from the workspace after the agent started used to reach the head as "current version
+// unavailable" with an instruction to keep every line of the current file. The head could do nothing but ask the user,
+// and in one session the build stayed broken for hours. The prompt now says the file is missing, where the newest copy
+// Relo recorded is, and what the agent changed.
+func TestAConflictOnAMissingFileTellsTheHeadHowToRestoreIt(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "base\nline\n"})
+	ch := proposeChange(t, core, dir, "a.txt", func(p string) {
+		if err := os.WriteFile(p, []byte("agent\nline\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// The user's uncommitted version at the moment an agent was cut: Relo recorded it as a snapshot base.
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("mine\nline\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := core.Coord.WS.Snapshot()
+	if err != nil || snap.Commit == "" || snap.HeadFallback {
+		t.Fatalf("snapshot = %+v, %v", snap, err)
+	}
+	git(t, dir, "update-ref", "refs/relo/vws/agent_old/base", snap.Commit)
+	if err := os.Remove(filepath.Join(dir, "a.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	core.headMu.Lock()
+	core.headBusy = true
+	core.headMu.Unlock()
+	if _, err := core.resolveConflicts(); err != nil {
+		t.Fatal(err)
+	}
+	now, _ := core.Coord.FindChange(ch.ID)
+	if now.Integration == nil || now.Integration.Kind != "delete_modify" {
+		t.Fatalf("integration = %+v, want delete_modify", now.Integration)
+	}
+	text := core.conflictPrompt([]orchestrator.Change{now})
+	for _, want := range []string{
+		"file missing", "recovery copy: commit " + snap.Commit, "git show <commit>:<path>", "+agent",
+		"not a question for the user", "Do not ask the user to restore",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("prompt lacks %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "current version unavailable") {
+		t.Errorf("prompt still says the current version is unavailable:\n%s", text)
+	}
+}
+
+// A conflict on a file that exists keeps the two-sided hunks and none of the restore text.
+func TestAConflictOnAnExistingFileHasNoRestoreText(t *testing.T) {
+	core, dir := newGitCore(t, map[string]string{"a.txt": "base\n"})
+	ch := proposeChange(t, core, dir, "a.txt", func(p string) {
+		if err := os.WriteFile(p, []byte("agent\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	})
+	markConflicted(t, core, ch.ID)
+	if text := core.conflictPrompt([]orchestrator.Change{ch}); strings.Contains(text, "file missing") || strings.Contains(text, "recovery copy") {
+		t.Fatalf("restore text on a file that exists:\n%s", text)
+	}
+}
